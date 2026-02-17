@@ -1,0 +1,21 @@
+set1: 
+  apex: 0.5
+  left-right: 0.15
+  anterior-cutoff: 0.6
+  anterior: [0.25, 0.25, 0.25, 0.25]
+  posterior: [0.25, 0.2, 0.1, 0.2, 0.25]
+
+set2: 
+  apex: 0.6
+  left-right: 0.15
+  anterior-cutoff: 0.5
+  anterior: [0.25, 0.25, 0.25, 0.25]
+  posterior: [0.25, 0.2, 0.1, 0.2, 0.25]
+
+set3: 
+  apex: 0.6
+  left-right: 0.15
+  anterior-cutoff: 0.6
+  anterior: [0.25, 0.25, 0.25, 0.25]
+  posterior: [0.25, 0.2, 0.1, 0.2, 0.25]
+
