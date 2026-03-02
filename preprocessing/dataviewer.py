@@ -48,7 +48,27 @@ class VolumeViewer:
         
         self.update_display()
 
+def npy_viewer(npy_path):
+    data = np.load(npy_path)
+    # 2. 查看基本信息
+    print("数据内容:", data)
+    print("数据维度 (Shape):", data.shape)
+    print("数据类型 (Dtype):", data.dtype)
+
+    # 3. 如果是 20 区域标签向量，你可以直接打印出来看每一个区域的分级
+    for i, isup in enumerate(data):
+        print(f"区域 {i+1} 的 ISUP 分级: {isup}")
+
 # 使用示例
 if __name__ == "__main__":
 
-    viewer = VolumeViewer("F:\RP_dataset\Processed_PROMIS\P-12743658\input_tensor.npy")
+    viewer = VolumeViewer(r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS\P-12743658\input_tensor.npy")
+    # viewer= VolumeViewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY\P-12743658.npy')
+    # viewer = VolumeViewer(r'F:\RP_dataset\Processed_Target_Biopsy\Prostate-MRI-US-Biopsy-0001\input_tensor.npy')
+    import numpy as np
+
+    # 1. 加载 npy 文件
+    # 假设文件名是 P-10104751.npy
+    # viewer = npy_viewer('F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY\P-12743658.npy')
+
+    
