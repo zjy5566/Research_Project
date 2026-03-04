@@ -62,9 +62,10 @@ def npy_viewer(npy_path):
 # 使用示例
 if __name__ == "__main__":
 
-    viewer = VolumeViewer(r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS\P-12743658\input_tensor.npy")
+    # viewer = VolumeViewer(r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS\P-12743658\input_tensor.npy")
     # viewer= VolumeViewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY\P-12743658.npy')
-    # viewer = VolumeViewer(r'F:\RP_dataset\Processed_Target_Biopsy\Prostate-MRI-US-Biopsy-0001\input_tensor.npy')
+    viewer = VolumeViewer(r'F:\RP_dataset\Target biosy\Processed_Target_Biopsy\Prostate-MRI-US-Biopsy-0001\input_tensor.npy')
+    # viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI\009_img.npy')
     import numpy as np
 
     # 1. 加载 npy 文件

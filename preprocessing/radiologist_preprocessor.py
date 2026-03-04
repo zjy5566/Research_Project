@@ -2,35 +2,70 @@ import os
 import glob
 import numpy as np
 import SimpleITK as sitk
+from tqdm import tqdm
 
 class ProstateDataPreprocessor:
-    def __init__(self, root_dir, output_dir):
+    def __init__(self, root_dir, output_dir, target_spacing=[1.0, 1.0, 2.24], target_size=[64, 64, 32]):
         """
         :param root_dir: 包含 imagesTr, labelsTr, zonesTr 的根目录
         :param output_dir: 处理后数据的保存目录
         """
         self.root_dir = root_dir
         self.output_dir = output_dir
+        self.target_spacing = target_spacing
+        self.target_size = target_size
         os.makedirs(output_dir, exist_ok=True)
 
-    def load_nifti(self, path):
-        img = sitk.ReadImage(path)
-        return sitk.GetArrayFromImage(img), img
-
-    def normalize_by_zone(self, data, zone_mask):
-        """
-        基于前列腺腺体区域(zone_mask == 1)进行 Z-score 归一化
-        """
-        # 获取腺体内的像素值
-        zone_pixels = data[zone_mask > 0]
-        if len(zone_pixels) == 0: # 防止异常情况
-            mean, std = data.mean(), data.std()
-        else:
-            mean, std = zone_pixels.mean(), zone_pixels.std()
+    # --- 1. 重采样函数 (保持与其它数据集一致) ---
+    def resample_to_spacing(self, image, is_label=False):
+        original_spacing = image.GetSpacing()
+        original_size = image.GetSize()
+        new_size = [int(round(original_size[i] * original_spacing[i] / self.target_spacing[i])) for i in range(3)]
         
-        # 归一化并防止除以零
-        normalized_data = (data - mean) / (std + 1e-8)
-        return normalized_data
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetOutputSpacing(self.target_spacing)
+        resampler.SetSize(new_size)
+        resampler.SetOutputDirection(image.GetDirection())
+        resampler.SetOutputOrigin(image.GetOrigin())
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+        return resampler.Execute(image)
+
+    # --- 2. 以前列腺掩膜为中心的裁剪函数 (保持与其它数据集一致) ---
+    def mask_centered_crop(self, img, mask):
+        label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+        # 确保 mask 为二值图像
+        binary_mask = sitk.Cast(mask > 0, sitk.sitkUInt8)
+        label_shape_filter.Execute(binary_mask)
+        
+        if label_shape_filter.GetNumberOfLabels() == 0:
+            # 如果 mask 为空，回退到图像中心裁剪
+            center_index = [s // 2 for s in img.GetSize()]
+        else:
+            # 获取质心物理坐标并转为索引
+            centroid_world = label_shape_filter.GetCentroid(1) 
+            center_index = img.TransformPhysicalPointToIndex(centroid_world)
+
+        roi_start = [center_index[i] - self.target_size[i] // 2 for i in range(3)]
+        
+        # 处理 Padding
+        img_size = img.GetSize()
+        pad_lower = [max(0, -roi_start[i]) for i in range(3)]
+        pad_upper = [max(0, roi_start[i] + self.target_size[i] - img_size[i]) for i in range(3)]
+        
+        if sum(pad_lower) + sum(pad_upper) > 0:
+            img = sitk.ConstantPad(img, pad_lower, pad_upper, 0)
+            roi_start = [roi_start[i] + pad_lower[i] for i in range(3)]
+        
+        return sitk.RegionOfInterest(img, self.target_size, roi_start)
+
+    # --- 3. 归一化函数 ---
+    def normalize_array(self, img_arr):
+        """
+        全局 Z-score 归一化 (与 TCIA/PROMIS 数据集保持一致)
+        """
+        img_arr = img_arr.astype(np.float32)
+        std = np.std(img_arr)
+        return (img_arr - np.mean(img_arr)) / (std if std > 1e-7 else 1.0)
 
     def process_patient(self, patient_id):
         # 1. 构建路径
@@ -40,44 +75,69 @@ class ProstateDataPreprocessor:
         label_path = os.path.join(self.root_dir, 'labelsTr', f"{patient_id}.nii.gz")
         zone_path = os.path.join(self.root_dir, 'zonesTr', f"{patient_id}.nii.gz")
 
-        # 2. 读取数据
-        t2_arr, ref_img = self.load_nifti(t2_path)
-        adc_arr, _ = self.load_nifti(adc_path)
-        dwi_arr, _ = self.load_nifti(dwi_path)
-        label_arr, _ = self.load_nifti(label_path) # 病灶索引 0...L
-        zone_arr, _ = self.load_nifti(zone_path)   # 腺体 Mask (0, 1)
+        # 如果缺失任何一个模态，则跳过
+        if not all([os.path.exists(p) for p in [t2_path, adc_path, dwi_path, zone_path]]):
+            print(f"Skipped {patient_id}: Missing modalities or zone mask.")
+            return
 
-        # 3. 执行基于腺体区域的归一化 (核心步骤)
-        t2_norm = self.normalize_by_zone(t2_arr, zone_arr)
-        adc_norm = self.normalize_by_zone(adc_arr, zone_arr)
-        dwi_norm = self.normalize_by_zone(dwi_arr, zone_arr)
-
-        # 4. 多模态堆叠 (Channel-first: [Channels, Z, Y, X])
-        # 这样可以直接输入 3D CNN
-        stacked_img = np.stack([t2_norm, adc_norm, dwi_norm], axis=0).astype(np.float32)
-
-        # 5. 标签处理
-        # 如果是简单的二分类检测（是否有癌），将索引图转为 binary
-        # 如果是 Mixed-supervision，这里后续需结合病理 CSV 映射 ISUP 等级
-        binary_label = (label_arr > 0).astype(np.uint8)
-
-        # 6. 保存处理后的结果 (以 .npy 格式保存加速训练读取，或存回 .nii.gz)
-        np.save(os.path.join(self.output_dir, f"{patient_id}_img.npy"), stacked_img)
-        np.save(os.path.join(self.output_dir, f"{patient_id}_lab.npy"), binary_label)
-        if patient_id == "001":
-            sitk.WriteImage(sitk.GetImageFromArray(t2_norm), os.path.join(self.output_dir, f"{patient_id}_ref.nii.gz"))
-
+        # 2. 读取数据 (使用 SimpleITK 对象以便进行空间变换)
+        t2 = sitk.ReadImage(t2_path)
+        adc = sitk.ReadImage(adc_path)
+        dwi = sitk.ReadImage(dwi_path)
+        zone = sitk.ReadImage(zone_path)
         
-        print(f"Finished processing patient: {patient_id}")
+        # 标签可能不存在（例如只有 gland mask 的情况）
+        has_label = os.path.exists(label_path)
+        if has_label:
+            label = sitk.ReadImage(label_path)
+
+        # 3. 统一重采样
+        t2_res = self.resample_to_spacing(t2)
+        adc_res = self.resample_to_spacing(adc)
+        dwi_res = self.resample_to_spacing(dwi)
+        zone_res = self.resample_to_spacing(zone, is_label=True)
+        if has_label:
+            label_res = self.resample_to_spacing(label, is_label=True)
+
+        # 4. 以前列腺质心进行中心裁剪
+        t2_crop = self.mask_centered_crop(t2_res, zone_res)
+        adc_crop = self.mask_centered_crop(adc_res, zone_res)
+        dwi_crop = self.mask_centered_crop(dwi_res, zone_res)
+        zone_crop = self.mask_centered_crop(zone_res, zone_res)
+        if has_label:
+            label_crop = self.mask_centered_crop(label_res, zone_res)
+
+        # 5. 转为 Numpy 数组并归一化
+        t2_arr = sitk.GetArrayFromImage(t2_crop)
+        adc_arr = sitk.GetArrayFromImage(adc_crop)
+        dwi_arr = sitk.GetArrayFromImage(dwi_crop)
+
+        # 6. 多模态堆叠 (严格遵守 T2, DWI, ADC 的通道顺序！！！)
+        stacked_img = np.stack([
+            self.normalize_array(t2_arr), 
+            self.normalize_array(dwi_arr), 
+            self.normalize_array(adc_arr)
+        ], axis=0).astype(np.float32)
+
+        # 7. 标签处理
+        # 优先保存 lesion label，如果没有则保存 zone mask 作为辅助分割任务的标签
+        if has_label:
+            label_arr = sitk.GetArrayFromImage(label_crop)
+            final_label = (label_arr > 0).astype(np.uint8)
+        else:
+            zone_arr = sitk.GetArrayFromImage(zone_crop)
+            final_label = (zone_arr > 0).astype(np.uint8)
+
+        # 8. 保存处理后的结果
+        # 命名格式严格遵守 000_img.npy 和 000_lab.npy
+        np.save(os.path.join(self.output_dir, f"{patient_id}_img.npy"), stacked_img)
+        np.save(os.path.join(self.output_dir, f"{patient_id}_lab.npy"), final_label)
 
     def run_all(self):
-        # 获取所有患者 ID (基于 T2 影像)
         t2_files = glob.glob(os.path.join(self.root_dir, 'imagesTr', '*_0000.nii.gz'))
-        patient_ids = [os.path.basename(f).replace('_0000.nii.gz', '') for f in t2_files]
+        patient_ids = sorted([os.path.basename(f).replace('_0000.nii.gz', '') for f in t2_files])
         
-        for pid in patient_ids:
-            if pid == "002":
-                break
+        for pid in tqdm(patient_ids, desc="Processing MRI Dataset"):
             try:
                 self.process_patient(pid)
             except Exception as e:
@@ -85,10 +145,10 @@ class ProstateDataPreprocessor:
 
 # --- 使用示例 ---
 if __name__ == "__main__":
-    # 填入您的实际文件夹路径
-    raw_data_path = "D:\\zjy\\study\\research_project\\Dataset_prostate" 
-    processed_path = "D:\\zjy\\study\\research_project\\processed_prostrate"
+    raw_data_path = r"F:\RP_dataset\Dataset_prostate_MRI" 
+    processed_path = r"F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI"
     
     preprocessor = ProstateDataPreprocessor(raw_data_path, processed_path)
     print("Script started...")
     preprocessor.run_all()
+    print(f"All done! Output saved to: {processed_path}")
