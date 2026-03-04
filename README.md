@@ -8,6 +8,7 @@ The pipeline is designed to fuse heterogeneous datasets (Targeted Biopsy, System
 ---
 
 ## 📊 1. Overview of Datasets
+<img width="2885" height="1271" alt="ba391831982ba6a9e469df2f242121a3" src="https://github.com/user-attachments/assets/a52085f2-3656-4b8b-9c9b-a4aab4849ef4" />
 
 Our pipeline unifies three distinct data sources into a standardized patient-centric format:
 
