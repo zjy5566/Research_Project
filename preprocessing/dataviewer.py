@@ -90,8 +90,9 @@ if __name__ == "__main__":
     # viewer = VolumeViewer(r'F:\RP_dataset\Target biosy\Processed_Target_Biopsy\Prostate-MRI-US-Biopsy-0001\input_tensor.npy')
     
     # 【测试例 2】：查看 3D 单通道掩膜 (32, 64, 64) (如 lab.npy 或 zones_mask.nii.gz 转换的 npy)
-    viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI\000_lab.npy')
+    # viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI\000_lab.npy')
     
     # 【测试例 3】：查看 1D 向量标签
     # npy_viewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY\P-12743658.npy')
+    npy_viewer(r'F:\RP_dataset\Target biosy\Processed_Target_Biopsy\Prostate-MRI-US-Biopsy-1151\systematic_labels.npy')
     pass

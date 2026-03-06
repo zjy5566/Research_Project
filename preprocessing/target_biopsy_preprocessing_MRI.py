@@ -81,7 +81,7 @@ def process_single_patient(p_id, src_path, dst_root):
     # 输出路径 (Processed 文件夹)
     save_dir = os.path.join(dst_root, p_id)
     # gland_mask 应该位于已经生成的 Processed 目录下对应病人的文件夹中
-    mask_file = os.path.join(save_dir, 'gland_mask.nii.gz') 
+    mask_file = os.path.join(src_path, 'gland_mask.nii.gz') 
 
     # 1. 检查是否存在 input_tensor.npy (跳过已处理)
     # if os.path.exists(os.path.join(save_dir, 'input_tensor.npy')):
@@ -131,7 +131,7 @@ def process_single_patient(p_id, src_path, dst_root):
 # --- 6. 主程序入口 ---
 if __name__ == "__main__":
     SRC_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
-    DST_ROOT = r'F:\RP_dataset\Target biosy\Processed_Target_Biopsy'
+    DST_ROOT = r'F:\RP_dataset\Target biosy\Processed_TCIA'
 
     patients = [d for d in os.listdir(SRC_ROOT) if d.startswith('Prostate-MRI-US-Biopsy-')]
     print(f"Total potential patients found: {len(patients)}")
