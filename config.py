@@ -1,7 +1,6 @@
 import os
 import torch
 from datetime import datetime
-import json
 import random
 import numpy as np
 
@@ -43,6 +42,10 @@ class Config:
     IN_CHANNELS = 3    # T2, DWI, ADC
     NUM_CLASSES = 7    # 0:Background, 1:Benign, 2:ISUP1, 3:ISUP2, 4:ISUP3, 5:ISUP4, 6:ISUP5
     
+    # 定义“临床显著性前列腺癌 (csPCa)”的阈值 (用于 Lesion 二分类)
+    # 3 代表 ISUP 2 (即 Gleason 3+4=7 及以上视为有高危病灶)
+    CSPC_THRESHOLD = 3
+
     # ==========================================
     # 4. 训练超参数 (Training Hyperparameters)
     # ==========================================
@@ -60,20 +63,28 @@ class Config:
     # 学习率衰减策略
     LR_SCHEDULER = "CosineAnnealing" # 可选: "StepLR", "CosineAnnealing"
 
-
     # ==========================================
-    # 5. 消融实验控制开关 (Ablation Study Flags)
+    # 5. 多任务权重控制 (Latent Variables & Loss Weights)
     # ==========================================
-    LAMBDA_TARGET = 1.0  # TCIA 靶向穿刺 (强监督: 针道)
-    LAMBDA_SYS = 0.5     # PROMIS & TCIA 系统穿刺 (弱监督: 12/20分区)
+    # 【主任务】 ISUP 分级金标准 (靶向穿刺)，保持绝对主导
+    LAMBDA_GRADE = 1.0   
     
-    # 既然是病灶分割掩膜，它提供了极强的体素级特征，权重给到 1.0
-    LAMBDA_SEG = 1.0     # PUB 公开数据集 (强监督: 病灶体素级分割)
+    # 【主任务补充】 系统区域级弱监督，为防假阴性带偏，适当降权
+    LAMBDA_SYS = 0.5     
     
-    # 是否启用数据增强 (Data Augmentation)
+    # 【辅任务A】 病灶发现 (Lesion Risk)，提供强劲且健康的底层特征，权重拉满
+    LAMBDA_LESION = 1.0  
+    
+    # 【辅任务B】 解剖先验 (Gland Seg)，极易收敛，防止网络偷懒，权重设低
+    LAMBDA_GLAND = 0.2   
+    
+    # ==========================================
+    # 6. 消融实验控制开关 (Ablation Study Flags)
+    # ==========================================
+    # 是否启用 3D 空间数据增强 (Data Augmentation)
     USE_AUGMENTATION = True
     
-    # 是否在系统分区标签中屏蔽掉 Target 区域 (避免信息泄露)
+    # 是否在系统分区标签中屏蔽掉 Target 区域 (防止强弱监督信息冲突)
     MASK_TARGET_IN_SYS = False
 
     # ==========================================
@@ -94,18 +105,22 @@ class Config:
     @classmethod
     def show(cls):
         """打印当前配置，方便写入日志文件"""
-        print("-" * 40)
+        print("-" * 50)
         print("Experiment Configurations:")
         for k, v in cls.__dict__.items():
             if not k.startswith("__") and not callable(v):
                 print(f"{k:<20}: {v}")
-        print("-" * 40)
+        print("-" * 50)
+        
     @classmethod
     def get_experiment_name(cls):
-        """自动生成类似：20231027_1530_T1.0_S0.5_LR1e-4 的名字"""
+        """
+        自动生成实验命名，例如：
+        20241027_1530_G1.0_S0.5_L1.0_Gl0.2_LR0.0001
+        """
         time_str = datetime.now().strftime("%Y%m%d_%H%M")
-        name = f"{time_str}_T{cls.LAMBDA_TARGET}_S{cls.LAMBDA_SYS}_Seg{cls.LAMBDA_SEG}_LR{cls.LR}"
+        name = (f"{time_str}_G{cls.LAMBDA_GRADE}_S{cls.LAMBDA_SYS}"
+                f"_L{cls.LAMBDA_LESION}_Gl{cls.LAMBDA_GLAND}_LR{cls.LR}")
         if not cls.USE_AUGMENTATION:
             name += "_NoAug"
         return name
-
