@@ -60,43 +60,39 @@ class ProstateUnifiedDataset(Dataset):
         # ==========================================
         # 2. 初始化容器与标志位
         # ==========================================
-        # 空间维度
         D, H, W = Config.INPUT_SHAPE[1:] 
         
-        # 默认使用全零填充 (Dummy Tensors)，确保 DataLoader 能成功 collate
+        # 默认使用全零填充 (Dummy Tensors)
         target_mask = np.zeros((1, D, H, W), dtype=np.float32)
         zones_mask = np.zeros((1, D, H, W), dtype=np.float32)
-        seg_mask = np.zeros((1, D, H, W), dtype=np.float32)
+        lesion_mask = np.zeros((1, D, H, W), dtype=np.float32) # 病灶辅助分割
+        gland_mask = np.zeros((1, D, H, W), dtype=np.float32)  # 腺体解剖先验
         
-        # 为了兼容 TCIA(12区) 和 PROMIS(20区)，我们统一将系统标签 pad 到长度 20
-        # Loss 计算时会自动忽略值为 0 的背景/占位符
         sys_labels = np.zeros(20, dtype=np.int64) 
         
+        # 读取数据库索引标志
         has_target = float(row['has_target'])
         has_sys = float(row['has_sys_12'] or row['has_sys_20'])
-        
-        # 【修改点 1】: 根据新生成的 CSV，将 has_gland 改为了 has_lesion
-        has_seg = float(row['has_lesion'])
+        has_lesion = float(row['has_lesion'])
+        has_gland = float(row['has_gland'])
 
         # ==========================================
         # 3. 按需加载具体标签数据
         # ==========================================
-        masks_to_aug = {'target': None, 'zones': None, 'seg': None}
+        masks_to_aug = {'target': None, 'zones': None, 'lesion': None, 'gland': None}
 
         # --- A. 强监督：靶向穿刺 (Target Biopsy) ---
         if has_target:
             t_img = sitk.ReadImage(os.path.join(p_dir, 'target_bx.nii.gz'))
             t_arr = sitk.GetArrayFromImage(t_img).astype(np.float32)
-            masks_to_aug['target'] = np.expand_dims(t_arr, axis=0) # (1, D, H, W)
+            masks_to_aug['target'] = np.expand_dims(t_arr, axis=0)
 
         # --- B. 弱监督：系统活检分区 (Systematic Zones) ---
         if has_sys:
-            # 无论12区还是20区，都叫 zones_mask.nii.gz
             z_img = sitk.ReadImage(os.path.join(p_dir, 'zones_mask.nii.gz'))
             z_arr = sitk.GetArrayFromImage(z_img).astype(np.float32)
             masks_to_aug['zones'] = np.expand_dims(z_arr, axis=0)
             
-            # 读取对应的分数并填入长度为 20 的数组前部
             if row['has_sys_12']:
                 s_labels = np.load(os.path.join(p_dir, 'systematic_labels_12.npy'))
                 sys_labels[:12] = s_labels
@@ -104,11 +100,25 @@ class ProstateUnifiedDataset(Dataset):
                 s_labels = np.load(os.path.join(p_dir, 'systematic_labels_20.npy'))
                 sys_labels[:20] = s_labels
 
-        # --- C. 辅助监督：密集病灶分割 (Lesion Segmentation) ---
-        if has_seg:
-            # 【修改点 2】: 文件名由 gland_mask.npy 改为 lesion_mask.npy
-            s_arr = np.load(os.path.join(p_dir, 'lesion_mask.npy')).astype(np.float32)
-            masks_to_aug['seg'] = np.expand_dims(s_arr, axis=0)
+        # --- C. 辅助监督 1：密集病灶分割 (Lesion Risk) ---
+        if has_lesion:
+            l_arr = np.load(os.path.join(p_dir, 'lesion_mask.npy')).astype(np.float32)
+            # 确保是严格的二值掩膜 (0, 1)
+            masks_to_aug['lesion'] = np.expand_dims((l_arr > 0).astype(np.float32), axis=0)
+
+        # --- D. 辅助监督 2：腺体解剖结构 (Gland Anatomy) ---
+        if has_gland:
+            g_path_nii = os.path.join(p_dir, 'gland_mask.nii.gz')
+            g_path_npy = os.path.join(p_dir, 'gland_mask.npy')
+            
+            # 兼容 TCIA/PROMIS (.nii.gz) 和 PUB (.npy) 两种格式
+            if os.path.exists(g_path_nii):
+                g_img = sitk.ReadImage(g_path_nii)
+                g_arr = sitk.GetArrayFromImage(g_img).astype(np.float32)
+            else:
+                g_arr = np.load(g_path_npy).astype(np.float32)
+                
+            masks_to_aug['gland'] = np.expand_dims((g_arr > 0).astype(np.float32), axis=0)
 
         # ==========================================
         # 4. 数据增强 (仅在训练时)
@@ -116,19 +126,16 @@ class ProstateUnifiedDataset(Dataset):
         if self.is_train and getattr(Config, 'USE_AUGMENTATION', False):
             input_tensor, masks_to_aug = self._apply_augmentations(input_tensor, masks_to_aug)
 
-        # 将增强后的数据取回
+        # 取回增强后的掩膜
         if masks_to_aug['target'] is not None: target_mask = masks_to_aug['target']
         if masks_to_aug['zones'] is not None: zones_mask = masks_to_aug['zones']
-        if masks_to_aug['seg'] is not None: seg_mask = masks_to_aug['seg']
+        if masks_to_aug['lesion'] is not None: lesion_mask = masks_to_aug['lesion']
+        if masks_to_aug['gland'] is not None: gland_mask = masks_to_aug['gland']
 
         # ==========================================
-        # 5. 特殊处理：防止信息泄露 (Rajagopal 等人的消融点)
+        # 5. 特殊处理：防止标签信息冲突 (Rajagopal)
         # ==========================================
-        # 如果一个病人同时做过靶向和系统穿刺，系统盲穿往往有假阴性（没扎准）。
-        # 为了防止系统标签的"假阴性"干扰靶向区域真实的"强阳性"，
-        # 我们可以选择在计算系统 Loss 时，从 zones_mask 中挖掉 target_mask 所在的区域。
         if getattr(Config, 'MASK_TARGET_IN_SYS', False) and has_target and has_sys:
-            # 把 target_mask > 0 的地方的 zones_mask 设为 0（背景）
             zones_mask[target_mask > 0] = 0
 
         # ==========================================
@@ -137,22 +144,23 @@ class ProstateUnifiedDataset(Dataset):
         return {
             'pid': pid,
             'input': torch.from_numpy(input_tensor),         # (3, 32, 64, 64)
-            'target_mask': torch.from_numpy(target_mask),    # (1, 32, 64, 64)
-            'zones_mask': torch.from_numpy(zones_mask),      # (1, 32, 64, 64)
-            'sys_labels': torch.from_numpy(sys_labels),      # (20,)
-            'seg_mask': torch.from_numpy(seg_mask),          # (1, 32, 64, 64)
+            'target_mask': torch.from_numpy(target_mask),    # (1, 32, 64, 64) [包含ISUP 0~6]
+            'zones_mask': torch.from_numpy(zones_mask),      # (1, 32, 64, 64) [包含区域ID]
+            'sys_labels': torch.from_numpy(sys_labels),      # (20,) [包含ISUP 0~6]
+            'lesion_mask': torch.from_numpy(lesion_mask),    # (1, 32, 64, 64) [二值: 0, 1]
+            'gland_mask': torch.from_numpy(gland_mask),      # (1, 32, 64, 64) [二值: 0, 1]
             
-            # 以下标识符用于在 Loss 函数中进行动态路由
+            # 路由标志位
             'has_target': torch.tensor(has_target, dtype=torch.float32),
             'has_sys': torch.tensor(has_sys, dtype=torch.float32),
-            'has_seg': torch.tensor(has_seg, dtype=torch.float32)
+            'has_lesion': torch.tensor(has_lesion, dtype=torch.float32),
+            'has_gland': torch.tensor(has_gland, dtype=torch.float32)
         }
 
 # --- 本地测试代码 ---
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
     
-    # 模拟测试环境
     print("Testing ProstateUnifiedDataset...")
     test_csv = os.path.join(Config.SPLIT_DIR, 'train.csv')
     
@@ -160,20 +168,21 @@ if __name__ == "__main__":
         dataset = ProstateUnifiedDataset(csv_path=test_csv, data_root=Config.UNIFIED_DATA_DIR, is_train=True)
         print(f"Dataset Size: {len(dataset)}")
         
-        # 测试 DataLoader
         loader = DataLoader(dataset, batch_size=4, shuffle=True)
         batch = next(iter(loader))
         
-        print("\nBatch Shapes:")
+        print("\nBatch Tensor Shapes:")
         print(f"  Inputs:      {batch['input'].shape}")
         print(f"  Target Mask: {batch['target_mask'].shape}")
         print(f"  Zones Mask:  {batch['zones_mask'].shape}")
         print(f"  Sys Labels:  {batch['sys_labels'].shape}")
-        print(f"  Seg Mask:    {batch['seg_mask'].shape}")
+        print(f"  Lesion Mask: {batch['lesion_mask'].shape}")
+        print(f"  Gland Mask:  {batch['gland_mask'].shape}")
         
-        print("\nBatch Flags:")
+        print("\nBatch Active Flags (1.0 means active):")
         print(f"  Has Target:  {batch['has_target']}")
         print(f"  Has Sys:     {batch['has_sys']}")
-        print(f"  Has Seg:     {batch['has_seg']}")
+        print(f"  Has Lesion:  {batch['has_lesion']}")
+        print(f"  Has Gland:   {batch['has_gland']}")
     else:
         print("CSV index not found. Please run the unified dataset script first.")

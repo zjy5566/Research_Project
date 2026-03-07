@@ -6,12 +6,8 @@ from tqdm import tqdm
 
 def create_unified_dataset(base_dir):
     # --- 1. 定义路径 ---
-    # 根据你的结构修正了路径
     src_pub = os.path.join(base_dir, 'Dataset_prostate_MRI','Dataset_prostate_MRI')
     src_promis = os.path.join(base_dir, 'derived PROMIS data set', 'Processed_PROMIS')
-    
-    # 注意：如果你的 Processed_TCIA 下面不小心多嵌套了一层 Processed_PROMIS，请将此处修改为对应的真实路径
-    # 这里按照标准逻辑指向 Processed_TCIA
     src_tcia = os.path.join(base_dir, 'Target biosy', 'Processed_TCIA')
     
     dst_root = os.path.join(base_dir, 'Unified_Dataset')
@@ -22,7 +18,6 @@ def create_unified_dataset(base_dir):
     # --- 2. 整合 TCIA 靶向活检集 ---
     print("Processing TCIA Target Biopsy Dataset...")
     if os.path.exists(src_tcia):
-        # 兼容处理：防患于未然，检查是不是嵌套在子文件夹里
         tcia_search_dir = src_tcia
         if os.path.exists(os.path.join(src_tcia, 'Processed_PROMIS')):
             tcia_search_dir = os.path.join(src_tcia, 'Processed_PROMIS')
@@ -35,27 +30,29 @@ def create_unified_dataset(base_dir):
             # 【完整性检查】必须同时拥有输入张量、12区掩膜、12区标签
             req_files = ['input_tensor.npy', 'zones_mask.nii.gz', 'systematic_labels.npy']
             if not all(os.path.exists(os.path.join(src_p_dir, f)) for f in req_files):
-                continue # 文件不全，直接跳过，不创建空文件夹
+                continue 
             
-            # 判断是否有靶向掩膜
             has_target = 1 if os.path.exists(os.path.join(src_p_dir, 'target_bx.nii.gz')) else 0
+            # 检查是否有腺体掩膜 (你之前的代码命名为 gland_mask_crop.nii.gz)
+            has_gland = 1 if os.path.exists(os.path.join(src_p_dir, 'gland_mask_crop.nii.gz')) else 0
             
             new_pid = f"TCIA_{pid.split('-')[-1]}"
             dst_p_dir = os.path.join(dst_root, new_pid)
             os.makedirs(dst_p_dir, exist_ok=True)
             
-            # 复制基础文件
             shutil.copy2(os.path.join(src_p_dir, 'input_tensor.npy'), os.path.join(dst_p_dir, 'input_tensor.npy'))
             shutil.copy2(os.path.join(src_p_dir, 'zones_mask.nii.gz'), os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
-            # 复制系统标签并重命名以作区分
             shutil.copy2(os.path.join(src_p_dir, 'systematic_labels.npy'), os.path.join(dst_p_dir, 'systematic_labels_12.npy'))
             
             if has_target:
                 shutil.copy2(os.path.join(src_p_dir, 'target_bx.nii.gz'), os.path.join(dst_p_dir, 'target_bx.nii.gz'))
+            if has_gland:
+                # 统一重命名为 gland_mask.nii.gz
+                shutil.copy2(os.path.join(src_p_dir, 'gland_mask_crop.nii.gz'), os.path.join(dst_p_dir, 'gland_mask.nii.gz'))
 
             registry_data.append({
                 'patient_id': new_pid, 'source': 'TCIA',
-                'has_target': has_target, 'has_sys_12': 1, 'has_sys_20': 0, 'has_lesion': 0
+                'has_target': has_target, 'has_sys_12': 1, 'has_sys_20': 0, 'has_lesion': 0, 'has_gland': has_gland
             })
 
     # --- 3. 整合 PROMIS 数据集 ---
@@ -66,27 +63,29 @@ def create_unified_dataset(base_dir):
         for pid in tqdm(promis_patients):
             src_p_dir = os.path.join(src_promis, pid)
             
-            # 【完整性检查】PROMIS 现在都在同一个文件夹下，要求这三者必备
             req_files = ['input_tensor.npy', 'zones_mask.nii.gz', 'systematic_labels.npy']
             if not all(os.path.exists(os.path.join(src_p_dir, f)) for f in req_files):
                 continue
+                
+            has_gland = 1 if os.path.exists(os.path.join(src_p_dir, 'gland_mask.nii.gz')) else 0
                 
             new_pid = f"PROMIS_{pid}"
             dst_p_dir = os.path.join(dst_root, new_pid)
             os.makedirs(dst_p_dir, exist_ok=True)
             
-            # 复制文件
             shutil.copy2(os.path.join(src_p_dir, 'input_tensor.npy'), os.path.join(dst_p_dir, 'input_tensor.npy'))
             shutil.copy2(os.path.join(src_p_dir, 'zones_mask.nii.gz'), os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
-            # 复制系统标签并重命名以作区分
             shutil.copy2(os.path.join(src_p_dir, 'systematic_labels.npy'), os.path.join(dst_p_dir, 'systematic_labels_20.npy'))
+            
+            if has_gland:
+                shutil.copy2(os.path.join(src_p_dir, 'gland_mask.nii.gz'), os.path.join(dst_p_dir, 'gland_mask.nii.gz'))
                 
             registry_data.append({
                 'patient_id': new_pid, 'source': 'PROMIS',
-                'has_target': 0, 'has_sys_12': 0, 'has_sys_20': 1, 'has_lesion': 0
+                'has_target': 0, 'has_sys_12': 0, 'has_sys_20': 1, 'has_lesion': 0, 'has_gland': has_gland
             })
 
-    # --- 4. 整合 公开 MRI 数据集 (Dataset_prostate_MRI) ---
+    # --- 4. 整合 公开 MRI 数据集 (PUB) ---
     print("\nProcessing Dataset_prostate_MRI...")
     if os.path.exists(src_pub):
         pub_files = os.listdir(src_pub)
@@ -95,22 +94,24 @@ def create_unified_dataset(base_dir):
         for pid in tqdm(pub_ids):
             src_img = os.path.join(src_pub, f"{pid}_img.npy")
             src_lab = os.path.join(src_pub, f"{pid}_lab.npy")
+            src_zone = os.path.join(src_pub, f"{pid}_zone.npy") # 新增: PUB的腺体/区域掩膜
             
-            # 【完整性检查】必须同时拥有影像和标注
-            if not os.path.exists(src_img) or not os.path.exists(src_lab):
+            # 【完整性检查】必须同时拥有影像、病灶(lab) 和 腺体(zone)
+            if not all(os.path.exists(f) for f in [src_img, src_lab, src_zone]):
                 continue
                 
             new_pid = f"PUB_{pid}"
             dst_p_dir = os.path.join(dst_root, new_pid)
             os.makedirs(dst_p_dir, exist_ok=True)
             
-            # 重命名为标准的规范命名，并注意 lab 是病灶 (lesion)
+            # 拷贝并规范化命名
             shutil.copy2(src_img, os.path.join(dst_p_dir, 'input_tensor.npy'))
             shutil.copy2(src_lab, os.path.join(dst_p_dir, 'lesion_mask.npy'))
+            shutil.copy2(src_zone, os.path.join(dst_p_dir, 'gland_mask.npy')) # 强行改名为 gland_mask.npy
                 
             registry_data.append({
                 'patient_id': new_pid, 'source': 'PUB',
-                'has_target': 0, 'has_sys_12': 0, 'has_sys_20': 0, 'has_lesion': 1
+                'has_target': 0, 'has_sys_12': 0, 'has_sys_20': 0, 'has_lesion': 1, 'has_gland': 1
             })
 
     # --- 5. 生成索引表与分层划分 ---
@@ -125,7 +126,6 @@ def create_unified_dataset(base_dir):
     os.makedirs(splits_dir, exist_ok=True)
     df.to_csv(os.path.join(splits_dir, 'dataset_registry.csv'), index=False)
 
-    # 按照数据源 (source) 进行分层划分
     train_val_df, test_df = train_test_split(df, test_size=0.20, random_state=42, stratify=df['source'])
     train_df, val_df = train_test_split(train_val_df, test_size=0.125, random_state=42, stratify=train_val_df['source'])
 
