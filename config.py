@@ -66,17 +66,18 @@ class Config:
     # ==========================================
     # 5. 多任务权重控制 (Latent Variables & Loss Weights)
     # ==========================================
-    # 【主任务】 ISUP 分级金标准 (靶向穿刺)，保持绝对主导
+    # 【主任务】 Cancer Grade 
     LAMBDA_GRADE = 1.0   
-    
-    # 【主任务补充】 系统区域级弱监督，为防假阴性带偏，适当降权
     LAMBDA_SYS = 0.5     
     
-    # 【辅任务A】 病灶发现 (Lesion Risk)，提供强劲且健康的底层特征，权重拉满
-    LAMBDA_LESION = 1.0  
+    # 【辅任务A】 Lesion Risk (将原来的单一权重拆解为多源内部权重)
+    LAMBDA_LESION = 1.0        # Lesion 整体分支的缩放系数
+    LESION_W_DENSE = 1.0       # 密集强监督 (PUB): 提供形状基准
+    LESION_W_SPARSE = 1.0      # 稀疏强监督 (靶向): 提供确信的局部锚点
+    LESION_W_REGIONAL = 0.2    # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
     
-    # 【辅任务B】 解剖先验 (Gland Seg)，极易收敛，防止网络偷懒，权重设低
-    LAMBDA_GLAND = 0.2   
+    # 【辅任务B】 Gland Anatomy
+    LAMBDA_GLAND = 0.2 
     
     # ==========================================
     # 6. 消融实验控制开关 (Ablation Study Flags)
