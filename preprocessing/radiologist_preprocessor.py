@@ -75,37 +75,30 @@ class ProstateDataPreprocessor:
         label_path = os.path.join(self.root_dir, 'labelsTr', f"{patient_id}.nii.gz")
         zone_path = os.path.join(self.root_dir, 'zonesTr', f"{patient_id}.nii.gz")
 
-        # 如果缺失任何一个模态，则跳过
-        if not all([os.path.exists(p) for p in [t2_path, adc_path, dwi_path, zone_path]]):
-            print(f"Skipped {patient_id}: Missing modalities or zone mask.")
+        # 严格要求必须存在 label_path (病灶掩膜)。缺失则直接 return 放弃该病人。
+        if not all([os.path.exists(p) for p in [t2_path, adc_path, dwi_path, zone_path, label_path]]):
             return
 
-        # 2. 读取数据 (使用 SimpleITK 对象以便进行空间变换)
+        # 2. 读取数据
         t2 = sitk.ReadImage(t2_path)
         adc = sitk.ReadImage(adc_path)
         dwi = sitk.ReadImage(dwi_path)
         zone = sitk.ReadImage(zone_path)
-        
-        # 标签可能不存在（例如只有 gland mask 的情况）
-        has_label = os.path.exists(label_path)
-        if has_label:
-            label = sitk.ReadImage(label_path)
+        label = sitk.ReadImage(label_path)
 
         # 3. 统一重采样
         t2_res = self.resample_to_spacing(t2)
         adc_res = self.resample_to_spacing(adc)
         dwi_res = self.resample_to_spacing(dwi)
         zone_res = self.resample_to_spacing(zone, is_label=True)
-        if has_label:
-            label_res = self.resample_to_spacing(label, is_label=True)
+        label_res = self.resample_to_spacing(label, is_label=True)
 
         # 4. 以前列腺质心进行中心裁剪
         t2_crop = self.mask_centered_crop(t2_res, zone_res)
         adc_crop = self.mask_centered_crop(adc_res, zone_res)
         dwi_crop = self.mask_centered_crop(dwi_res, zone_res)
-        zone_crop = self.mask_centered_crop(zone_res, zone_res)
-        if has_label:
-            label_crop = self.mask_centered_crop(label_res, zone_res)
+        label_crop = self.mask_centered_crop(label_res, zone_res)
+        zone_crop = self.mask_centered_crop(zone_res, zone_res) # 确保 zone_mask 也被同步裁剪
 
         # 5. 转为 Numpy 数组并归一化
         t2_arr = sitk.GetArrayFromImage(t2_crop)
@@ -119,29 +112,39 @@ class ProstateDataPreprocessor:
             self.normalize_array(adc_arr)
         ], axis=0).astype(np.float32)
 
-        # 7. 标签处理
-        # 优先保存 lesion label，如果没有则保存 zone mask 作为辅助分割任务的标签
-        if has_label:
-            label_arr = sitk.GetArrayFromImage(label_crop)
-            final_label = (label_arr > 0).astype(np.uint8)
-        else:
-            zone_arr = sitk.GetArrayFromImage(zone_crop)
-            final_label = (zone_arr > 0).astype(np.uint8)
+        # 7. 标签与区域掩膜处理
+        # (label_arr > 0) 自动将原数据中被标为 1,2,3... 等多个病灶转化为统一的二值分割掩膜(1)
+        label_arr = sitk.GetArrayFromImage(label_crop)
+        final_label = (label_arr > 0).astype(np.uint8)
+
+        # 【核心新增点】：提取裁剪后的 zone_mask
+        zone_arr = sitk.GetArrayFromImage(zone_crop)
+        final_zone = zone_arr.astype(np.uint8) 
 
         # 8. 保存处理后的结果
-        # 命名格式严格遵守 000_img.npy 和 000_lab.npy
+        # 命名格式严格遵守 _img.npy, _lab.npy, _zone.npy
         np.save(os.path.join(self.output_dir, f"{patient_id}_img.npy"), stacked_img)
         np.save(os.path.join(self.output_dir, f"{patient_id}_lab.npy"), final_label)
+        np.save(os.path.join(self.output_dir, f"{patient_id}_zone.npy"), final_zone) # 新增保存 zone_mask
 
     def run_all(self):
         t2_files = glob.glob(os.path.join(self.root_dir, 'imagesTr', '*_0000.nii.gz'))
         patient_ids = sorted([os.path.basename(f).replace('_0000.nii.gz', '') for f in t2_files])
         
+        valid_count = 0
         for pid in tqdm(patient_ids, desc="Processing MRI Dataset"):
             try:
+                # 在处理前可加一层预判，减少报错日志刷屏
+                label_path = os.path.join(self.root_dir, 'labelsTr', f"{pid}.nii.gz")
+                if not os.path.exists(label_path):
+                    continue
+                    
                 self.process_patient(pid)
+                valid_count += 1
             except Exception as e:
                 print(f"Error processing {pid}: {e}")
+                
+        print(f"Processing complete. Successfully processed {valid_count} patients with valid lesion masks.")
 
 # --- 使用示例 ---
 if __name__ == "__main__":
