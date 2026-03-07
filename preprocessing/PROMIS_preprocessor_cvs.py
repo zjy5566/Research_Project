@@ -29,14 +29,15 @@ def process_promis_sbx_csv(file_path):
         print(f"处理文件 {file_path} 时出错: {e}")
         return None
 
-def batch_convert_csv_to_npy(input_dir, output_dir):
+def batch_convert_csv_to_npy(input_dir, output_root):
     """
-    遍历文件夹，转换所有 CSV 为 npy
+    遍历文件夹，转换所有 CSV 并存入对应的病人 ID 文件夹下
     """
-    # 如果输出文件夹不存在则创建
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"已创建输出目录: {output_dir}")
+    # 检查输出根目录是否存在
+    if not os.path.exists(output_root):
+        print(f"警告: 输出根目录 {output_root} 不存在，请确保预处理图像的步骤已创建该目录。")
+        # 如果你希望自动创建根目录，可以取消下面一行的注释
+        # os.makedirs(output_root)
 
     count = 0
     # 遍历输入目录下的所有文件
@@ -48,22 +49,34 @@ def batch_convert_csv_to_npy(input_dir, output_dir):
             labels = process_promis_sbx_csv(file_path)
             
             if labels is not None:
-                # 提取 Patient 编号作为文件名 (去掉 .csv 后缀)
+                # 1. 提取 Patient 编号 (例如 P-12345678)
                 patient_id = os.path.splitext(filename)[0]
-                save_path = os.path.join(output_dir, f"{patient_id}.npy")
+                
+                # 2. 构造病人对应的目标文件夹路径
+                patient_folder = os.path.join(output_root, patient_id)
+                
+                # 3. 如果该病人的文件夹不存在则创建 (通常应与图像预处理目录一致)
+                if not os.path.exists(patient_folder):
+                    os.makedirs(patient_folder)
+                
+                # 4. 构造最终的文件保存路径，命名为 systematic_labels.npy
+                save_path = os.path.join(patient_folder, "systematic_labels.npy")
                 
                 # 保存为 npy 文件
                 np.save(save_path, labels)
                 count += 1
+                
                 if count % 50 == 0:
                     print(f"已处理 {count} 个病例...")
 
-    print(f"\n全部处理完成！共转换 {count} 个文件。")
-    print(f"结果已存至: {output_dir}")
+    print(f"\n全部处理完成！共转换 {count} 个标签文件。")
+    print(f"所有 systematic_labels.npy 已存入 {output_root} 下的各病人目录。")
 
 # --- 配置路径 ---
+# CSV 源文件目录
 input_folder = r'F:\RP_dataset\derived PROMIS data set\Template_biopsy\Template_biopsy'
-output_folder = r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY'
+# 目标根目录 (Processed_PROMIS)
+output_folder = r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS'
 
 # 执行批量转换
 batch_convert_csv_to_npy(input_folder, output_folder)
