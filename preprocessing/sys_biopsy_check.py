@@ -11,7 +11,7 @@ def map_sys_labels_to_3d_mask(patient_dir):
     # 1. 定义文件路径
     zones_mask_path = os.path.join(patient_dir, 'zones_mask.nii.gz')
     labels_12_path = os.path.join(patient_dir, 'systematic_labels.npy')
-    labels_20_path = os.path.join(patient_dir, 'systematic_labels_20.npy')
+    labels_20_path = os.path.join(patient_dir, 'systematic_labels.npy')
     
     # 确定使用的 label 文件 (优先 12 区，兼容 20 区)
     labels_path = labels_12_path if os.path.exists(labels_12_path) else labels_20_path
@@ -60,12 +60,14 @@ def map_sys_labels_to_3d_mask(patient_dir):
 
 if __name__ == "__main__":
     
-    dataset_root = r"F:\RP_dataset\Target biosy\Processed_TCIA"
+    # dataset_root = r"F:\RP_dataset\Target biosy\Processed_TCIA"
+    dataset_root = r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS"
     
     # 修改了此处的 startswith 判断逻辑，匹配实际的文件夹命名
+    # patients = [d for d in os.listdir(dataset_root) 
+    #             if os.path.isdir(os.path.join(dataset_root, d)) and d.startswith('Prostate-MRI-US-Biopsy-')]
     patients = [d for d in os.listdir(dataset_root) 
-                if os.path.isdir(os.path.join(dataset_root, d)) and d.startswith('Prostate-MRI-US-Biopsy-')]
-    
+                 if os.path.isdir(os.path.join(dataset_root, d)) and d.startswith('P-')]
     print(f"\n--- 正在批量处理 {len(patients)} 个病人 ---")
     
     # 使用 tqdm 包装循环，动态显示进度条

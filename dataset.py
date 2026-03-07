@@ -74,7 +74,9 @@ class ProstateUnifiedDataset(Dataset):
         
         has_target = float(row['has_target'])
         has_sys = float(row['has_sys_12'] or row['has_sys_20'])
-        has_seg = float(row['has_gland'])
+        
+        # 【修改点 1】: 根据新生成的 CSV，将 has_gland 改为了 has_lesion
+        has_seg = float(row['has_lesion'])
 
         # ==========================================
         # 3. 按需加载具体标签数据
@@ -102,10 +104,10 @@ class ProstateUnifiedDataset(Dataset):
                 s_labels = np.load(os.path.join(p_dir, 'systematic_labels_20.npy'))
                 sys_labels[:20] = s_labels
 
-        # --- C. 辅助监督：密集分割 (Gland / Lesion) ---
+        # --- C. 辅助监督：密集病灶分割 (Lesion Segmentation) ---
         if has_seg:
-            # PUB 数据集保存为了 .npy
-            s_arr = np.load(os.path.join(p_dir, 'gland_mask.npy')).astype(np.float32)
+            # 【修改点 2】: 文件名由 gland_mask.npy 改为 lesion_mask.npy
+            s_arr = np.load(os.path.join(p_dir, 'lesion_mask.npy')).astype(np.float32)
             masks_to_aug['seg'] = np.expand_dims(s_arr, axis=0)
 
         # ==========================================

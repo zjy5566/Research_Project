@@ -7,7 +7,7 @@ from tqdm import tqdm
 def create_unified_dataset(base_dir):
     # --- 1. 定义路径 ---
     # 根据你的结构修正了路径
-    src_pub = os.path.join(base_dir, 'Dataset_prostate_MRI')
+    src_pub = os.path.join(base_dir, 'Dataset_prostate_MRI','Dataset_prostate_MRI')
     src_promis = os.path.join(base_dir, 'derived PROMIS data set', 'Processed_PROMIS')
     
     # 注意：如果你的 Processed_TCIA 下面不小心多嵌套了一层 Processed_PROMIS，请将此处修改为对应的真实路径
