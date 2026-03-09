@@ -32,7 +32,7 @@ Our pipeline unifies three distinct data sources into a standardized patient-cen
 - **Resampling**: All modalities and masks are isotropically resampled to a uniform physical spacing of `[1.0, 1.0, 2.24] mm`.
 - **Centroid Cropping**: Uses `sitk.LabelShapeStatisticsImageFilter` to extract the physical centroid of the prostate gland.
 - **Dynamic Padding**: Crops a fixed volume of **$64 \times 64 \times 32$** around the centroid. Automatically applies zero-padding if the physical boundaries exceed the image size.
-- **Normalization**: Applies Global Z-score normalization per channel `(x - mean) / std`.
+- **Normalization**: Applies regional Z-score normalization per channel `(x - mean) / std`.
 
 ### Step 3: Biopsy Trajectory Mapping (The Core Innovation)
 Instead of manual pixel offsets, we utilize physical coordinate transformations (`TransformPhysicalPointToIndex`) to ensure perfect alignment:

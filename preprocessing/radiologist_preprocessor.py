@@ -16,7 +16,7 @@ class ProstateDataPreprocessor:
         self.target_size = target_size
         os.makedirs(output_dir, exist_ok=True)
 
-    # --- 1. 重采样函数 (保持与其它数据集一致) ---
+    # --- 1. 重采样函数 ---
     def resample_to_spacing(self, image, is_label=False):
         original_spacing = image.GetSpacing()
         original_size = image.GetSize()
@@ -30,24 +30,20 @@ class ProstateDataPreprocessor:
         resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
         return resampler.Execute(image)
 
-    # --- 2. 以前列腺掩膜为中心的裁剪函数 (保持与其它数据集一致) ---
+    # --- 2. 以前列腺掩膜为中心的裁剪函数 ---
     def mask_centered_crop(self, img, mask):
         label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
-        # 确保 mask 为二值图像
         binary_mask = sitk.Cast(mask > 0, sitk.sitkUInt8)
         label_shape_filter.Execute(binary_mask)
         
         if label_shape_filter.GetNumberOfLabels() == 0:
-            # 如果 mask 为空，回退到图像中心裁剪
             center_index = [s // 2 for s in img.GetSize()]
         else:
-            # 获取质心物理坐标并转为索引
             centroid_world = label_shape_filter.GetCentroid(1) 
             center_index = img.TransformPhysicalPointToIndex(centroid_world)
 
         roi_start = [center_index[i] - self.target_size[i] // 2 for i in range(3)]
         
-        # 处理 Padding
         img_size = img.GetSize()
         pad_lower = [max(0, -roi_start[i]) for i in range(3)]
         pad_upper = [max(0, roi_start[i] + self.target_size[i] - img_size[i]) for i in range(3)]
@@ -58,14 +54,33 @@ class ProstateDataPreprocessor:
         
         return sitk.RegionOfInterest(img, self.target_size, roi_start)
 
-    # --- 3. 归一化函数 ---
-    def normalize_array(self, img_arr):
+    # --- 3. 归一化函数 (已修改为局部/前景归一化) ---
+    def normalize_array(self, img_arr, mask_arr):
         """
-        全局 Z-score 归一化 (与 TCIA/PROMIS 数据集保持一致)
+        局部 Z-score 归一化 (Foreground Normalization)
+        仅利用前列腺区域 (mask > 0) 的像素计算均值和方差，并应用到整张图。
         """
         img_arr = img_arr.astype(np.float32)
-        std = np.std(img_arr)
-        return (img_arr - np.mean(img_arr)) / (std if std > 1e-7 else 1.0)
+        
+        # 提取前列腺内部的有效像素
+        valid_pixels = img_arr[mask_arr > 0]
+        
+        # 防御性编程：万一遇到了极其罕见的空 mask，回退到全局归一化
+        if len(valid_pixels) == 0:
+            mean_val = np.mean(img_arr)
+            std_val = np.std(img_arr)
+        else:
+            mean_val = np.mean(valid_pixels)
+            std_val = np.std(valid_pixels)
+            
+        # 将局部算出的均值和方差，应用到整张图像上
+        norm_arr = (img_arr - mean_val) / (std_val if std_val > 1e-7 else 1.0)
+        
+        # 【进阶可选操作】：如果你希望网络完全不受周围脂肪和直肠的干扰，
+        # 可以取消下面这行的注释，直接把前列腺外面的背景全部设为纯黑(0)。
+        # norm_arr[mask_arr == 0] = 0.0
+        
+        return norm_arr
 
     def process_patient(self, patient_id):
         # 1. 构建路径
@@ -75,7 +90,6 @@ class ProstateDataPreprocessor:
         label_path = os.path.join(self.root_dir, 'labelsTr', f"{patient_id}.nii.gz")
         zone_path = os.path.join(self.root_dir, 'zonesTr', f"{patient_id}.nii.gz")
 
-        # 严格要求必须存在 label_path (病灶掩膜)。缺失则直接 return 放弃该病人。
         if not all([os.path.exists(p) for p in [t2_path, adc_path, dwi_path, zone_path, label_path]]):
             return
 
@@ -98,34 +112,32 @@ class ProstateDataPreprocessor:
         adc_crop = self.mask_centered_crop(adc_res, zone_res)
         dwi_crop = self.mask_centered_crop(dwi_res, zone_res)
         label_crop = self.mask_centered_crop(label_res, zone_res)
-        zone_crop = self.mask_centered_crop(zone_res, zone_res) # 确保 zone_mask 也被同步裁剪
+        zone_crop = self.mask_centered_crop(zone_res, zone_res)
 
-        # 5. 转为 Numpy 数组并归一化
+        # 5. 转为 Numpy 数组
         t2_arr = sitk.GetArrayFromImage(t2_crop)
         adc_arr = sitk.GetArrayFromImage(adc_crop)
         dwi_arr = sitk.GetArrayFromImage(dwi_crop)
-
-        # 6. 多模态堆叠 (严格遵守 T2, DWI, ADC 的通道顺序！！！)
-        stacked_img = np.stack([
-            self.normalize_array(t2_arr), 
-            self.normalize_array(dwi_arr), 
-            self.normalize_array(adc_arr)
-        ], axis=0).astype(np.float32)
-
-        # 7. 标签与区域掩膜处理
-        # (label_arr > 0) 自动将原数据中被标为 1,2,3... 等多个病灶转化为统一的二值分割掩膜(1)
-        label_arr = sitk.GetArrayFromImage(label_crop)
-        final_label = (label_arr > 0).astype(np.uint8)
-
-        # 【核心新增点】：提取裁剪后的 zone_mask
+        
+        # 【修改逻辑】：提前提取 zone_mask，因为归一化函数现在需要用到它
         zone_arr = sitk.GetArrayFromImage(zone_crop)
         final_zone = zone_arr.astype(np.uint8) 
 
+        # 6. 多模态堆叠并执行前景局部归一化 (传入 final_zone)
+        stacked_img = np.stack([
+            self.normalize_array(t2_arr, final_zone), 
+            self.normalize_array(dwi_arr, final_zone), 
+            self.normalize_array(adc_arr, final_zone)
+        ], axis=0).astype(np.float32)
+
+        # 7. 标签与区域掩膜处理
+        label_arr = sitk.GetArrayFromImage(label_crop)
+        final_label = (label_arr > 0).astype(np.uint8)
+
         # 8. 保存处理后的结果
-        # 命名格式严格遵守 _img.npy, _lab.npy, _zone.npy
         np.save(os.path.join(self.output_dir, f"{patient_id}_img.npy"), stacked_img)
         np.save(os.path.join(self.output_dir, f"{patient_id}_lab.npy"), final_label)
-        np.save(os.path.join(self.output_dir, f"{patient_id}_zone.npy"), final_zone) # 新增保存 zone_mask
+        np.save(os.path.join(self.output_dir, f"{patient_id}_zone.npy"), final_zone)
 
     def run_all(self):
         t2_files = glob.glob(os.path.join(self.root_dir, 'imagesTr', '*_0000.nii.gz'))
@@ -134,7 +146,6 @@ class ProstateDataPreprocessor:
         valid_count = 0
         for pid in tqdm(patient_ids, desc="Processing MRI Dataset"):
             try:
-                # 在处理前可加一层预判，减少报错日志刷屏
                 label_path = os.path.join(self.root_dir, 'labelsTr', f"{pid}.nii.gz")
                 if not os.path.exists(label_path):
                     continue

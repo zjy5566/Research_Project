@@ -31,15 +31,11 @@ def register_images(fixed_image, moving_image, is_label=False):
 
 
 # ==========================================
-# 2. 单病例处理流程 (修改版)
+# 2. 单病例处理流程 (引入前景归一化)
 # ==========================================
 def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24], crop_size=[64, 64, 32]):
     case_id = os.path.basename(case_dir)
     save_path = os.path.join(output_dir, case_id)
-    
-    # if os.path.exists(os.path.join(save_path, 'zones_mask.nii.gz')):
-    #     # print(f"Skip {case_id}: already processed.") 
-    #     return
     
     os.makedirs(save_path, exist_ok=True)
     
@@ -48,7 +44,6 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
         adc = sitk.ReadImage(os.path.join(case_dir, 'adc.nii.gz'))
         dwi = sitk.ReadImage(os.path.join(case_dir, 'dwi.nii.gz'))
         gland = sitk.ReadImage(os.path.join(case_dir, 'gland.nii.gz'))
-        # --- 新增: 读取开源代码生成的原尺寸 20 zones mask ---
         zones = sitk.ReadImage(os.path.join(case_dir, 'gland_zone_20level_set1.nii.gz'))
     except Exception as e:
         print(f"\n[Error] Missing files in {case_id}: {e}")
@@ -61,14 +56,13 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
         resampler.SetSize(new_size)
         resampler.SetOutputDirection(image.GetDirection())
         resampler.SetOutputOrigin(image.GetOrigin())
-        # 对于 Mask 标签（gland 和 zones），严格使用 NearestNeighbor，避免产生小数
         resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
         return resampler.Execute(image)
 
     # --- 对所有模态和Mask进行重采样 ---
     t2_res = resample(t2)
     gland_res = resample(gland, is_label=True)
-    zones_res = resample(zones, is_label=True) # 新增: 对 20 zones 进行重采样
+    zones_res = resample(zones, is_label=True)
     adc_res_init = resample(adc)
     dwi_res_init = resample(dwi)
 
@@ -94,7 +88,7 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
     adc_reg = pad_if_needed(adc_reg, crop_size)
     dwi_reg = pad_if_needed(dwi_reg, crop_size)
     gland_res = pad_if_needed(gland_res, crop_size)
-    zones_res = pad_if_needed(zones_res, crop_size) # 新增: 对 20 zones 进行补齐
+    zones_res = pad_if_needed(zones_res, crop_size)
 
     # --- 以 Gland 的质心计算裁剪坐标 ---
     stats = sitk.LabelShapeStatisticsImageFilter()
@@ -113,14 +107,38 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
     adc_crop = sitk.RegionOfInterest(adc_reg, crop_size, roi_start)
     dwi_crop = sitk.RegionOfInterest(dwi_reg, crop_size, roi_start)
     gland_crop = sitk.RegionOfInterest(gland_res, crop_size, roi_start)
-    zones_crop = sitk.RegionOfInterest(zones_res, crop_size, roi_start) # 新增: 对 20 zones 进行同步裁剪
+    zones_crop = sitk.RegionOfInterest(zones_res, crop_size, roi_start)
 
-    def finalize(img):
+    # ========================================================
+    # 【核心修改点】：前景 Z-score 局部归一化逻辑
+    # ========================================================
+    # 先提取出 Gland 的 Numpy 数组，作为计算统计量的掩膜标尺
+    gland_arr = sitk.GetArrayFromImage(gland_crop).astype(np.uint8)
+
+    def finalize_foreground(img, mask_arr):
+        """仅利用前列腺腺体内部的像素计算均值和方差"""
         arr = sitk.GetArrayFromImage(img).astype(np.float32)
-        return (arr - np.mean(arr)) / (np.std(arr) + 1e-7)
+        
+        # 提取前列腺内部有效像素
+        valid_pixels = arr[mask_arr > 0]
+        
+        # 防御性回退：如果掩膜为空，则全局归一化
+        if len(valid_pixels) == 0:
+            mean_val = np.mean(arr)
+            std_val = np.std(arr)
+        else:
+            mean_val = np.mean(valid_pixels)
+            std_val = np.std(valid_pixels)
+            
+        return (arr - mean_val) / (std_val + 1e-8)
 
-    # 保存 1: 多模态输入张量
-    input_tensor = np.stack([finalize(t2_crop), finalize(dwi_crop), finalize(adc_crop)], axis=0)
+    # 保存 1: 多模态输入张量 (传入 gland_arr 作为前景计算标尺)
+    input_tensor = np.stack([
+        finalize_foreground(t2_crop, gland_arr), 
+        finalize_foreground(dwi_crop, gland_arr), 
+        finalize_foreground(adc_crop, gland_arr)
+    ], axis=0)
+    
     np.save(os.path.join(save_path, 'input_tensor.npy'), input_tensor)
     
     # 保存 2: Gland 腺体掩膜 

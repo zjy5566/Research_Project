@@ -65,11 +65,25 @@ def mask_centered_crop(img, mask, target_size=[64, 64, 32]):
     
     return sitk.RegionOfInterest(img, target_size, roi_start)
 
-# --- 4. 归一化函数 ---
-def normalize_array(img):
+# ========================================================
+# --- 4. 归一化函数 (修改为前景 Z-score 局部归一化) ---
+# ========================================================
+def normalize_array(img, mask_arr):
     arr = sitk.GetArrayFromImage(img).astype(np.float32)
-    std = np.std(arr)
-    return (arr - np.mean(arr)) / (std if std > 1e-7 else 1.0)
+    
+    # 提取前列腺内部有效像素
+    valid_pixels = arr[mask_arr > 0]
+    
+    # 防御性回退：如果掩膜为空，则全局归一化
+    if len(valid_pixels) == 0:
+        mean_val = np.mean(arr)
+        std_val = np.std(arr)
+    else:
+        mean_val = np.mean(valid_pixels)
+        std_val = np.std(valid_pixels)
+        
+    return (arr - mean_val) / (std_val + 1e-8)
+
 
 # --- 5. 单个病例处理流程 ---
 def process_single_patient(p_id, src_path, dst_root):
@@ -116,10 +130,15 @@ def process_single_patient(p_id, src_path, dst_root):
         sitk.WriteImage(dwi_crop, os.path.join(save_dir, 'dwi_crop.nii.gz'))
         sitk.WriteImage(mask_crop, os.path.join(save_dir, 'gland_mask_crop.nii.gz'))
 
+        # ========================================================
+        # 【核心修改点】：提取 mask 数组并传入归一化函数
+        # ========================================================
+        mask_arr = sitk.GetArrayFromImage(mask_crop).astype(np.uint8)
+
         input_tensor = np.stack([
-            normalize_array(t2_crop), 
-            normalize_array(dwi_crop), 
-            normalize_array(adc_crop)
+            normalize_array(t2_crop, mask_arr), 
+            normalize_array(dwi_crop, mask_arr), 
+            normalize_array(adc_crop, mask_arr)
         ], axis=0)
         
         np.save(os.path.join(save_dir, 'input_tensor.npy'), input_tensor)
