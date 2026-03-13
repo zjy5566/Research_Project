@@ -135,7 +135,7 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
     # 保存 1: 多模态输入张量 (传入 gland_arr 作为前景计算标尺)
     input_tensor = np.stack([
         finalize_foreground(t2_crop, gland_arr), 
-        finalize_foreground(dwi_crop, gland_arr), 
+        # finalize_foreground(dwi_crop, gland_arr), 
         finalize_foreground(adc_crop, gland_arr)
     ], axis=0)
     

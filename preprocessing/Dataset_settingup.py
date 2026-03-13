@@ -27,32 +27,44 @@ def create_unified_dataset(base_dir):
         for pid in tqdm(tcia_patients):
             src_p_dir = os.path.join(tcia_search_dir, pid)
             
-            # 【完整性检查】必须同时拥有输入张量、12区掩膜、12区标签
-            req_files = ['input_tensor.npy', 'zones_mask.nii.gz', 'systematic_labels.npy']
-            if not all(os.path.exists(os.path.join(src_p_dir, f)) for f in req_files):
+            # 【修改点 1：降低 TCIA 的强约束】
+            # TCIA 的核心是靶向穿刺，系统穿刺 (zones_mask) 现在是可选项了！
+            # 我们只需要保证它至少有 input_tensor 和 (靶向 或 系统两者之一)
+            if not os.path.exists(os.path.join(src_p_dir, 'input_tensor.npy')):
                 continue 
             
+            # 检查各项数据是否存在
             has_target = 1 if os.path.exists(os.path.join(src_p_dir, 'target_bx.nii.gz')) else 0
-            # 检查是否有腺体掩膜 (你之前的代码命名为 gland_mask_crop.nii.gz)
+            has_sys_12 = 1 if (os.path.exists(os.path.join(src_p_dir, 'zones_mask.nii.gz')) and 
+                               os.path.exists(os.path.join(src_p_dir, 'systematic_labels.npy'))) else 0
             has_gland = 1 if os.path.exists(os.path.join(src_p_dir, 'gland_mask_crop.nii.gz')) else 0
+            
+            # 如果既没有靶向也没有系统活检，这个病人就是无用数据，跳过
+            if has_target == 0 and has_sys_12 == 0:
+                continue
             
             new_pid = f"TCIA_{pid.split('-')[-1]}"
             dst_p_dir = os.path.join(dst_root, new_pid)
             os.makedirs(dst_p_dir, exist_ok=True)
             
+            # 拷贝基础图像
             shutil.copy2(os.path.join(src_p_dir, 'input_tensor.npy'), os.path.join(dst_p_dir, 'input_tensor.npy'))
-            shutil.copy2(os.path.join(src_p_dir, 'zones_mask.nii.gz'), os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
-            shutil.copy2(os.path.join(src_p_dir, 'systematic_labels.npy'), os.path.join(dst_p_dir, 'systematic_labels_12.npy'))
+            
+            # 【修改点 2：条件拷贝】只有存在的文件才拷贝
+            if has_sys_12:
+                shutil.copy2(os.path.join(src_p_dir, 'zones_mask.nii.gz'), os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
+                shutil.copy2(os.path.join(src_p_dir, 'systematic_labels.npy'), os.path.join(dst_p_dir, 'systematic_labels_12.npy'))
             
             if has_target:
                 shutil.copy2(os.path.join(src_p_dir, 'target_bx.nii.gz'), os.path.join(dst_p_dir, 'target_bx.nii.gz'))
+            
             if has_gland:
                 # 统一重命名为 gland_mask.nii.gz
                 shutil.copy2(os.path.join(src_p_dir, 'gland_mask_crop.nii.gz'), os.path.join(dst_p_dir, 'gland_mask.nii.gz'))
 
             registry_data.append({
                 'patient_id': new_pid, 'source': 'TCIA',
-                'has_target': has_target, 'has_sys_12': 1, 'has_sys_20': 0, 'has_lesion': 0, 'has_gland': has_gland
+                'has_target': has_target, 'has_sys_12': has_sys_12, 'has_sys_20': 0, 'has_lesion': 0, 'has_gland': has_gland
             })
 
     # --- 3. 整合 PROMIS 数据集 ---

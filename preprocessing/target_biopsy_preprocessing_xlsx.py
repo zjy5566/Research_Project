@@ -103,8 +103,9 @@ def generate_12_zone_mask(crop_t2, gland_binary):
     return zones_sitk
 
 def process_patient_biopsy(patient_id, biopsy_df, processed_dir):
-    if patient_id== 'Prostate-MRI-US-Biopsy-1151':
+    if patient_id == 'Prostate-MRI-US-Biopsy-1151':
         print(f"Processing {patient_id}...")
+        
     # 1. 路径与读取
     crop_t2_path = os.path.join(processed_dir, patient_id, 't2_crop.nii.gz')
     gland_mask_path = os.path.join(processed_dir, patient_id, 'gland_mask_crop.nii.gz')
@@ -125,7 +126,10 @@ def process_patient_biopsy(patient_id, biopsy_df, processed_dir):
     
     target_mask_arr = np.zeros((32, 64, 64), dtype=np.uint8)
     sys_labels = np.zeros(12, dtype=np.uint8)  
+    
+    # 【新增】：状态位，用于记录是否找到了靶向和系统活检数据
     found_any_target = False
+    found_any_sys = False 
 
     # 3. 遍历穿刺点
     for _, row in p_data.iterrows():
@@ -157,6 +161,8 @@ def process_patient_biopsy(patient_id, biopsy_df, processed_dir):
                     # 修复3：系统活检根本不需要解析物理坐标！直接提取它的区域 Label 和 ISUP 得分存入数组
                     idx = ZONE_DICT[core_label] - 1  
                     sys_labels[idx] = max(sys_labels[idx], isup_label)
+                    # 【新增】：一旦成功解析了一条系统活检记录，将标志位置为 True
+                    found_any_sys = True 
                     
         except Exception as e:
             # print(f"Warning: Failed to parse row for {patient_id}: {e}") # 调试用
@@ -165,15 +171,18 @@ def process_patient_biopsy(patient_id, biopsy_df, processed_dir):
     # 4. 约束保存
     save_folder = os.path.join(processed_dir, patient_id)
     
+    # 保存靶向活检 Mask（如果存在）
     if found_any_target:
         target_mask_arr = target_mask_arr * gland_binary
         t_mask = sitk.GetImageFromArray(target_mask_arr)
         t_mask.CopyInformation(crop_t2)
         sitk.WriteImage(t_mask, os.path.join(save_folder, 'target_bx.nii.gz'))
         
-    zones_sitk = generate_12_zone_mask(crop_t2, gland_binary)
-    sitk.WriteImage(zones_sitk, os.path.join(save_folder, 'zones_mask.nii.gz'))
-    np.save(os.path.join(save_folder, 'systematic_labels.npy'), sys_labels)
+    # 【新增逻辑】：仅在成功找到系统活检数据时，才生成并保存 zones_mask 和 labels
+    if found_any_sys:
+        zones_sitk = generate_12_zone_mask(crop_t2, gland_binary)
+        sitk.WriteImage(zones_sitk, os.path.join(save_folder, 'zones_mask.nii.gz'))
+        np.save(os.path.join(save_folder, 'systematic_labels.npy'), sys_labels)
 
 # --- 执行主流程 ---
 if __name__ == "__main__":

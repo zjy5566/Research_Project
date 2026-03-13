@@ -6,7 +6,7 @@ from tqdm import tqdm
 from config import Config
 from dataset import ProstateUnifiedDataset
 from model import ProstateMixedSupervisionNet
-from Loss_function import MixedSupervisionLoss
+from Loss_function_all import MixedSupervisionLoss
 import utils
 
 def train_one_epoch(model, loader, optimizer, criterion, device):

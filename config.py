@@ -9,15 +9,15 @@ class Config:
     # 1. 路径配置 (Path Configurations)
     # ==========================================
     # 根目录
-    # BASE_DIR = r"/raid/candi/jiayi/RP"
-    BASE_DIR = r"F:\RP_dataset"
+    BASE_DIR = r"/raid/candi/jiayi/RP"
+    # BASE_DIR = r"F:\RP_dataset"
     
     # 统一数据集目录 (训练直接从这里读取)
     UNIFIED_DATA_DIR = os.path.join(BASE_DIR, 'data',"Unified_Dataset")
     SPLIT_DIR = os.path.join(UNIFIED_DATA_DIR, "splits")
     
     # 划分好的 CSV 索引表路径
-    TRAIN_CSV = os.path.join(SPLIT_DIR, "train.csv")
+    TRAIN_CSV = os.path.join(SPLIT_DIR, "train_pub.csv")
     VAL_CSV = os.path.join(SPLIT_DIR, "val.csv")
     TEST_CSV = os.path.join(SPLIT_DIR, "test.csv")
     
@@ -70,17 +70,17 @@ class Config:
     # 5. 多任务权重控制 (Latent Variables & Loss Weights)
     # ==========================================
     # 【主任务】 Cancer Grade 
-    LAMBDA_GRADE = 2.0   
-    LAMBDA_SYS = 1     
+    LAMBDA_GRADE = 0 
+    LAMBDA_SYS = 0   
     
     # 【辅任务A】 Lesion Risk (将原来的单一权重拆解为多源内部权重)
-    LAMBDA_LESION = 1.0        # Lesion 整体分支的缩放系数
-    LESION_W_DENSE = 1.0       # 密集强监督 (PUB): 提供形状基准
-    LESION_W_SPARSE = 1      # 稀疏强监督 (靶向): 提供确信的局部锚点
-    LESION_W_REGIONAL = 1   # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
+    LAMBDA_LESION = 0       # Lesion 整体分支的缩放系数
+    LESION_W_DENSE = 1     # 密集强监督 (PUB): 提供形状基准
+    LESION_W_SPARSE = 0    # 稀疏强监督 (靶向): 提供确信的局部锚点
+    LESION_W_REGIONAL = 0  # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
     
     # 【辅任务B】 Gland Anatomy
-    LAMBDA_GLAND = 0.05 
+    LAMBDA_GLAND = 0
     
     # ==========================================
     # 6. 消融实验控制开关 (Ablation Study Flags)
