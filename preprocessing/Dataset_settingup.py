@@ -6,9 +6,9 @@ from tqdm import tqdm
 
 def create_unified_dataset(base_dir):
     # --- 1. 定义路径 ---
-    src_pub = os.path.join(base_dir, 'Dataset_prostate_MRI','Dataset_prostate_MRI')
-    src_promis = os.path.join(base_dir, 'derived PROMIS data set', 'Processed_PROMIS')
-    src_tcia = os.path.join(base_dir, 'Target biosy', 'Processed_TCIA')
+    src_pub = os.path.join(base_dir, 'Dataset_prostate_MRI','Dataset_prostate_MRI_nodwi')
+    src_promis = os.path.join(base_dir, 'derived PROMIS data set', 'Processed_PROMIS_nodwi')
+    src_tcia = os.path.join(base_dir, 'Target biosy', 'Processed_TCIA_nodwi')
     
     dst_root = os.path.join(base_dir, 'Unified_Dataset')
     os.makedirs(dst_root, exist_ok=True)

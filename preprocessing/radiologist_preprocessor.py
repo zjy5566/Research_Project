@@ -126,7 +126,7 @@ class ProstateDataPreprocessor:
         # 6. 多模态堆叠并执行前景局部归一化 (传入 final_zone)
         stacked_img = np.stack([
             self.normalize_array(t2_arr, final_zone), 
-            self.normalize_array(dwi_arr, final_zone), 
+            # self.normalize_array(dwi_arr, final_zone), 
             self.normalize_array(adc_arr, final_zone)
         ], axis=0).astype(np.float32)
 

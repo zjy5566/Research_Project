@@ -137,7 +137,7 @@ def process_single_patient(p_id, src_path, dst_root):
 
         input_tensor = np.stack([
             normalize_array(t2_crop, mask_arr), 
-            # normalize_array(dwi_crop, mask_arr), 
+            normalize_array(dwi_crop, mask_arr), 
             normalize_array(adc_crop, mask_arr)
         ], axis=0)
         
