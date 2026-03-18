@@ -1,4 +1,5 @@
 import os
+import shutil
 import numpy as np
 import SimpleITK as sitk
 from tqdm import tqdm
@@ -66,15 +67,12 @@ def mask_centered_crop(img, mask, target_size=[64, 64, 32]):
     return sitk.RegionOfInterest(img, target_size, roi_start)
 
 # ========================================================
-# --- 4. 归一化函数 (修改为前景 Z-score 局部归一化) ---
+# --- 4. 归一化函数 (前景 Z-score 局部归一化) ---
 # ========================================================
 def normalize_array(img, mask_arr):
     arr = sitk.GetArrayFromImage(img).astype(np.float32)
-    
-    # 提取前列腺内部有效像素
     valid_pixels = arr[mask_arr > 0]
     
-    # 防御性回退：如果掩膜为空，则全局归一化
     if len(valid_pixels) == 0:
         mean_val = np.mean(arr)
         std_val = np.std(arr)
@@ -86,52 +84,85 @@ def normalize_array(img, mask_arr):
 
 
 # --- 5. 单个病例处理流程 ---
-def process_single_patient(p_id, src_path, dst_root):
-    # 输入路径 (Extracted 文件夹)
+def process_single_patient(folder_name, src_path, dst_root):
     t2_file = os.path.join(src_path, 't2.nii.gz')
     adc_file = os.path.join(src_path, 'adc.nii.gz')
     dwi_file = os.path.join(src_path, 'dwi.nii.gz')
-    
-    # 输出路径 (Processed 文件夹)
-    save_dir = os.path.join(dst_root, p_id)
-    # gland_mask 应该位于已经生成的 Processed 目录下对应病人的文件夹中
     mask_file = os.path.join(src_path, 'gland_mask.nii.gz') 
+    
+    # 扩展：寻找额外的 Mask 文件和 NPY 文件
+    target_mask_file = os.path.join(src_path, 'target_mask.nii.gz') # 由 STL 生成的靶点
+    needle_mask_file = os.path.join(src_path, 'target_bx_needle.nii.gz') # 由 Excel 坐标生成的针道
+    zones_mask_file = os.path.join(src_path, 'zones_mask.nii.gz') # 由 12 分区算法生成的系统活检分区
+    sys_labels_file = os.path.join(src_path, 'systematic_labels.npy') # 系统活检结果
+    
+    save_dir = os.path.join(dst_root, folder_name)
 
-    # 1. 检查是否存在 input_tensor.npy (跳过已处理)
-    # if os.path.exists(os.path.join(save_dir, 'input_tensor.npy')):
-    #     return "ALREADY_PROCESSED"
-
-    # 2. 检查四要素是否齐全 (T2, ADC, DWI, Mask)
+    # 1. 检查四要素是否齐全 (T2, ADC, DWI, Mask)
     if not all([os.path.exists(f) for f in [t2_file, adc_file, dwi_file, mask_file]]):
         return "MISSING_DATA"
 
     try:
+        os.makedirs(save_dir, exist_ok=True)
+        
         t2 = sitk.ReadImage(t2_file)
         adc = sitk.ReadImage(adc_file)
         dwi = sitk.ReadImage(dwi_file)
         mask = sitk.ReadImage(mask_file)
 
+        # 重采样
         t2_res = resample_to_spacing(t2)
         adc_res = resample_to_spacing(adc)
         dwi_res = resample_to_spacing(dwi)
         mask_res = resample_to_spacing(mask, is_label=True)
 
+        # 配准
         adc_reg = register_images(t2_res, adc_res)
         dwi_reg = register_images(t2_res, dwi_res)
 
+        # 中心裁剪 (核心金标准位置)
         t2_crop = mask_centered_crop(t2_res, mask_res)
         adc_crop = mask_centered_crop(adc_reg, mask_res)
         dwi_crop = mask_centered_crop(dwi_reg, mask_res)
         mask_crop = mask_centered_crop(mask_res, mask_res)
 
-        os.makedirs(save_dir, exist_ok=True)
+        # 保存主要影像
         sitk.WriteImage(t2_crop, os.path.join(save_dir, 't2_crop.nii.gz'))
         sitk.WriteImage(adc_crop, os.path.join(save_dir, 'adc_crop.nii.gz'))
         sitk.WriteImage(dwi_crop, os.path.join(save_dir, 'dwi_crop.nii.gz'))
         sitk.WriteImage(mask_crop, os.path.join(save_dir, 'gland_mask_crop.nii.gz'))
 
         # ========================================================
-        # 【核心修改点】：提取 mask 数组并传入归一化函数
+        # [新增] 额外掩膜处理流程：完全沿用 T2/Gland 的裁剪逻辑
+        # ========================================================
+        # 1. 靶点 (Target STL 转化来的)
+        if os.path.exists(target_mask_file):
+            t_mask = sitk.ReadImage(target_mask_file)
+            t_mask_res = resample_to_spacing(t_mask, is_label=True)
+            # 使用前面算好的腺体 mask_res 作为参照进行空间切割
+            t_mask_crop = mask_centered_crop(t_mask_res, mask_res)
+            sitk.WriteImage(t_mask_crop, os.path.join(save_dir, 'target_mask_crop.nii.gz'))
+
+        # 2. 针道 (Excel 坐标生成)
+        if os.path.exists(needle_mask_file):
+            n_mask = sitk.ReadImage(needle_mask_file)
+            n_mask_res = resample_to_spacing(n_mask, is_label=True)
+            n_mask_crop = mask_centered_crop(n_mask_res, mask_res)
+            sitk.WriteImage(n_mask_crop, os.path.join(save_dir, 'target_bx_needle_crop.nii.gz'))
+
+        # 3. 12 分区系统活检掩膜
+        if os.path.exists(zones_mask_file):
+            z_mask = sitk.ReadImage(zones_mask_file)
+            z_mask_res = resample_to_spacing(z_mask, is_label=True)
+            z_mask_crop = mask_centered_crop(z_mask_res, mask_res)
+            sitk.WriteImage(z_mask_crop, os.path.join(save_dir, 'zones_mask_crop.nii.gz'))
+            
+        # 4. 拷贝系统活检结果的 NPY 文件
+        if os.path.exists(sys_labels_file):
+            shutil.copy2(sys_labels_file, os.path.join(save_dir, 'systematic_labels.npy'))
+
+        # ========================================================
+        # 提取 mask 数组并传入归一化函数构建多通道张量
         # ========================================================
         mask_arr = sitk.GetArrayFromImage(mask_crop).astype(np.uint8)
 
@@ -144,7 +175,7 @@ def process_single_patient(p_id, src_path, dst_root):
         np.save(os.path.join(save_dir, 'input_tensor.npy'), input_tensor)
         return "SUCCESS"
     except Exception as e:
-        print(f"\n[Error] {p_id}: {e}")
+        print(f"\n[Error] {folder_name}: {e}")
         return "FAILED"
 
 # --- 6. 主程序入口 ---
@@ -152,22 +183,22 @@ if __name__ == "__main__":
     SRC_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
     DST_ROOT = r'F:\RP_dataset\Target biosy\Processed_TCIA'
 
-    patients = [d for d in os.listdir(SRC_ROOT) if d.startswith('Prostate-MRI-US-Biopsy-')]
-    print(f"Total potential patients found: {len(patients)}")
+    # 这里读取真实的文件夹名称 (无论是 Prostate-MRI-US-Biopsy-0159 还是 Prostate-MRI-US-Biopsy-0159_12345 都会被抓取)
+    folders = [d for d in os.listdir(SRC_ROOT) if d.startswith('Prostate-MRI-US-Biopsy-') and os.path.isdir(os.path.join(SRC_ROOT, d))]
+    print(f"Total potential cases found: {len(folders)}")
 
-    # 统计计数器
     stats = {
-        "complete_modalities": 0,  # 模态齐全的病例
-        "newly_processed": 0,      # 本次成功处理的
-        "already_exists": 0,       # 之前已经做好的
-        "failed": 0,               # 处理过程中报错的
-        "missing": 0               # 缺模态或缺 Mask 的
+        "complete_modalities": 0, 
+        "newly_processed": 0,      
+        "already_exists": 0,       
+        "failed": 0,               
+        "missing": 0               
     }
 
-    pbar = tqdm(patients, desc="Batch Processing")
-    for p_id in pbar:
-        p_path = os.path.join(SRC_ROOT, p_id)
-        result = process_single_patient(p_id, p_path, DST_ROOT)
+    pbar = tqdm(folders, desc="Batch Processing")
+    for folder_name in pbar:
+        src_path = os.path.join(SRC_ROOT, folder_name)
+        result = process_single_patient(folder_name, src_path, DST_ROOT)
         
         if result == "SUCCESS":
             stats["complete_modalities"] += 1
@@ -180,14 +211,12 @@ if __name__ == "__main__":
         elif result == "FAILED":
             stats["failed"] += 1
         
-        # 实时显示统计
         pbar.set_postfix({
             "Complete": stats["complete_modalities"], 
             "New": stats["newly_processed"],
             "Exist": stats["already_exists"]
         })
             
-    # 打印最终汇总报告
     print(f"\n" + "="*40)
     print(f"Preprocessing Summary:")
     print(f"  - Total Complete Cases (T2+ADC+DWI+Mask): {stats['complete_modalities']}")

@@ -64,8 +64,8 @@ def main():
 
     model = ProstateMixedSupervisionNet(in_channels=Config.IN_CHANNELS).to(device)
     criterion = MixedSupervisionLoss(
-        Config.LAMBDA_GRADE, Config.LAMBDA_SYS, Config.LAMBDA_LESION, Config.LAMBDA_GLAND,
-        Config.LESION_W_DENSE, Config.LESION_W_SPARSE, Config.LESION_W_REGIONAL, Config.CSPC_THRESHOLD
+        Config.LAMBDA_GRADE, Config.LAMBDA_TB, Config.LAMBDA_SYS, Config.LAMBDA_LESION, Config.LAMBDA_GLAND,
+        Config.LESION_W_DENSE, Config.LESION_W_SPARSE, Config.LESION_W_REGIONAL, Config.CSPC_THRESHOLD,Config.LESION_W_SMALL
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)

@@ -87,10 +87,10 @@ def npy_viewer(npy_path):
 if __name__ == "__main__":
     
     # 【测试例 1】：查看 4D 多模态图像 (3, 32, 64, 64)
-    viewer = VolumeViewer(r'F:\RP_dataset\Target biosy\Processed_TCIA_nodwi\Prostate-MRI-US-Biopsy-0001\input_tensor.npy')
-    viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI_nodwi\000_img.npy')
+    viewer = VolumeViewer(r'F:\RP_dataset\Target biosy\Processed_TCIA\Prostate-MRI-US-Biopsy-0001_90221\input_tensor.npy')
+    viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI_dwi\000_img.npy')
 
-    viewer=VolumeViewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_nodwi\P-10104751\input_tensor.npy')
+    viewer=VolumeViewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_dwi\P-10104751\input_tensor.npy')
     
     # 【测试例 2】：查看 3D 单通道掩膜 (32, 64, 64) (如 lab.npy 或 zones_mask.nii.gz 转换的 npy)
     # viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI\000_lab.npy')

@@ -44,7 +44,8 @@ class FocalLoss(nn.Module):
 
 class MixedSupervisionLoss(nn.Module):
     def __init__(self, 
-                 lambda_grade=1.0,         
+                 lambda_grade=1.0,         # 主任务 (靶向 ISUP 分级)
+                 lambda_tb=1.0,         
                  lambda_sys=0.5,           
                  lambda_lesion=1.0,        
                  lambda_gland=0.2,         
@@ -63,6 +64,7 @@ class MixedSupervisionLoss(nn.Module):
         super(MixedSupervisionLoss, self).__init__()
         
         self.lambda_grade = lambda_grade
+        self.lambda_tb = lambda_tb
         self.lambda_sys = lambda_sys
         self.lambda_lesion = lambda_lesion
         self.lambda_gland = lambda_gland
@@ -198,4 +200,4 @@ class MixedSupervisionLoss(nn.Module):
         total_loss = (self.lambda_lesion * loss_lesion_total) + \
                      (self.lambda_gland * loss_gland)
                       
-        return total_loss, loss_grade_target, loss_grade_sys, loss_lesion_total,loss_lesion_dense, loss_lesion_sparse, loss_lesion_sys, loss_gland
+        return total_loss, self.lambda_tb*loss_grade_target,self.lambda_sys*loss_grade_sys, loss_lesion_total,self.l_w_dense *loss_lesion_dense, self.l_w_sparse * loss_lesion_sparse, self.l_w_regional * loss_lesion_sys, self.lambda_gland*loss_gland

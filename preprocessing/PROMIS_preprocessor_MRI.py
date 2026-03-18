@@ -135,7 +135,7 @@ def preprocess_promis_case(case_dir, output_dir, target_spacing=[1.0, 1.0, 2.24]
     # 保存 1: 多模态输入张量 (传入 gland_arr 作为前景计算标尺)
     input_tensor = np.stack([
         finalize_foreground(t2_crop, gland_arr), 
-        # finalize_foreground(dwi_crop, gland_arr), 
+        finalize_foreground(dwi_crop, gland_arr), 
         finalize_foreground(adc_crop, gland_arr)
     ], axis=0)
     
@@ -165,7 +165,7 @@ def batch_preprocess(src_root, dst_root):
 
 if __name__ == "__main__":
     MRI_DATA_ROOT = r'F:/RP_dataset/derived PROMIS data set/MRI'
-    PROCESSED_ROOT = r'F:/RP_dataset/derived PROMIS data set/Processed_PROMIS'
+    PROCESSED_ROOT = r'F:/RP_dataset/derived PROMIS data set/Processed_PROMIS_dwi'
     
     batch_preprocess(MRI_DATA_ROOT, PROCESSED_ROOT)
     print("\nAll done!")

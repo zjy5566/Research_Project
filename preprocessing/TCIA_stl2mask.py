@@ -1,18 +1,17 @@
 import os
-import pandas as pd
 import vtk
 from vtk.util import numpy_support
 import numpy as np
 import SimpleITK as sitk
 from tqdm import tqdm
+import pandas as pd
+import glob
 
-# --- STL 转换核心函数 ---
-def stl_to_mask(stl_path, template_mri_path, output_mask_path):
-    """
-    将 STL 转换为与 T2 图像空间对齐的 NIfTI 掩膜
-    """
+# ==========================================
+# 核心转换引擎 (已修复 VTK 内存泄漏与挖空逻辑)
+# ==========================================
+def stl_to_numpy_mask(stl_path, template_img):
     try:
-        template_img = sitk.ReadImage(template_mri_path)
         reader = vtk.vtkSTLReader()
         reader.SetFileName(stl_path)
         reader.Update()
@@ -20,14 +19,19 @@ def stl_to_mask(stl_path, template_mri_path, output_mask_path):
         
         dims = template_img.GetSize()
         spacing = template_img.GetSpacing()
-        origin = template_img.GetOrigin()
 
+        # 1. 创建底图
         white_image = vtk.vtkImageData()
         white_image.SetDimensions(dims)
         white_image.SetSpacing(spacing)
         white_image.SetOrigin(0, 0, 0)
         white_image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
 
+        # 强制将底图的所有像素初始化为 1 (前景)
+        scalars = white_image.GetPointData().GetScalars()
+        scalars.Fill(1) 
+
+        # 2. 将 STL 表面转换为 3D 模板 (Stencil)
         pol2stenc = vtk.vtkPolyDataToImageStencil()
         pol2stenc.SetInputData(polydata)
         pol2stenc.SetOutputOrigin(template_img.GetOrigin())
@@ -35,89 +39,149 @@ def stl_to_mask(stl_path, template_mri_path, output_mask_path):
         pol2stenc.SetOutputWholeExtent(0, dims[0]-1, 0, dims[1]-1, 0, dims[2]-1)
         pol2stenc.Update()
 
+        # 3. 执行模板切割
         imgstenc = vtk.vtkImageStencil()
         imgstenc.SetInputData(white_image)
         imgstenc.SetStencilConnection(pol2stenc.GetOutputPort())
-        imgstenc.SetReverseStencil(1)
-        imgstenc.SetBackgroundValue(1)
+        
+        # 关闭反转，外部强制设为 BackgroundValue(0)
+        imgstenc.ReverseStencilOff() 
+        imgstenc.SetBackgroundValue(0)
         imgstenc.Update()
 
+        # 4. 提取为 Numpy 数组并重塑维度 (Z, Y, X)
         vtk_data = imgstenc.GetOutput().GetPointData().GetScalars()
         numpy_mask = numpy_support.vtk_to_numpy(vtk_data).reshape(dims[::-1])
         
-        final_mask = sitk.GetImageFromArray(numpy_mask)
-        final_mask.CopyInformation(template_img)
-        
-        # 强制同步空间信息
-        final_mask.SetOrigin(template_img.GetOrigin())
-        final_mask.SetSpacing(template_img.GetSpacing())
-        final_mask.SetDirection(template_img.GetDirection())
-
-        sitk.WriteImage(final_mask, output_mask_path)
-        return True
+        return numpy_mask
     except Exception as e:
         print(f"Error converting {os.path.basename(stl_path)}: {e}")
-        return False
+        return None
 
-# --- 自动化检索与批量处理 ---
-def batch_convert_stls(excel_path, stl_root, processed_dir_root, save_root):
-    print(f"Loading Excel file: {os.path.basename(excel_path)}")
-    
-    # 修正点 1：使用 read_excel 读取 .xlsx 文件
-    # 如果表格有多个 sheet，请确认 'Prostate-MRI-US-Biopsy Target' 是正确的名字
+def save_numpy_to_nifti(numpy_array, template_img, output_path):
+    final_mask = sitk.GetImageFromArray(numpy_array.astype(np.uint8))
+    final_mask.CopyInformation(template_img)
+    sitk.WriteImage(final_mask, output_path)
+
+# ==========================================
+# 标签映射字典
+# ==========================================
+def map_ucla_to_isup(ucla_score):
+    """
+    UCLA Score 映射规则：0/1/2=1, 3=2, 4=3, 5=4, 6=5, 7=6
+    """
     try:
-        df = pd.read_excel(excel_path)
-    except Exception as e:
-        print(f"Failed to read Excel: {e}")
-        return
+        score = int(ucla_score)
+        if score in [0, 1, 2]: return 1
+        elif score == 3: return 2
+        elif score == 4: return 3
+        elif score == 5: return 4
+        elif score == 6: return 5
+        elif score == 7: return 6
+        else: return 1
+    except:
+        return 1
 
-    # 修正点 2：列名匹配。Target 文件的列名通常是 'Patient ID' 和 'seriesInstanceUID_MR'
-    pid_col = 'Patient ID'
-    uid_col = 'seriesInstanceUID_MR'
-    
-    # 去重处理，一个 UID 对应一个前列腺表面模型
-    unique_cases = df[[pid_col, uid_col]].drop_duplicates()
-    
-    success_count = 0
-    for _, row in tqdm(unique_cases.iterrows(), total=len(unique_cases), desc="Processing Cases"):
-        pid = str(row[pid_col]).strip()
-        uid = str(row[uid_col]).strip()
-        
-        # 构建 STL 文件名：PatientID-ProstateSurface-seriesUID-UID.STL
-        stl_name = f"{pid}-ProstateSurface-seriesUID-{uid}.STL"
-        stl_path = os.path.join(stl_root, stl_name)
-        
-        # 模板图路径：指向你之前提取出的 t2.nii.gz
-        mri_template_path = os.path.join(processed_dir_root, pid, 't2.nii.gz')
-        
-        # 输出路径：保存到处理后的病人文件夹
-        output_mask_path = os.path.join(save_root, pid, 'gland_mask.nii.gz')
-        
-        if os.path.exists(stl_path) and os.path.exists(mri_template_path):
-            os.makedirs(os.path.dirname(output_mask_path), exist_ok=True)
-            if stl_to_mask(stl_path, mri_template_path, output_mask_path):
-                success_count += 1
+# ==========================================
+# 批量处理主函数
+# ==========================================
+def batch_convert_stls(processed_dir_root, excel_path):
+    print("Loading Target Biopsy Clinical Excel...")
+    try:
+        if excel_path.endswith('.csv'):
+            df = pd.read_csv(excel_path)
         else:
-            # 调试信息：如果没找到，查看是缺 STL 还是缺 MRI
-            if not os.path.exists(stl_path):
-                pass # 很多 UID 可能是超声的，没有对应的 MRI STL 属于正常现象
-            if not os.path.exists(mri_template_path):
-                print(f"Warning: MRI template missing for {pid}")
+            df = pd.read_excel(excel_path)
+    except Exception as e:
+        print(f"Failed to read clinical file: {e}")
+        return
+        
+    patient_targets_info = {}
+    for _, row in df.iterrows():
+        pid = str(row['Patient ID']).strip()
+        t_num = str(row['Target No.']).strip()
+        ucla = row['UCLA Score (Similar to PIRADS v2)']
+        
+        if pd.isna(ucla): ucla = 0
+        
+        if pid not in patient_targets_info:
+            patient_targets_info[pid] = []
+        patient_targets_info[pid].append({
+            'target_num': t_num,
+            'isup_label': map_ucla_to_isup(ucla)
+        })
 
-    print(f"\nCompleted! Successfully generated {success_count} gland masks.")
+    folders = [d for d in os.listdir(processed_dir_root) if os.path.isdir(os.path.join(processed_dir_root, d))]
+    
+    gland_success = 0
+    target_success = 0
+    
+    for folder in tqdm(folders, desc="Converting STLs to Masks"):
+        folder_path = os.path.join(processed_dir_root, folder)
+        mri_template_path = os.path.join(folder_path, 't2.nii.gz')
+        
+        if not os.path.exists(mri_template_path):
+            continue
+            
+        template_img = sitk.ReadImage(mri_template_path)
+        base_pid = folder.split('_')[0] 
+        
+        # ---------------------------------------------------------
+        # 任务 A: 转换 Gland Mask (移除覆盖保护)
+        # ---------------------------------------------------------
+        stl_path_gland = os.path.join(folder_path, 'prostate_surface.stl')
+        output_gland_path = os.path.join(folder_path, 'gland_mask.nii.gz')
+        
+        if os.path.exists(stl_path_gland):
+            gland_np = stl_to_numpy_mask(stl_path_gland, template_img)
+            if gland_np is not None:
+                save_numpy_to_nifti(gland_np, template_img, output_gland_path)
+                gland_success += 1
+                
+        # ---------------------------------------------------------
+        # 任务 B: 转换 Target Masks 并合并 (移除覆盖保护)
+        # ---------------------------------------------------------
+        output_target_path = os.path.join(folder_path, 'target_mask.nii.gz')
+        
+        if base_pid not in patient_targets_info:
+            continue
+            
+        targets_info = patient_targets_info[base_pid]
+        target_stl_files = glob.glob(os.path.join(folder_path, 'target_*.stl'))
+        
+        if len(target_stl_files) > 0:
+            dims = template_img.GetSize()
+            combined_target_mask = np.zeros(dims[::-1], dtype=np.uint8)
+            found_any = False
+            
+            for t_file in target_stl_files:
+                t_num = os.path.basename(t_file).replace('target_', '').replace('.stl', '')
+                
+                matched_label = 1 # 默认阴性
+                for t_info in targets_info:
+                    if t_info['target_num'] == t_num:
+                        matched_label = t_info['isup_label']
+                        break
+                
+                target_np = stl_to_numpy_mask(t_file, template_img)
+                if target_np is not None:
+                    labeled_target = target_np * matched_label
+                    combined_target_mask = np.maximum(combined_target_mask, labeled_target)
+                    found_any = True
+            
+            if found_any:
+                save_numpy_to_nifti(combined_target_mask, template_img, output_target_path)
+                target_success += 1
+
+    print(f"\n=============================================")
+    print(f"Summary:")
+    print(f" - Gland Masks Generated:  {gland_success}")
+    print(f" - Target Masks Generated: {target_success}")
+    print(f"=============================================")
+
 
 if __name__ == "__main__":
-    # --- 路径配置 ---
-    # 1. 靶向数据 Excel 路径
-    EXCEL_PATH = r'F:\RP_dataset\Target biosy\Target-Data_2019-12-05-2.xlsx'
-    
-    # 2. STL 原始文件夹路径
-    STL_DIR = r'F:\RP_dataset\Target biosy\Prostate-MRI-US-Biopsy\STLs\STLs'
-    
-    # 3. 原始提取的 MRI 路径 (用于做模板)
     EXTRACTED_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
+    EXCEL_PATH = r'F:\RP_dataset\Target biosy\unprocessed_data\Target-Data_2019-12-05-2.xlsx'
     
-    # 4. 最终处理结果存放路径
-    SAVE_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
-    
-    batch_convert_stls(EXCEL_PATH, STL_DIR, EXTRACTED_ROOT, SAVE_ROOT)
+    batch_convert_stls(EXTRACTED_ROOT, EXCEL_PATH)

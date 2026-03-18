@@ -1,121 +1,177 @@
 import os
+import shutil
 import SimpleITK as sitk
 from tqdm import tqdm
+import glob
 
-# --- 1. 序列自动识别函数 (保持你最新的优化逻辑) ---
-def find_mri_sequences(patient_path):
-    paths = {'t2': None, 'adc': None, 'dwi': None}
-    for root, dirs, files in os.walk(patient_path):
-        if any(f.lower().endswith('.dcm') for f in files):
-            folder_name = os.path.basename(root).lower()
-            parent_name = os.path.basename(os.path.dirname(root)).lower()
-            combined_name = folder_name + " " + parent_name
+def identify_folder_type(root):
+    folder_name = os.path.basename(root).lower()
+    parent_name = os.path.basename(os.path.dirname(root)).lower()
+    combined_name = folder_name + " " + parent_name
 
-            if 'adc' in combined_name or 'apparent diffusion' in combined_name:
-                if 'report' not in combined_name:
-                    paths['adc'] = root
-                    continue
+    if 'adc' in combined_name or 'apparent diffusion' in combined_name:
+        if 'report' not in combined_name: return 'adc'
 
-            dwi_indicators = ['dwi', 'diff', 'b1600', 'b2000', 'b1000', 'b800', 'calcbval']
-            if any(x in combined_name for x in dwi_indicators):
-                if 'adc' not in folder_name:
-                    paths['dwi'] = root
-                    continue
+    dwi_indicators = ['dwi', 'diff', 'b1600', 'b2000', 'b1000', 'b800', 'calcbval']
+    if any(x in combined_name for x in dwi_indicators):
+        if 'adc' not in folder_name: return 'dwi'
 
-            if 't2' in combined_name:
-                if not any(x in combined_name for x in ['sag', 'cor', 'haste', 'loc']):
-                    paths['t2'] = root
-                    continue
-    return paths
+    if 't2' in combined_name:
+        if not any(x in combined_name for x in ['sag', 'cor', 'haste', 'loc']): return 't2'
+            
+    return None
 
-# --- 2. DICOM 读取函数 ---
 def read_dicom_series(directory):
     reader = sitk.ImageSeriesReader()
     dicom_names = reader.GetGDCMSeriesFileNames(directory)
-    if not dicom_names:
-        return None
+    if not dicom_names: return None
     reader.SetFileNames(dicom_names)
-    try:
-        return reader.Execute()
-    except Exception:
-        return None
+    try: return reader.Execute()
+    except Exception: return None
 
-# --- 3. 单个病人处理逻辑 (增加预检跳过逻辑) ---
-def extract_and_save_case(patient_id, patient_path, dst_root):
-    save_path = os.path.join(dst_root, patient_id)
+def extract_and_save_case(patient_id, patient_path, dst_root, stl_dir):
+    # 1. 查找该病人名下的前列腺表面 STL (用于锚定 T2 UID)
+    patient_surface_stls = {}
+    if os.path.exists(stl_dir):
+        for f in os.listdir(stl_dir):
+            if f.startswith(patient_id) and 'ProstateSurface' in f and f.endswith('.STL'):
+                parts = f.split('-seriesUID-')
+                if len(parts) == 2:
+                    uid = parts[1].replace('.STL', '').strip()
+                    patient_surface_stls[uid] = os.path.join(stl_dir, f)
     
-    # --- 新增：检查是否已经完整提取 ---
-    required_files = ['t2.nii.gz', 'adc.nii.gz', 'dwi.nii.gz']
-    if os.path.exists(save_path):
-        existing_files = os.listdir(save_path)
-        if all(f in existing_files for f in required_files):
-            # 返回特定标志表示“已存在”，方便统计
-            return "ALREADY_EXISTS"
-
-    seq_paths = find_mri_sequences(patient_path)
-    
-    # 如果一个模态都没找到，跳过
-    if not any(seq_paths.values()):
-        return "FAILED"
-    
-    extracted_count = 0
-    for modality, folder in seq_paths.items():
-        if folder:
-            try:
-                # 再次检查单个文件，防止部分缺失的情况补提
-                output_path = os.path.join(save_path, f"{modality}.nii.gz")
-                if os.path.exists(output_path):
-                    extracted_count += 1
+    # 2. 遍历病人的所有 DICOM 文件夹，读取元数据并按 Study UID 归组
+    studies = {} 
+    for root, dirs, files in os.walk(patient_path):
+        dicoms = [f for f in files if f.lower().endswith('.dcm')]
+        if dicoms:
+            mri_type = identify_folder_type(root)
+            if mri_type:
+                dcm_path = os.path.join(root, dicoms[0])
+                reader = sitk.ImageFileReader()
+                reader.SetFileName(dcm_path)
+                reader.LoadPrivateTagsOn()
+                try:
+                    reader.ReadImageInformation()
+                    series_uid = reader.GetMetaData('0020|000e').strip()
+                    study_uid = reader.GetMetaData('0020|000d').strip()
+                except Exception:
                     continue
-
-                img = read_dicom_series(folder)
-                if img:
-                    if not os.path.exists(save_path):
-                        os.makedirs(save_path)
-                    sitk.WriteImage(img, output_path)
-                    extracted_count += 1
-            except Exception as e:
-                print(f"\n[Error] Failed to read {modality} for {patient_id}: {e}")
                 
-    return "SUCCESS" if extracted_count > 0 else "FAILED"
+                if study_uid not in studies:
+                    studies[study_uid] = {'t2': [], 'adc': [], 'dwi': [], 't2_uids': []}
+                
+                studies[study_uid][mri_type].append((series_uid, root))
+                if mri_type == 't2':
+                    studies[study_uid]['t2_uids'].append(series_uid)
+    
+    # 3. 匹配并提取
+    extracted_count = 0
+    already_exists_count = 0
+    
+    for study_uid, modalities in studies.items():
+        matched_uid = None
+        for t2_uid in modalities['t2_uids']:
+            if t2_uid in patient_surface_stls:
+                matched_uid = t2_uid
+                break
+        
+        if matched_uid:
+            save_folder = os.path.join(dst_root, f"{patient_id}_{matched_uid[-5:]}")
+            surface_stl_to_copy = patient_surface_stls[matched_uid]
+            
+            # [新增] 寻找属于这个病人且对应这个 UID 的所有 Target STL 文件
+            # 例如: Prostate-MRI-US-Biopsy-0159-Target1-seriesUID-xxxxxx.STL
+            target_stls_to_copy = []
+            target_search_pattern = os.path.join(stl_dir, f"{patient_id}-Target*-seriesUID-{matched_uid}.STL")
+            for t_file in glob.glob(target_search_pattern):
+                # 提取 Target 编号 (例如 Target1 -> 1)
+                t_name = os.path.basename(t_file)
+                try:
+                    t_num = t_name.split('-Target')[1].split('-seriesUID')[0]
+                    target_stls_to_copy.append((t_num, t_file))
+                except:
+                    pass
 
-# --- 4. 批量处理主函数 (增加详细统计) ---
-def batch_extract_mri(src_root, dst_root):
-    if not os.path.exists(dst_root):
-        os.makedirs(dst_root)
+        elif len(patient_surface_stls) == 0 and len(modalities['t2']) > 0:
+            save_folder = os.path.join(dst_root, patient_id)
+            surface_stl_to_copy = None
+            target_stls_to_copy = []
+        else:
+            continue
+            
+        # 检查是否已经存在
+        req_files = ['t2.nii.gz']
+        if surface_stl_to_copy: req_files.append('prostate_surface.stl')
+        if target_stls_to_copy: req_files.extend([f"target_{num}.stl" for num, _ in target_stls_to_copy])
+
+        # if os.path.exists(save_folder):
+        #     if all(f in os.listdir(save_folder) for f in req_files):
+        #         already_exists_count += 1
+        #         continue
+                
+        os.makedirs(save_folder, exist_ok=True)
+        
+        success = False
+        for m_type in ['t2', 'adc', 'dwi']:
+            if len(modalities[m_type]) > 0:
+                _, mri_folder = modalities[m_type][0]
+                out_path = os.path.join(save_folder, f"{m_type}.nii.gz")
+                if not os.path.exists(out_path):
+                    img = read_dicom_series(mri_folder)
+                    if img:
+                        sitk.WriteImage(img, out_path)
+                        success = True
+                else:
+                    success = True
+        
+        # 拷贝 Gland STL
+        if success and surface_stl_to_copy:
+            dest_stl = os.path.join(save_folder, "prostate_surface.stl")
+            if not os.path.exists(dest_stl):
+                shutil.copy2(surface_stl_to_copy, dest_stl)
+        
+        # [新增] 拷贝所有 Target STL
+        if success and len(target_stls_to_copy) > 0:
+            for t_num, t_file in target_stls_to_copy:
+                dest_t_stl = os.path.join(save_folder, f"target_{t_num}.stl")
+                if not os.path.exists(dest_t_stl):
+                    shutil.copy2(t_file, dest_t_stl)
+                
+        if success: extracted_count += 1
+
+    if extracted_count > 0: return "SUCCESS"
+    elif already_exists_count > 0: return "ALREADY_EXISTS"
+    else: return "FAILED"
+
+def batch_extract_mri(src_root, dst_root, stl_dir):
+    os.makedirs(dst_root, exist_ok=True)
     
     patients = [d for d in os.listdir(src_root) if d.startswith('Prostate-MRI-US-Biopsy-')]
     print(f"Found {len(patients)} potential patients.")
 
-    new_count = 0
-    skip_count = 0
-    fail_count = 0
-
+    new_count = skip_count = fail_count = 0
     pbar = tqdm(patients, desc="Extracting MRI")
     for p_id in pbar:
         p_path = os.path.join(src_root, p_id)
-        result = extract_and_save_case(p_id, p_path, dst_root)
+        result = extract_and_save_case(p_id, p_path, dst_root, stl_dir)
         
-        if result == "SUCCESS":
-            new_count += 1
-        elif result == "ALREADY_EXISTS":
-            skip_count += 1
-        else:
-            fail_count += 1
+        if result == "SUCCESS": new_count += 1
+        elif result == "ALREADY_EXISTS": skip_count += 1
+        else: fail_count += 1
         
-        # 在进度条动态显示统计信息
-        pbar.set_postfix({"New": new_count, "Skipped": skip_count, "Failed": fail_count})
+        pbar.set_postfix({"New": new_count, "Skip": skip_count, "Fail": fail_count})
             
-    print(f"\n" + "="*30)
+    print("\n" + "="*30)
     print(f"Extraction Summary:")
     print(f"  - Newly Extracted: {new_count}")
     print(f"  - Already Exists:  {skip_count}")
     print(f"  - Failed/Missing:  {fail_count}")
-    print(f"  - Total Processed: {new_count + skip_count}")
     print("="*30)
 
 if __name__ == "__main__":
-    SRC_DIR = r'F:\RP_dataset\Target biosy\manifest-1694710246744\Prostate-MRI-US-Biopsy'
+    SRC_DIR = r'F:\RP_dataset\Target biosy\unprocessed_data\manifest-1694710246744\Prostate-MRI-US-Biopsy'
     DST_DIR = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
+    STL_DIR = r'F:\RP_dataset\Target biosy\unprocessed_data\Prostate-MRI-US-Biopsy\STLs\STLs'
     
-    batch_extract_mri(SRC_DIR, DST_DIR)
+    batch_extract_mri(SRC_DIR, DST_DIR, STL_DIR)
