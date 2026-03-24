@@ -64,7 +64,7 @@ class Config:
     # 学习率衰减策略
     LR_SCHEDULER = "CosineAnnealing" # 可选: "StepLR", "CosineAnnealing"
 
-    EARLY_STOP_PATIENCE = 30  # 如果连续 10 个 epoch 性能没有提升，则停止训练
+    EARLY_STOP_PATIENCE = 300  # 如果连续 10 个 epoch 性能没有提升，则停止训练
 
     # ==========================================
     # 5. 多任务权重控制 (Latent Variables & Loss Weights)
@@ -77,23 +77,23 @@ class Config:
     # 【辅任务A】 Lesion Risk (将原来的单一权重拆解为多源内部权重)
     LAMBDA_LESION = 1       # Lesion 整体分支的缩放系数
     LESION_W_DENSE = 1     # 密集强监督 (PUB): 提供形状基准
-    LESION_W_SPARSE = 1   # 稀疏强监督 (靶向): 提供确信的局部锚点
-    LESION_W_REGIONAL = 0  # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
+    LESION_W_SPARSE = 0  # 稀疏强监督 (靶向): 提供确信的局部锚点
+    LESION_W_REGIONAL =0  # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
     
     # 【辅任务B】 Gland Anatomy
     LAMBDA_GLAND = 0
 
     #针对极小病灶将权重
-    LESION_W_SMALL = 20  # 小病灶权重 (根据实际情况调整，可能需要大于1以强调小病灶)
+    LESION_W_SMALL = 0.2  # 小病灶权重 (根据实际情况调整，可能需要大于1以强调小病灶)
     
     # ==========================================
     # 6. 消融实验控制开关 (Ablation Study Flags)
     # ==========================================
     # 是否启用 3D 空间数据增强 (Data Augmentation)
-    USE_AUGMENTATION = False
+    USE_AUGMENTATION = True
     
     # 是否在系统分区标签中屏蔽掉 Target 区域 (防止强弱监督信息冲突)
-    MASK_TARGET_IN_SYS = False
+    MASK_TARGET_IN_SYS = True
 
     # ==========================================
     # 7. 可视化配置 (Visualization)

@@ -111,7 +111,7 @@ def batch_convert_csv_to_npy(input_dir, output_root):
 
 # --- 配置路径 ---
 input_folder = r'F:\RP_dataset\derived PROMIS data set\Template_biopsy\Template_biopsy'
-output_folder = r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS'
+output_folder = r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_dwi'
 
 # 执行批量转换
 batch_convert_csv_to_npy(input_folder, output_folder)

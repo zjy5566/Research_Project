@@ -27,7 +27,6 @@ def compute_f1(preds, targets):
         return 1.0
     return f1_score(targets, preds, zero_division=0)
 
-# [新增] 计算 Sensitivity (召回率)
 def compute_sens(preds, targets):
     preds = preds.detach().cpu().numpy().flatten()
     targets = targets.detach().cpu().numpy().flatten()
@@ -46,7 +45,89 @@ def compute_kappa(preds, targets):
         return 0.0
 
 # ==========================================
-# 2. 实验追踪器 (MetricTracker)
+# [新增] 2. 类别平衡准确率评估器 (Balanced Accuracy)
+# ==========================================
+class BalancedAccuracyEvaluator:
+    def __init__(self, prob_threshold=0.5, cs_pca_threshold=3):
+        # 注意: 标签中 3 代表 ISUP 2 (临床显著性前列腺癌的起点)
+        self.prob_threshold = prob_threshold
+        self.cs_pca_threshold = cs_pca_threshold
+        
+        # Gland level 统计 (患者级)
+        self.gland_tp, self.gland_tn, self.gland_fp, self.gland_fn = 0, 0, 0, 0
+        # Region level 统计 (区域级)
+        self.region_tp, self.region_tn, self.region_fp, self.region_fn = 0, 0, 0, 0
+
+    def update(self, pred_prob_3d, gland_mask, zones_mask, sys_labels, lesion_mask, target_mask, has_sys, has_lesion, has_target):
+        # 为了加速计算，我们直接在 GPU 上操作张量，只在最后取 item()
+        
+        # =======================================================
+        # 1. 提取 Gland Level GT (患者级真实标签)
+        # =======================================================
+        patient_gt = 0
+        if has_sys and sys_labels is not None:
+            if sys_labels.max() >= self.cs_pca_threshold: patient_gt = 1
+        if has_target and target_mask is not None:
+            if target_mask.max() >= self.cs_pca_threshold: patient_gt = 1
+        if has_lesion and lesion_mask is not None:
+            if lesion_mask.max() > 0: patient_gt = 1  # PUB数据集 1 即代表恶性病灶
+            
+        # 提取 Gland Level 模型预测 (腺体内部的最高预测概率)
+        valid_gland_probs = pred_prob_3d[gland_mask > 0]
+        if len(valid_gland_probs) > 0:
+            patient_pred_prob = valid_gland_probs.max().item()
+            patient_pred = 1 if patient_pred_prob >= self.prob_threshold else 0
+            
+            if patient_gt == 1 and patient_pred == 1: self.gland_tp += 1
+            elif patient_gt == 0 and patient_pred == 0: self.gland_tn += 1
+            elif patient_gt == 0 and patient_pred == 1: self.gland_fp += 1
+            elif patient_gt == 1 and patient_pred == 0: self.gland_fn += 1
+
+        # =======================================================
+        # 2. 提取 Region Level GT (系统活检区域级)
+        # =======================================================
+        if has_sys and zones_mask is not None and sys_labels is not None:
+            unique_zones = torch.unique(zones_mask)
+            for z_idx in unique_zones:
+                if z_idx == 0: continue # 跳过背景
+                
+                try:
+                    # 分区是从 1 开始的，对应 label 索引要减 1
+                    z_label = sys_labels[int(z_idx.item()) - 1].item()
+                except IndexError:
+                    continue
+                    
+                if z_label == 0: continue # 跳过医生没穿刺的区域
+                
+                zone_gt = 1 if z_label >= self.cs_pca_threshold else 0
+                
+                # 获取模型在该分区内的最高概率
+                zone_probs = pred_prob_3d[zones_mask == z_idx]
+                if len(zone_probs) > 0:
+                    zone_pred_prob = zone_probs.max().item()
+                    zone_pred = 1 if zone_pred_prob >= self.prob_threshold else 0
+                    
+                    if zone_gt == 1 and zone_pred == 1: self.region_tp += 1
+                    elif zone_gt == 0 and zone_pred == 0: self.region_tn += 1
+                    elif zone_gt == 0 and zone_pred == 1: self.region_fp += 1
+                    elif zone_gt == 1 and zone_pred == 0: self.region_fn += 1
+
+    def compute_metrics(self):
+        g_tpr = self.gland_tp / (self.gland_tp + self.gland_fn + 1e-8)
+        g_tnr = self.gland_tn / (self.gland_tn + self.gland_fp + 1e-8)
+        gland_bacc = (g_tpr + g_tnr) / 2
+        
+        r_tpr = self.region_tp / (self.region_tp + self.region_fn + 1e-8)
+        r_tnr = self.region_tn / (self.region_tn + self.region_fp + 1e-8)
+        region_bacc = (r_tpr + r_tnr) / 2
+        
+        return {
+            "gland_sens": g_tpr, "gland_spec": g_tnr, "gland_bacc": gland_bacc,
+            "region_sens": r_tpr, "region_spec": r_tnr, "region_bacc": region_bacc
+        }
+
+# ==========================================
+# 3. 实验追踪器 (MetricTracker)
 # ==========================================
 class AverageMeter(object):
     def __init__(self): self.reset()
@@ -57,26 +138,28 @@ class AverageMeter(object):
 
 class MetricTracker:
     def __init__(self):
-        # 损失 (Train 和 Val 都需要)
         self.loss_total = AverageMeter()
         self.loss_grade = AverageMeter()
         self.loss_lesion = AverageMeter()
-        
-        # [修改] 新增三个细分的 lesion loss
         self.loss_lesion_dense = AverageMeter()
         self.loss_lesion_sparse = AverageMeter()
         self.loss_lesion_sys = AverageMeter()
-        
         self.loss_gland = AverageMeter()
         
-        # 性能指标 (只给 Val 算)
         self.lesion_dice = AverageMeter()
         self.lesion_f1 = AverageMeter()
-        self.lesion_sens = AverageMeter() # [新增]
+        self.lesion_sens = AverageMeter()
         self.gland_dice = AverageMeter()
         self.grade_kappa = AverageMeter()
+        
+        # [新增] 存储 Balanced Accuracy 评估器的全局结果
+        self.gland_bacc = 0.0
+        self.gland_tpr = 0.0
+        self.gland_tnr = 0.0
+        self.region_bacc = 0.0
+        self.region_tpr = 0.0
+        self.region_tnr = 0.0
 
-    # [修改] 接收三个细分的 lesion loss
     def update_losses(self, total, g, l, l_dense, l_sparse, l_sys, gl):
         self.loss_total.update(total)
         self.loss_grade.update(g)
@@ -91,16 +174,15 @@ class MetricTracker:
                 f"L_Les: {self.loss_lesion.avg:.4f} | L_Glan: {self.loss_gland.avg:.4f}")
 
     def print_val_summary(self):
-        return (f"Loss: {self.loss_total.avg:.4f} | Les-Dice(PUB): {self.lesion_dice.avg:.4f} | "
-                f"Les-Sens: {self.lesion_sens.avg:.4f} | Glan-Dice: {self.gland_dice.avg:.4f} | Grade-Kap(TC/PR): {self.grade_kappa.avg:.4f}")
+        return (f"Loss: {self.loss_total.avg:.4f} | Les-Dice: {self.lesion_dice.avg:.4f} | "
+                f"Grade-Kap: {self.grade_kappa.avg:.4f} | "
+                f"Glan-BAcc: {self.gland_bacc:.4f} | Reg-BAcc: {self.region_bacc:.4f}")
 
     def get_train_dict(self):
-        """训练集只返回 Loss"""
         return {
             'train_loss_total': self.loss_total.avg,
             'train_loss_grade': self.loss_grade.avg,
             'train_loss_lesion': self.loss_lesion.avg,
-            # [修改] 暴露子分支 Loss
             'train_loss_lesion_dense': self.loss_lesion_dense.avg,
             'train_loss_lesion_sparse': self.loss_lesion_sparse.avg,
             'train_loss_lesion_sys': self.loss_lesion_sys.avg,
@@ -108,34 +190,42 @@ class MetricTracker:
         }
 
     def get_val_dict(self):
-        """验证集返回全面指标"""
         return {
             'val_loss_total': self.loss_total.avg,
             'val_loss_grade': self.loss_grade.avg,
             'val_loss_lesion': self.loss_lesion.avg,
-            # [修改] 暴露子分支 Loss
             'val_loss_lesion_dense': self.loss_lesion_dense.avg,
             'val_loss_lesion_sparse': self.loss_lesion_sparse.avg,
             'val_loss_lesion_sys': self.loss_lesion_sys.avg,
             'val_loss_gland': self.loss_gland.avg,
             'val_lesion_dice': self.lesion_dice.avg,
             'val_lesion_f1': self.lesion_f1.avg,
-            'val_lesion_sens': self.lesion_sens.avg, # [新增]
+            'val_lesion_sens': self.lesion_sens.avg,
             'val_gland_dice': self.gland_dice.avg,
-            'val_grade_kappa': self.grade_kappa.avg
+            'val_grade_kappa': self.grade_kappa.avg,
+            # [新增] 暴露平衡准确率指标
+            'val_gland_bacc': self.gland_bacc,
+            'val_gland_sens': self.gland_tpr,
+            'val_gland_spec': self.gland_tnr,
+            'val_region_bacc': self.region_bacc,
+            'val_region_sens': self.region_tpr,
+            'val_region_spec': self.region_tnr
         }
 
 # ==========================================
-# 3. 集成验证流程 (Validation Routine)
+# 4. 集成验证流程 (Validation Routine)
 # ==========================================
 @torch.no_grad()
 def validate(model, loader, criterion, device, epoch, save_dir):
     model.eval()
     tracker = MetricTracker()
+    
+    # [新增] 初始化平衡准确率评估器
+    balanced_evaluator = BalancedAccuracyEvaluator(prob_threshold=0.5, cs_pca_threshold=3)
+    
     vis_dir = os.path.join(save_dir, Config.VIS_SUBDIR, f"epoch_{epoch}")
     os.makedirs(vis_dir, exist_ok=True)
 
-    # 随机抽样配置
     saved_counts = {'PUB': 0, 'TCIA': 0, 'PROMIS': 0}
     max_saves_per_type = 2 
     plot_prob = 0.15 
@@ -149,7 +239,6 @@ def validate(model, loader, criterion, device, epoch, save_dir):
         # ---------------------------
         # 计算 Loss
         # ---------------------------
-        # [修改] 接收新增的三个 lesion 子 loss
         total_loss, l_grad, l_sys, l_les, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
             g_p, s_g_p, l_p, s_l_p, gl_p,
             batch['target_mask'].to(device), batch['sys_labels'].to(device),
@@ -158,36 +247,27 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             batch['has_lesion'].to(device), batch['has_gland'].to(device)
         )
         
-        # [修改] 传递子 loss 给 tracker
         tracker.update_losses(
-            total_loss.item(), 
-            (l_grad + l_sys).item(), 
-            l_les.item(), 
-            l_les_dense.item(), 
-            l_les_sparse.item(), 
-            l_les_sys.item(), 
-            l_gland.item()
+            total_loss.item(), (l_grad + l_sys).item(), l_les.item(), 
+            l_les_dense.item(), l_les_sparse.item(), l_les_sys.item(), l_gland.item()
         )
 
         # ---------------------------
-        # 计算评价指标 (分源独立计算)
+        # 计算传统评价指标 (分源独立计算)
         # ---------------------------
-        # 1. Gland (所有数据集只要有标注就能算)
         if batch['has_gland'].sum() > 0:
             idx = batch['has_gland'] > 0
             g_bin = (torch.sigmoid(gl_p[idx]) > 0.5).float()
             tracker.gland_dice.update(compute_dice(g_bin, batch['gland_mask'][idx].to(device)))
         
-        # 2. Lesion Dice, F1 & Sens (极其严格：只能用 PUB 算)
         if batch['has_lesion'].sum() > 0:
             idx = batch['has_lesion'] > 0
             lp, lt = torch.sigmoid(l_p[idx]), batch['lesion_mask'][idx].to(device)
             lb = (lp > 0.5).float()
             tracker.lesion_dice.update(compute_dice(lb, lt))
             tracker.lesion_f1.update(compute_f1(lb, lt))
-            tracker.lesion_sens.update(compute_sens(lb, lt)) # [新增]
+            tracker.lesion_sens.update(compute_sens(lb, lt))
             
-        # 3. Grade Kappa (系统活检 TCIA, PROMIS 算)
         if batch['has_sys'].sum() > 0:
             idx = batch['has_sys'] > 0
             sys_pred_flat = torch.argmax(s_g_p[idx], dim=-1).flatten()
@@ -197,9 +277,27 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                 tracker.grade_kappa.update(compute_kappa(sys_pred_flat[valid_mask], sys_true_flat[valid_mask]))
 
         # ---------------------------
-        # 智能随机可视化抽样
+        # [新增] 计算平衡准确率 (Gland & Region Level)
         # ---------------------------
         r_probs = torch.sigmoid(l_p)
+        for b in range(imgs.size(0)):
+            has_s = batch['has_sys'][b].item() > 0
+            has_l = batch['has_lesion'][b].item() > 0
+            has_t = batch['has_target'][b].item() > 0
+            
+            balanced_evaluator.update(
+                pred_prob_3d=r_probs[b, 0],
+                gland_mask=batch['gland_mask'][b, 0].to(device),
+                zones_mask=batch['zones_mask'][b, 0].to(device) if has_s else None,
+                sys_labels=batch['sys_labels'][b].to(device) if has_s else None,
+                lesion_mask=batch['lesion_mask'][b, 0].to(device) if has_l else None,
+                target_mask=batch['target_mask'][b, 0].to(device) if has_t else None,
+                has_sys=has_s, has_lesion=has_l, has_target=has_t
+            )
+
+        # ---------------------------
+        # 智能随机可视化抽样
+        # ---------------------------
         g_preds = torch.argmax(g_p, dim=1, keepdim=True)
 
         for b in range(imgs.size(0)):
@@ -208,8 +306,7 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             elif batch['has_sys'][b] > 0: d_type = 'PROMIS'
             else: continue
 
-            if saved_counts[d_type] >= max_saves_per_type:
-                continue
+            if saved_counts[d_type] >= max_saves_per_type: continue
                 
             if random.random() < plot_prob:
                 gt_dict = {
@@ -219,7 +316,6 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                     'zones_mask': batch['zones_mask'][b][0].cpu().numpy(),
                     'sys_labels': batch['sys_labels'][b].cpu().numpy()
                 }
-                
                 vis_filename = f"{d_type}_{batch['pid'][b]}.png"
                 visualize_predictions(
                     imgs[b], r_probs[b], g_preds[b], gt_dict,
@@ -227,16 +323,25 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                 )
                 saved_counts[d_type] += 1
 
+    # [新增] 整个 epoch 结束后，提取全局 balanced accuracy
+    bacc_results = balanced_evaluator.compute_metrics()
+    tracker.gland_tpr = bacc_results['gland_sens']
+    tracker.gland_tnr = bacc_results['gland_spec']
+    tracker.gland_bacc = bacc_results['gland_bacc']
+    tracker.region_tpr = bacc_results['region_sens']
+    tracker.region_tnr = bacc_results['region_spec']
+    tracker.region_bacc = bacc_results['region_bacc']
+
     return tracker
 
 
 # ==========================================
-# 4. 图表工具
+# 5. 图表工具
 # ==========================================
 def plot_loss_curves(log_path, save_path):
     try:
         df = pd.read_csv(log_path)
-        plt.figure(figsize=(12, 8)) # 稍微放大画板容纳更多曲线
+        plt.figure(figsize=(12, 8))
         
         plt.plot(df['epoch'], df['train_loss_total'], label='Total Loss', color='black', lw=2)
         
@@ -245,7 +350,6 @@ def plot_loss_curves(log_path, save_path):
         if 'train_loss_gland' in df.columns:
             plt.plot(df['epoch'], df['train_loss_gland'], '--', label='Gland Loss', alpha=0.7)
             
-        # [修改] 绘制整体的 Lesion Loss 和 细分的 Lesion Loss
         if 'train_loss_lesion' in df.columns:
             plt.plot(df['epoch'], df['train_loss_lesion'], '-.', label='Lesion Total', alpha=0.9, lw=2)
         if 'train_loss_lesion_dense' in df.columns:
@@ -258,7 +362,7 @@ def plot_loss_curves(log_path, save_path):
         plt.xlabel('Epoch')
         plt.ylabel('Loss Value')
         plt.title('Multi-Task Training Loss Curves')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') # 图例放到外侧避免遮挡
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.grid(True, linestyle='--', alpha=0.4)
         plt.tight_layout()
         plt.savefig(save_path)
@@ -280,7 +384,6 @@ def visualize_predictions(input_tensor, risk_map, grade_map, gt_dict, save_path,
     grade_cmap = plt.get_cmap('jet', 7) 
 
     for i, s_idx in enumerate(slices):
-        # Row 1: Risk Map
         axes[0, i].imshow(t2[s_idx], cmap='gray')
         risk_slice = risk[s_idx]
         rmask = np.ma.masked_where(risk_slice < 0.2, risk_slice)
@@ -289,7 +392,6 @@ def visualize_predictions(input_tensor, risk_map, grade_map, gt_dict, save_path,
         axes[0, i].axis('off')
         if i == 2: fig.colorbar(im1, ax=axes[0, i], fraction=0.046, pad=0.04)
 
-        # Row 2: Grade Map
         axes[1, i].imshow(t2[s_idx], cmap='gray')
         grade_slice = grade[s_idx]
         gmask = np.ma.masked_where(grade_slice == 0, grade_slice)
@@ -301,7 +403,6 @@ def visualize_predictions(input_tensor, risk_map, grade_map, gt_dict, save_path,
             cbar2.set_ticks(np.arange(7))
             cbar2.set_ticklabels(['BG', 'Ben', 'IS1', 'IS2', 'IS3', 'IS4', 'IS5'])
 
-        # Row 3: Ground Truth
         axes[2, i].imshow(t2[s_idx], cmap='gray')
         
         gt_slice = None
