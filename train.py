@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import pandas as pd
 from torch.utils.data import DataLoader
@@ -9,14 +10,32 @@ from Loss_function import MixedSupervisionLoss
 import utils
 
 # ==========================================
-# [新增] 动态权重调度函数 (Curriculum Learning)
+# [新增] 控制台日志双写记录器 (Logger)
+# ==========================================
+class Logger(object):
+    """
+    将 sys.stdout 重定向到终端和文件。
+    任何 print() 输出都会同时显示在屏幕上并追加保存到 log_file 中。
+    """
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # 强制每次写入后刷新缓冲区，防止程序意外中断时日志丢失
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# ==========================================
+# 动态权重调度函数 (Curriculum Learning)
 # ==========================================
 def update_loss_weights(criterion, epoch):
     """
     根据 Epoch 动态调整三个子任务的权重。
-    阶段 1 (Epoch 1-10): [1.0, 0.0, 0.0] 专注 PUB 强监督，学习基础形状。
-    阶段 2 (Epoch 11-30): [1.0, 0.5, 0.5] 引入 TCIA 和 PROMIS，结合系统/靶向数据学习多中心特征。
-    阶段 3 (Epoch 31+): [0.5, 1.0, 1.0] 降低 PUB 权重，重点依靠临床活检的弱监督压制假阳性。
     """
     if epoch <= 10:
         criterion.l_w_dense = 1.0
@@ -76,6 +95,15 @@ def main():
     exp_name = Config.get_experiment_name()
     save_path = os.path.join(Config.EXP_DIR, exp_name)
     os.makedirs(save_path, exist_ok=True)
+    
+    # ========================================================
+    # [核心修改] 在生成保存目录后，立即重定向标准输出！
+    # ========================================================
+    log_file_path = os.path.join(save_path, "console_output.log")
+    sys.stdout = Logger(log_file_path)
+    print(f"✅ Console outputs will be saved to: {log_file_path}")
+
+    # 下面所有的 print (包括 Config.show) 都会自动写进文件里了
     Config.show()
 
     train_loader = DataLoader(ProstateUnifiedDataset(Config.TRAIN_CSV, Config.UNIFIED_DATA_DIR, True), 
@@ -99,9 +127,7 @@ def main():
     for epoch in range(1, Config.NUM_EPOCHS + 1):
         print(f"\nEpoch {epoch}/{Config.NUM_EPOCHS}")
         
-        # ========================================================
-        # [核心调用] 在每个 Epoch 开始前，调用函数更新 Loss 权重！
-        # ========================================================
+        # 调用函数更新 Loss 权重
         update_loss_weights(criterion, epoch)
         
         t_track = train_one_epoch(model, train_loader, optimizer, criterion, device)
