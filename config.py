@@ -80,11 +80,19 @@ class Config:
     LESION_W_SPARSE = 0.5  # 稀疏强监督 (靶向): 提供确信的局部锚点
     LESION_W_REGIONAL =0.5  # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
     
+
+    # [新增] 动态多阶段权重控制 (Curriculum Learning)
+    USE_DYNAMIC_WEIGHTS = False         # 是否开启根据 Epoch 动态调节 Lesion 子权重
+    DYNAMIC_WEIGHT_EPOCHS = [10, 30]   # 阶段切换的 Epoch 节点
+
+
     # 【辅任务B】 Gland Anatomy
     LAMBDA_GLAND = 0
 
+
+
     #针对极小病灶将权重
-    LESION_W_SMALL = 0.5  # 小病灶权重 (根据实际情况调整，可能需要大于1以强调小病灶)
+    LESION_W_SMALL = 5  # 小病灶权重 (根据实际情况调整，可能需要大于1以强调小病灶)
     
     # ==========================================
     # 6. 消融实验控制开关 (Ablation Study Flags)

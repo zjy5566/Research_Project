@@ -10,7 +10,7 @@ from Loss_function import MixedSupervisionLoss
 import utils
 
 # ==========================================
-# [新增] 控制台日志双写记录器 (Logger)
+# 控制台日志双写记录器 (Logger)
 # ==========================================
 class Logger(object):
     """
@@ -35,13 +35,23 @@ class Logger(object):
 # ==========================================
 def update_loss_weights(criterion, epoch):
     """
-    根据 Epoch 动态调整三个子任务的权重。
+    受 Config 控制的动态权重调度器。
+    如果 Config 中关闭了该功能，则保持 Loss 类初始化时的默认权重不变。
     """
-    if epoch <= 10:
+    # 检查开关状态 (兼容之前没写这个变量的情况，默认设为 False)
+    use_dynamic = getattr(Config, 'USE_DYNAMIC_WEIGHTS', False)
+    if not use_dynamic:
+        return  # 不执行动态更新，维持 config 中初始化的静态权重
+
+    # 获取分段节点，默认为 [10, 30]
+    epochs_nodes = getattr(Config, 'DYNAMIC_WEIGHT_EPOCHS', [10, 30])
+    node1, node2 = epochs_nodes[0], epochs_nodes[1]
+
+    if epoch <= node1:
         criterion.l_w_dense = 1.0
         criterion.l_w_sparse = 0.0
         criterion.l_w_regional = 0.0
-    elif 10 < epoch <= 30:
+    elif node1 < epoch <= node2:
         criterion.l_w_dense = 1.0
         criterion.l_w_sparse = 0.5
         criterion.l_w_regional = 0.5
@@ -58,7 +68,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     tracker = utils.MetricTracker()
     
-    # 获取带有进度条的枚举迭代器
     from tqdm import tqdm
     pbar = tqdm(loader, desc="Training")
     
@@ -69,7 +78,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         optimizer.zero_grad()
         g_p, s_g_p, l_p, s_l_p, gl_p = model(imgs, z_mask)
         
-        # 接收细分的 lesion 子 loss
+        # 接收新增的三个 lesion 子 loss
         total_loss, l_grad, l_sys, l_les, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
             g_p, s_g_p, l_p, s_l_p, gl_p,
             batch['target_mask'].to(device), batch['sys_labels'].to(device),
@@ -96,14 +105,11 @@ def main():
     save_path = os.path.join(Config.EXP_DIR, exp_name)
     os.makedirs(save_path, exist_ok=True)
     
-    # ========================================================
-    # [核心修改] 在生成保存目录后，立即重定向标准输出！
-    # ========================================================
+    # 在生成保存目录后，立即重定向标准输出
     log_file_path = os.path.join(save_path, "console_output.log")
     sys.stdout = Logger(log_file_path)
     print(f"✅ Console outputs will be saved to: {log_file_path}")
 
-    # 下面所有的 print (包括 Config.show) 都会自动写进文件里了
     Config.show()
 
     train_loader = DataLoader(ProstateUnifiedDataset(Config.TRAIN_CSV, Config.UNIFIED_DATA_DIR, True), 
@@ -127,7 +133,9 @@ def main():
     for epoch in range(1, Config.NUM_EPOCHS + 1):
         print(f"\nEpoch {epoch}/{Config.NUM_EPOCHS}")
         
-        # 调用函数更新 Loss 权重
+        # ========================================================
+        # [调用] 依据 Config 检查并更新权重
+        # ========================================================
         update_loss_weights(criterion, epoch)
         
         t_track = train_one_epoch(model, train_loader, optimizer, criterion, device)
