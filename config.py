@@ -66,19 +66,24 @@ class Config:
 
     EARLY_STOP_PATIENCE = 300  # 如果连续 10 个 epoch 性能没有提升，则停止训练
 
+   # ==========================================
+    # Loss 权重配置
     # ==========================================
-    # 5. 多任务权重控制 (Latent Variables & Loss Weights)
-    # ==========================================
-    # 【主任务】 Cancer Grade 
-    LAMBDA_GRADE = 0
-    LAMBDA_TB = 0 
-    LAMBDA_SYS = 0   
+    # 1. 宏观三大任务总权重
+    LAMBDA_GRADE = 1.0         # ISUP分级总任务权重
+    LAMBDA_LESION = 1.0        # 病灶检测总任务权重
+    LAMBDA_GLAND = 0.2         # 腺体分割总任务权重
     
-    # 【辅任务A】 Lesion Risk (将原来的单一权重拆解为多源内部权重)
-    LAMBDA_LESION = 1       # Lesion 整体分支的缩放系数
-    LESION_W_DENSE = 1     # 密集强监督 (PUB): 提供形状基准
-    LESION_W_SPARSE = 0.5  # 稀疏强监督 (靶向): 提供确信的局部锚点
-    LESION_W_REGIONAL =0.5  # 区域弱监督 (系统): 提供宏观先验，大幅降权防污染
+    # 2. Grade 子任务权重细分 (新增)
+    GRADE_W_TBX = 1.0          # 靶向穿刺强监督 (TCIA)
+    GRADE_W_SBX = 0.5          # 系统穿刺弱监督 (PROMIS)
+    
+    # 3. Lesion 子任务权重细分
+    LESION_W_DENSE = 1.0       # 密集掩膜强监督 (PUB)
+    LESION_W_SPARSE = 1.0      # 靶向针道强监督 (TCIA)
+    LESION_W_REGIONAL = 1.0    # 系统活检弱监督 (PROMIS)
+
+    # (如果有 LAMBDA_TB 和 LAMBDA_SYS，现在可以删除了，因为它们被更清晰的子权重替代了)
     
 
     # [新增] 动态多阶段权重控制 (Curriculum Learning)
@@ -141,7 +146,7 @@ class Config:
         20241027_1530_G1.0_S0.5_L1.0_Gl0.2_LR0.0001
         """
         time_str = datetime.now().strftime("%Y%m%d_%H%M")
-        name = (f"{time_str}_G{cls.LAMBDA_GRADE}_{cls.LAMBDA_TB}_{cls.LAMBDA_SYS}"
+        name = (f"{time_str}_G{cls.LAMBDA_GRADE}_{cls.GRADE_W_TBX}_{cls.GRADE_W_SBX}"
                 f"_L{cls.LAMBDA_LESION}_{cls.LESION_W_DENSE}_{cls.LESION_W_SPARSE}_{cls.LESION_W_REGIONAL}_Gl{cls.LAMBDA_GLAND}_LS{cls.LESION_W_SMALL}_LR{cls.LR}")
         if not cls.USE_AUGMENTATION:
             name += "_NoAug"

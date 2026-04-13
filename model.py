@@ -91,7 +91,8 @@ class ProstateMixedSupervisionNet(nn.Module):
         self.head_lesion = nn.Conv3d(32, 1, kernel_size=1)
         self.head_gland = nn.Conv3d(32, 1, kernel_size=1)
 
-    def zone_pooling(self, voxel_logits, zones_mask):
+    # 【修改】：增加了 mode 参数，用来区分不同的池化策略
+    def zone_pooling(self, voxel_logits, zones_mask, mode='lme'):
         B, C, D, H, W = voxel_logits.shape
         device = voxel_logits.device
         
@@ -106,16 +107,17 @@ class ProstateMixedSupervisionNet(nn.Module):
                 if zone_pixels.sum() > 0:
                     features_in_zone = logits_b[:, zone_pixels] # 形状: (C, N)
                     
-                    # 【核心修改点】：将硬性 max 替换为 LME (Log-Mean-Exp) 平滑池化
-                    r = 8.0  # 平滑系数。r 越大越像 Max，r 越小越像 Mean。8.0 是极佳的经验值
-                    N = features_in_zone.shape[1]
-                    
-                    # 算法：1/r * log( mean( exp(r * x) ) ) = 1/r * ( logsumexp(r*x) - log(N) )
-                    # 直接调用 PyTorch 底层 C++ 的 logsumexp，极其稳定，不会出现 inf 或 NaN
-                    lse = torch.logsumexp(features_in_zone * r, dim=1)
-                    lme = (lse - torch.log(torch.tensor(N, dtype=torch.float32, device=device))) / r
-                    
-                    sys_preds[b, z - 1] = lme
+                    if mode == 'lme':
+                        # LME (Log-Mean-Exp) 平滑池化，适用于 Lesion (二分类) 找异常高分
+                        r = 8.0  
+                        N = features_in_zone.shape[1]
+                        lse = torch.logsumexp(features_in_zone * r, dim=1)
+                        pooled = (lse - torch.log(torch.tensor(N, dtype=torch.float32, device=device))) / r
+                    else:
+                        # Mean Pooling 平均池化，适用于 Grade (多分类) 维持 Logits 相对分布
+                        pooled = features_in_zone.mean(dim=1)
+                        
+                    sys_preds[b, z - 1] = pooled
                     
         return sys_preds
 
@@ -162,7 +164,8 @@ class ProstateMixedSupervisionNet(nn.Module):
         sys_lesion_preds = None
         
         if zones_mask is not None:
-            sys_grade_preds = self.zone_pooling(grade_pred, zones_mask)   
-            sys_lesion_preds = self.zone_pooling(lesion_pred, zones_mask) 
+            # 【核心修改】：Grade 用 mean，Lesion 用 lme
+            sys_grade_preds = self.zone_pooling(grade_pred, zones_mask, mode='mean')   
+            sys_lesion_preds = self.zone_pooling(lesion_pred, zones_mask, mode='lme') 
 
         return grade_pred, sys_grade_preds, lesion_pred, sys_lesion_preds, gland_pred

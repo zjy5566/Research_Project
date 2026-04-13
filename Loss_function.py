@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -49,26 +49,28 @@ class FocalLoss(nn.Module):
 
 class MixedSupervisionLoss(nn.Module):
     def __init__(self, 
-                 lambda_grade=1.0,         # 主任务 (靶向 ISUP 分级)
-                 lambda_tb=1.0,            # 预留参数
-                 lambda_sys=0.5,           # 弱监督分级 (系统区域池化)
-                 lambda_lesion=1.0,        # 辅任务A (寻找病灶整体权重)
-                 lambda_gland=0.2,         # 辅任务B (腺体轮廓)
-                 lesion_w_dense=1.0,       # 辅任务A内部：密集强监督 (PUB)
-                 lesion_w_sparse=1.0,      # 辅任务A内部：稀疏强监督 (靶向)
-                 lesion_w_regional=1.0,    # 辅任务A内部：系统区域弱监督 (PROMIS)
+                 lambda_grade=1.0,         # 主任务 (分级总体权重)
+                 lambda_lesion=1.0,        # 辅任务A (寻找病灶总体权重)
+                 lambda_gland=0.2,         # 辅任务B (腺体轮廓总体权重)
+                 grade_w_tbx=1.0,          # 分级内部：靶向强监督权重 (TCIA)
+                 grade_w_sbx=0.5,          # 分级内部：系统弱监督权重 (PROMIS/TCIA)
+                 lesion_w_dense=1.0,       # 病灶内部：密集强监督 (PUB)
+                 lesion_w_sparse=1.0,      # 病灶内部：稀疏强监督 (靶向)
+                 lesion_w_regional=1.0,    # 病灶内部：系统区域弱监督 (PROMIS)
                  csPCa_threshold=3,        # 临床显著性前列腺癌的 ISUP 阈值
-                 lesion_w_small=1.0,
-                 pos_weight_val=2.0):      # [建议]: 提高 Dense 正样本权重，帮助网络画图
-        
+                 pos_weight_val=2.0):      
         super(MixedSupervisionLoss, self).__init__()
         
+        # 总权重
         self.lambda_grade = lambda_grade
-        self.lambda_sys = lambda_sys
         self.lambda_lesion = lambda_lesion
         self.lambda_gland = lambda_gland
         
-        # 动态课程学习权重（这三个属性在 train.py 中会被动态修改）
+        # Grade 内部子权重
+        self.g_w_tbx = grade_w_tbx
+        self.g_w_sbx = grade_w_sbx
+        
+        # Lesion 内部子权重 (动态课程学习会在 train.py 修改这些)
         self.l_w_dense = lesion_w_dense
         self.l_w_sparse = lesion_w_sparse
         self.l_w_regional = lesion_w_regional
@@ -77,13 +79,18 @@ class MixedSupervisionLoss(nn.Module):
         
         # --- Loss 实例化 ---
         self.pos_weight = torch.tensor([pos_weight_val])
-        self.lesion_bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        self.lesion_bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight) # 处理极度不平衡的lesion标签
         self.lesion_focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
         self.gland_bce_loss = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss()
         
-        # [新增] 多分类交叉熵，用于 ISUP 级别预测 (忽略值为 -1 的非合法区域)
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+        # 多分类交叉熵，用于 ISUP 级别预测 (忽略值为 -1 的非合法区域)
+        # 类别 0 (健康) 权重极低，类别 1 (良性) 略高，ISUP 1-5 (类别 2-6) 权重极高
+        # 注意：你需要确保这个 tensor 放在正确的 device 上 (可以在 forward 里 to(device))
+        self.class_weights = torch.tensor([0.1, 0.5, 2.0, 2.0, 3.0, 3.0, 3.0], dtype=torch.float32)
+        
+        # 传入 weight 参数
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=-1)
 
 
     def forward(self, grade_preds, sys_grade_preds, lesion_pred, sys_lesion_preds, gland_pred, 
@@ -92,7 +99,6 @@ class MixedSupervisionLoss(nn.Module):
         
         device = lesion_pred.device if lesion_pred is not None else grade_preds.device
         
-        # 设备同步
         if self.lesion_bce_loss.pos_weight.device != device:
             self.lesion_bce_loss.pos_weight = self.lesion_bce_loss.pos_weight.to(device)
 
@@ -105,7 +111,6 @@ class MixedSupervisionLoss(nn.Module):
         loss_lesion_sys = torch.tensor(0.0, device=device)
         loss_gland = torch.tensor(0.0, device=device)
         
-        # 有效数据标记
         valid_target = has_target > 0
         valid_sys = has_sys > 0
         valid_lesion = has_lesion > 0
@@ -114,32 +119,33 @@ class MixedSupervisionLoss(nn.Module):
         # ===================================================================
         # [任务 1]：Grade ISUP 分级任务 (多分类)
         # ===================================================================
-        # 1A. 靶向针道密集分类强监督 (TCIA)
+        # 1A. 靶向针道密集分类强监督 (TBx - TCIA)
+        # ===================================================================
         if grade_preds is not None and valid_target.any():
-            g_p_t = grade_preds[valid_target]       # [N, C, D, H, W]
-            mask_t = target_mask[valid_target]      # [N, D, H, W]
+            g_p_t = grade_preds[valid_target]       
+            mask_t = target_mask[valid_target]      
             
-            # 只选出有针道的地方 (ISUP > 0) 进行分类监督
+            # 【修复点】：去掉 mask_t 多余的 Channel=1 维度
+            # 把它从 [B, 1, D, H, W] 变成 [B, D, H, W]
+            if mask_t.dim() == 5 and mask_t.shape[1] == 1:
+                mask_t = mask_t.squeeze(1)
+                
             valid_pixels = mask_t > 0
             if valid_pixels.any():
-                # 维度转换: [N, C, D, H, W] -> [N, D, H, W, C] 方便按照 bool 掩膜提取
-                g_p_t_permuted = g_p_t.permute(0, 2, 3, 4, 1)
+                g_p_t_permuted = g_p_t.permute(0, 2, 3, 4, 1) # [B, D, H, W, 7]
                 
-                preds_valid_grade = g_p_t_permuted[valid_pixels] # [num_pixels, C]
-                labels_valid_grade = mask_t[valid_pixels].long() # [num_pixels]
+                # 现在 valid_pixels 是 [B, D, H, W]，刚好索引 permuted 的前4个维度
+                preds_valid_grade = g_p_t_permuted[valid_pixels] # 结果形状: [N, 7]
+                labels_valid_grade = mask_t[valid_pixels].long() # 结果形状: [N]
                 
                 loss_grade_target = self.ce_loss(preds_valid_grade, labels_valid_grade)
 
-        # 1B. 系统分区域池化弱监督分类 (PROMIS/TCIA)
+        # 1B. 系统分区域池化弱监督分类 (SBx - PROMIS/TCIA)
         if sys_grade_preds is not None and valid_sys.any():
-            s_g_p = sys_grade_preds[valid_sys]      # [N, num_zones, C]
-            s_labels = sys_labels[valid_sys]        # [N, num_zones]
-            
-            # 打平批次和区域维度
-            s_g_p_flat = s_g_p.view(-1, s_g_p.size(-1)) # [N * num_zones, C]
-            s_labels_flat = s_labels.view(-1)           # [N * num_zones]
-            
-            # 过滤掉标签为负数（未穿刺）的区域
+            s_g_p = sys_grade_preds[valid_sys]      
+            s_labels = sys_labels[valid_sys]        
+            s_g_p_flat = s_g_p.view(-1, s_g_p.size(-1)) 
+            s_labels_flat = s_labels.view(-1)           
             valid_zones = s_labels_flat >= 0
             if valid_zones.any():
                 loss_grade_sys = self.ce_loss(s_g_p_flat[valid_zones], s_labels_flat[valid_zones].long())
@@ -147,50 +153,32 @@ class MixedSupervisionLoss(nn.Module):
         # ===================================================================
         # [任务 2]：Lesion 临床显著性病灶检测 (二分类)
         # ===================================================================
-        # 2A. PUB 数据集 -> 密集强监督
         if lesion_pred is not None and valid_lesion.any():
             pred_l = lesion_pred[valid_lesion]
             mask_l = lesion_mask[valid_lesion].float()
-            
-            loss_bce_dense = self.lesion_bce_loss(pred_l, mask_l)
-            loss_focal_dense = self.lesion_focal_loss(pred_l, mask_l)
-            # 建议: 如果后续想恢复形状，可以在这里加回 Dice Loss
-            loss_lesion_dense = loss_bce_dense + loss_focal_dense
+            loss_lesion_dense = self.lesion_bce_loss(pred_l, mask_l) + self.lesion_focal_loss(pred_l, mask_l)
 
-        # 2B. TCIA 数据集 -> 靶向针道稀疏强监督
         if lesion_pred is not None and valid_target.any():
             pred_t = lesion_pred[valid_target]
             mask_t = target_mask[valid_target]
-            
             valid_pixels = mask_t > 0
             if valid_pixels.any():
                 target_lesion_label = (mask_t >= self.csPCa_threshold).float()
-                
                 pred_valid = pred_t[valid_pixels]
                 label_valid = target_lesion_label[valid_pixels]
-                
-                loss_bce_sparse = self.lesion_bce_loss(pred_valid, label_valid)
-                loss_focal_sparse = self.lesion_focal_loss(pred_valid, label_valid)
-                loss_lesion_sparse = loss_bce_sparse + loss_focal_sparse
+                loss_lesion_sparse = self.lesion_bce_loss(pred_valid, label_valid) + self.lesion_focal_loss(pred_valid, label_valid)
 
-        # 2C. PROMIS 数据集 -> 系统分区域池化弱监督
         if sys_lesion_preds is not None and valid_sys.any():
             s_l_p = sys_lesion_preds[valid_sys]
             s_labels = sys_labels[valid_sys]
-            
             s_l_p_flat = s_l_p.view(-1)
             s_labels_flat = s_labels.view(-1)
-            
             valid_zones = s_labels_flat >= 0
             if valid_zones.any():
                 sys_lesion_label = (s_labels_flat >= self.csPCa_threshold).float()
-                
                 pred_valid = s_l_p_flat[valid_zones]
                 label_valid = sys_lesion_label[valid_zones]
-                
-                loss_bce_sys = self.lesion_bce_loss(pred_valid, label_valid)
-                loss_focal_sys = self.lesion_focal_loss(pred_valid, label_valid)
-                loss_lesion_sys = loss_bce_sys + loss_focal_sys
+                loss_lesion_sys = self.lesion_bce_loss(pred_valid, label_valid) + self.lesion_focal_loss(pred_valid, label_valid)
 
         # ===================================================================
         # [任务 3]：Gland 腺体密集强监督
@@ -198,24 +186,20 @@ class MixedSupervisionLoss(nn.Module):
         if gland_pred is not None and valid_gland.any():
             g_pred_valid = gland_pred[valid_gland]
             g_mask_valid = gland_mask[valid_gland].float()
-            
-            loss_g_bce = self.gland_bce_loss(g_pred_valid, g_mask_valid)
-            loss_g_dice = self.dice_loss(g_pred_valid, g_mask_valid)
-            loss_gland = loss_g_bce + loss_g_dice
+            loss_gland = self.gland_bce_loss(g_pred_valid, g_mask_valid) + self.dice_loss(g_pred_valid, g_mask_valid)
 
         # ===================================================================
-        # 汇总返回
+        # 汇总返回 (包含全新的 Grade 子类拆分)
         # ===================================================================
-        # Lesion 内部的动态权重融合
+        loss_grade_total = (self.g_w_tbx * loss_grade_target) + (self.g_w_sbx * loss_grade_sys)
+        
         loss_lesion_total = (self.l_w_dense * loss_lesion_dense + 
                              self.l_w_sparse * loss_lesion_sparse + 
                              self.l_w_regional * loss_lesion_sys)
 
-        # 四大总任务的最终融合
-        total_loss = (self.lambda_grade * loss_grade_target) + \
-                     (self.lambda_sys * loss_grade_sys) + \
+        total_loss = (self.lambda_grade * loss_grade_total) + \
                      (self.lambda_lesion * loss_lesion_total) + \
                      (self.lambda_gland * loss_gland)
                       
-        # 返回结构与 train.py 严格对齐
-        return total_loss, loss_grade_target, loss_grade_sys, loss_lesion_total, loss_lesion_dense, loss_lesion_sparse, loss_lesion_sys, loss_gland
+        # 返回 9 个变量 (新增了 loss_grade_total 及其子项)
+        return total_loss, loss_grade_total, loss_grade_target, loss_grade_sys, loss_lesion_total, loss_lesion_dense, loss_lesion_sparse, loss_lesion_sys, loss_gland

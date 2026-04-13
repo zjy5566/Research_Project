@@ -139,7 +139,11 @@ class AverageMeter(object):
 class MetricTracker:
     def __init__(self):
         self.loss_total = AverageMeter()
-        self.loss_grade = AverageMeter()
+
+        self.loss_grade_total = AverageMeter()
+        self.loss_grade_tbx = AverageMeter()
+        self.loss_grade_sbx = AverageMeter()
+
         self.loss_lesion = AverageMeter()
         self.loss_lesion_dense = AverageMeter()
         self.loss_lesion_sparse = AverageMeter()
@@ -160,17 +164,19 @@ class MetricTracker:
         self.region_tpr = 0.0
         self.region_tnr = 0.0
 
-    def update_losses(self, total, g, l, l_dense, l_sparse, l_sys, gl):
+    def update_losses(self, total, g_tot, g_tbx, g_sbx, l_tot, l_dense, l_sparse, l_sys, gl):
         self.loss_total.update(total)
-        self.loss_grade.update(g)
-        self.loss_lesion.update(l)
+        self.loss_grade_total.update(g_tot)
+        self.loss_grade_tbx.update(g_tbx)
+        self.loss_grade_sbx.update(g_sbx)
+        self.loss_lesion.update(l_tot)
         self.loss_lesion_dense.update(l_dense)
         self.loss_lesion_sparse.update(l_sparse)
         self.loss_lesion_sys.update(l_sys)
         self.loss_gland.update(gl)
 
     def print_train_summary(self):
-        return (f"Loss: {self.loss_total.avg:.4f} | L_Grad: {self.loss_grade.avg:.4f} | "
+        return (f"Loss: {self.loss_total.avg:.4f} | L_Grad: {self.loss_grade_total.avg:.4f} | "
                 f"L_Les: {self.loss_lesion.avg:.4f} | L_Glan: {self.loss_gland.avg:.4f}")
 
     def print_val_summary(self):
@@ -181,7 +187,9 @@ class MetricTracker:
     def get_train_dict(self):
         return {
             'train_loss_total': self.loss_total.avg,
-            'train_loss_grade': self.loss_grade.avg,
+            'train_loss_grade': self.loss_grade_total.avg,
+            'train_loss_grade_tbx': self.loss_grade_tbx.avg,  # 新增
+            'train_loss_grade_sbx': self.loss_grade_sbx.avg,  # 新增
             'train_loss_lesion': self.loss_lesion.avg,
             'train_loss_lesion_dense': self.loss_lesion_dense.avg,
             'train_loss_lesion_sparse': self.loss_lesion_sparse.avg,
@@ -192,7 +200,9 @@ class MetricTracker:
     def get_val_dict(self):
         return {
             'val_loss_total': self.loss_total.avg,
-            'val_loss_grade': self.loss_grade.avg,
+            'val_loss_grade': self.loss_grade_total.avg,
+            'val_loss_grade_tbx': self.loss_grade_tbx.avg,    # 新增
+            'val_loss_grade_sbx': self.loss_grade_sbx.avg,    # 新增
             'val_loss_lesion': self.loss_lesion.avg,
             'val_loss_lesion_dense': self.loss_lesion_dense.avg,
             'val_loss_lesion_sparse': self.loss_lesion_sparse.avg,
@@ -238,8 +248,7 @@ def validate(model, loader, criterion, device, epoch, save_dir):
 
         # ---------------------------
         # 计算 Loss
-        # ---------------------------
-        total_loss, l_grad, l_sys, l_les, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
+        total_loss, l_grad_tot, l_grad_tbx, l_grad_sbx, l_les_tot, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
             g_p, s_g_p, l_p, s_l_p, gl_p,
             batch['target_mask'].to(device), batch['sys_labels'].to(device),
             batch['lesion_mask'].to(device), batch['gland_mask'].to(device),
@@ -248,8 +257,10 @@ def validate(model, loader, criterion, device, epoch, save_dir):
         )
         
         tracker.update_losses(
-            total_loss.item(), (l_grad + l_sys).item(), l_les.item(), 
-            l_les_dense.item(), l_les_sparse.item(), l_les_sys.item(), l_gland.item()
+            total_loss.item(), 
+            l_grad_tot.item(), l_grad_tbx.item(), l_grad_sbx.item(), 
+            l_les_tot.item(), l_les_dense.item(), l_les_sparse.item(), l_les_sys.item(), 
+            l_gland.item()
         )
 
         # ---------------------------
@@ -346,7 +357,12 @@ def plot_loss_curves(log_path, save_path):
         plt.plot(df['epoch'], df['train_loss_total'], label='Total Loss', color='black', lw=2)
         
         if 'train_loss_grade' in df.columns:
-            plt.plot(df['epoch'], df['train_loss_grade'], '--', label='Grade Loss', alpha=0.7)
+            plt.plot(df['epoch'], df['train_loss_grade'], '-.', label='Grade Total', alpha=0.9, lw=2)
+        if 'train_loss_grade_tbx' in df.columns:
+            plt.plot(df['epoch'], df['train_loss_grade_tbx'], ':', label='Grade TBx (TCIA)', alpha=0.7)
+        if 'train_loss_grade_sbx' in df.columns:
+            plt.plot(df['epoch'], df['train_loss_grade_sbx'], ':', label='Grade SBx (PROMIS)', alpha=0.7)
+            
         if 'train_loss_gland' in df.columns:
             plt.plot(df['epoch'], df['train_loss_gland'], '--', label='Gland Loss', alpha=0.7)
             
@@ -358,6 +374,7 @@ def plot_loss_curves(log_path, save_path):
             plt.plot(df['epoch'], df['train_loss_lesion_sparse'], ':', label='Lesion Sparse (TCIA)', alpha=0.7)
         if 'train_loss_lesion_sys' in df.columns:
             plt.plot(df['epoch'], df['train_loss_lesion_sys'], ':', label='Lesion Sys (PROMIS)', alpha=0.7)
+        
         
         plt.xlabel('Epoch')
         plt.ylabel('Loss Value')

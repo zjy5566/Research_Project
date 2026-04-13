@@ -79,7 +79,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         g_p, s_g_p, l_p, s_l_p, gl_p = model(imgs, z_mask)
         
         # 接收新增的三个 lesion 子 loss
-        total_loss, l_grad, l_sys, l_les, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
+        # 接收细分的 Grade 和 Lesion 子 loss (9个返回值)
+        total_loss, l_grad_tot, l_grad_tbx, l_grad_sbx, l_les_tot, l_les_dense, l_les_sparse, l_les_sys, l_gland = criterion(
             g_p, s_g_p, l_p, s_l_p, gl_p,
             batch['target_mask'].to(device), batch['sys_labels'].to(device),
             batch['lesion_mask'].to(device), batch['gland_mask'].to(device),
@@ -90,9 +91,12 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         total_loss.backward()
         optimizer.step()
         
+       # 传递给 tracker
         tracker.update_losses(
-            total_loss.item(), (l_grad + l_sys).item(), l_les.item(), 
-            l_les_dense.item(), l_les_sparse.item(), l_les_sys.item(), l_gland.item()
+            total_loss.item(), 
+            l_grad_tot.item(), l_grad_tbx.item(), l_grad_sbx.item(), 
+            l_les_tot.item(), l_les_dense.item(), l_les_sparse.item(), l_les_sys.item(), 
+            l_gland.item()
         )
         pbar.set_postfix({"Total Loss": f"{total_loss.item():.4f}"})
         
@@ -120,9 +124,17 @@ def main():
     model = ProstateMixedSupervisionNet(in_channels=Config.IN_CHANNELS).to(device)
     
     # 初始化 Criterion
+    # 初始化 Criterion
     criterion = MixedSupervisionLoss(
-        Config.LAMBDA_GRADE, Config.LAMBDA_TB, Config.LAMBDA_SYS, Config.LAMBDA_LESION, Config.LAMBDA_GLAND,
-        Config.LESION_W_DENSE, Config.LESION_W_SPARSE, Config.LESION_W_REGIONAL, Config.CSPC_THRESHOLD, Config.LESION_W_SMALL
+        lambda_grade=Config.LAMBDA_GRADE, 
+        lambda_lesion=Config.LAMBDA_LESION, 
+        lambda_gland=Config.LAMBDA_GLAND,
+        grade_w_tbx=Config.GRADE_W_TBX,         # [新增] 传入TBx权重
+        grade_w_sbx=Config.GRADE_W_SBX,         # [新增] 传入SBx权重
+        lesion_w_dense=Config.LESION_W_DENSE, 
+        lesion_w_sparse=Config.LESION_W_SPARSE, 
+        lesion_w_regional=Config.LESION_W_REGIONAL, 
+        csPCa_threshold=Config.CSPC_THRESHOLD
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
