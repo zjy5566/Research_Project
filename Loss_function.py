@@ -1,205 +1,235 @@
-﻿import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5):
-        """标准的二分类 Dice Loss"""
-        super(DiceLoss, self).__init__()
+    def __init__(self, smooth: float = 1e-5):
+        super().__init__()
         self.smooth = smooth
 
     def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)                 
-        probs = probs.view(probs.size(0), -1)         
-        targets = targets.view(targets.size(0), -1)   
-        
-        intersection = (probs * targets).sum(dim=1)   
-        union = probs.sum(dim=1) + targets.sum(dim=1) 
-        
-        dice = (2. * intersection + self.smooth) / (union + self.smooth) 
-        return 1.0 - dice.mean()                      
+        probs = torch.sigmoid(logits)
+        probs = probs.view(probs.size(0), -1)
+        targets = targets.view(targets.size(0), -1)
+        intersection = (probs * targets).sum(dim=1)
+        union = probs.sum(dim=1) + targets.sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - dice.mean()
 
-# ===================================================================
-# [核心组件]：Focal Loss (针对微小目标和极度不平衡的 Hard 样本挖掘)
-# ===================================================================
+
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         probs = torch.sigmoid(logits)
-        
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        
-        focal_weight = alpha_t * (1 - p_t) ** self.gamma
-        loss = focal_weight * bce_loss
-        
-        if self.reduction == 'mean':
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
+        loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce_loss
+
+        if self.reduction == "mean":
             return loss.mean()
-        elif self.reduction == 'sum':
+        if self.reduction == "sum":
             return loss.sum()
-        else:
-            return loss
+        return loss
 
 
 class MixedSupervisionLoss(nn.Module):
-    def __init__(self, 
-                 lambda_grade=1.0,         # 主任务 (分级总体权重)
-                 lambda_lesion=1.0,        # 辅任务A (寻找病灶总体权重)
-                 lambda_gland=0.2,         # 辅任务B (腺体轮廓总体权重)
-                 grade_w_tbx=1.0,          # 分级内部：靶向强监督权重 (TCIA)
-                 grade_w_sbx=0.5,          # 分级内部：系统弱监督权重 (PROMIS/TCIA)
-                 lesion_w_dense=1.0,       # 病灶内部：密集强监督 (PUB)
-                 lesion_w_sparse=1.0,      # 病灶内部：稀疏强监督 (靶向)
-                 lesion_w_regional=1.0,    # 病灶内部：系统区域弱监督 (PROMIS)
-                 csPCa_threshold=3,        # 临床显著性前列腺癌的 ISUP 阈值
-                 pos_weight_val=2.0):      
-        super(MixedSupervisionLoss, self).__init__()
-        
-        # 总权重
-        self.lambda_grade = lambda_grade
-        self.lambda_lesion = lambda_lesion
-        self.lambda_gland = lambda_gland
-        
-        # Grade 内部子权重
-        self.g_w_tbx = grade_w_tbx
-        self.g_w_sbx = grade_w_sbx
-        
-        # Lesion 内部子权重 (动态课程学习会在 train.py 修改这些)
-        self.l_w_dense = lesion_w_dense
-        self.l_w_sparse = lesion_w_sparse
-        self.l_w_regional = lesion_w_regional
-        
-        self.csPCa_threshold = csPCa_threshold
-        
-        # --- Loss 实例化 ---
-        self.pos_weight = torch.tensor([pos_weight_val])
-        self.lesion_bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight) # 处理极度不平衡的lesion标签
+    """
+    Mixed-supervision loss with uncertainty-based dynamic weighting.
+
+    Critical implementation detail:
+    A supervision branch is added to the total uncertainty-weighted loss only when that branch is active
+    in the current batch. This prevents absent tasks from optimizing their log_var term alone.
+
+    Label conventions:
+      - sys_labels == invalid_sys_label: unsampled / no supervision
+      - sys_labels == 0: valid negative systematic biopsy region
+      - sys_labels >= csPCa_threshold: clinically significant PCa
+    """
+
+    def __init__(
+        self,
+        csPCa_threshold: int = 3,
+        pos_weight_val: float = 2.0,
+        invalid_sys_label: int = -1,
+        class_weights=None,
+    ):
+        super().__init__()
+        self.csPCa_threshold = int(csPCa_threshold)
+        self.invalid_sys_label = int(invalid_sys_label)
+
+        self.log_vars = nn.ParameterDict(
+            {
+                "grade_tbx": nn.Parameter(torch.zeros(1)),
+                "grade_sbx": nn.Parameter(torch.zeros(1)),
+                "lesion_dense": nn.Parameter(torch.zeros(1)),
+                "lesion_sparse": nn.Parameter(torch.zeros(1)),
+                "lesion_sys": nn.Parameter(torch.zeros(1)),
+                "gland": nn.Parameter(torch.zeros(1)),
+            }
+        )
+
+        self.register_buffer("pos_weight", torch.tensor([pos_weight_val], dtype=torch.float32))
+        self.lesion_bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         self.lesion_focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
         self.gland_bce_loss = nn.BCEWithLogitsLoss()
         self.dice_loss = DiceLoss()
-        
-        # 多分类交叉熵，用于 ISUP 级别预测 (忽略值为 -1 的非合法区域)
-        # 类别 0 (健康) 权重极低，类别 1 (良性) 略高，ISUP 1-5 (类别 2-6) 权重极高
-        # 注意：你需要确保这个 tensor 放在正确的 device 上 (可以在 forward 里 to(device))
-        self.class_weights = torch.tensor([0.1, 0.5, 2.0, 2.0, 3.0, 3.0, 3.0], dtype=torch.float32)
-        
-        # 传入 weight 参数
-        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=-1)
 
+        if class_weights is None:
+            class_weights = [0.1, 0.5, 2.0, 2.0, 3.0, 3.0, 3.0]
+        self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=self.invalid_sys_label)
 
-    def forward(self, grade_preds, sys_grade_preds, lesion_pred, sys_lesion_preds, gland_pred, 
-                target_mask, sys_labels, lesion_mask, gland_mask, 
-                has_target, has_sys, has_lesion, has_gland):
-        
+    def _weighted(self, loss, key: str):
+        """Uncertainty weighting: L_i * exp(-s_i) + s_i."""
+        return loss * torch.exp(-self.log_vars[key]) + self.log_vars[key]
+
+    def _zero(self, device):
+        return torch.tensor(0.0, device=device)
+
+    def forward(
+        self,
+        grade_preds,
+        sys_grade_preds,
+        lesion_pred,
+        sys_lesion_preds,
+        gland_pred,
+        target_mask,
+        sys_labels,
+        lesion_mask,
+        gland_mask,
+        has_target,
+        has_sys,
+        has_lesion,
+        has_gland,
+    ):
         device = lesion_pred.device if lesion_pred is not None else grade_preds.device
-        
-        if self.lesion_bce_loss.pos_weight.device != device:
-            self.lesion_bce_loss.pos_weight = self.lesion_bce_loss.pos_weight.to(device)
 
-        # 1. 初始化所有 Loss
-        loss_grade_target = torch.tensor(0.0, device=device)
-        loss_grade_sys = torch.tensor(0.0, device=device)
-        
-        loss_lesion_dense = torch.tensor(0.0, device=device)
-        loss_lesion_sparse = torch.tensor(0.0, device=device)
-        loss_lesion_sys = torch.tensor(0.0, device=device)
-        loss_gland = torch.tensor(0.0, device=device)
-        
-        valid_target = has_target > 0
-        valid_sys = has_sys > 0
-        valid_lesion = has_lesion > 0
-        valid_gland = has_gland > 0
+        loss_grade_target = self._zero(device)
+        loss_grade_sys = self._zero(device)
+        loss_lesion_dense = self._zero(device)
+        loss_lesion_sparse = self._zero(device)
+        loss_lesion_sys = self._zero(device)
+        loss_gland = self._zero(device)
 
-        # ===================================================================
-        # [任务 1]：Grade ISUP 分级任务 (多分类)
-        # ===================================================================
-        # 1A. 靶向针道密集分类强监督 (TBx - TCIA)
-        # ===================================================================
-        if grade_preds is not None and valid_target.any():
-            g_p_t = grade_preds[valid_target]       
-            mask_t = target_mask[valid_target]      
-            
-            # 【修复点】：去掉 mask_t 多余的 Channel=1 维度
-            # 把它从 [B, 1, D, H, W] 变成 [B, D, H, W]
+        active = {
+            "grade_tbx": False,
+            "grade_sbx": False,
+            "lesion_dense": False,
+            "lesion_sparse": False,
+            "lesion_sys": False,
+            "gland": False,
+        }
+
+        valid_target_batch = has_target > 0
+        valid_sys_batch = has_sys > 0
+        valid_lesion_batch = has_lesion > 0
+        valid_gland_batch = has_gland > 0
+
+        # 1A. Targeted-biopsy voxel-level ISUP grade supervision.
+        if grade_preds is not None and valid_target_batch.any():
+            g_p_t = grade_preds[valid_target_batch]
+            mask_t = target_mask[valid_target_batch]
             if mask_t.dim() == 5 and mask_t.shape[1] == 1:
                 mask_t = mask_t.squeeze(1)
-                
             valid_pixels = mask_t > 0
             if valid_pixels.any():
-                g_p_t_permuted = g_p_t.permute(0, 2, 3, 4, 1) # [B, D, H, W, 7]
-                
-                # 现在 valid_pixels 是 [B, D, H, W]，刚好索引 permuted 的前4个维度
-                preds_valid_grade = g_p_t_permuted[valid_pixels] # 结果形状: [N, 7]
-                labels_valid_grade = mask_t[valid_pixels].long() # 结果形状: [N]
-                
-                loss_grade_target = self.ce_loss(preds_valid_grade, labels_valid_grade)
+                preds_valid = g_p_t.permute(0, 2, 3, 4, 1)[valid_pixels]
+                labels_valid = mask_t[valid_pixels].long()
+                loss_grade_target = self.ce_loss(preds_valid, labels_valid)
+                active["grade_tbx"] = True
 
-        # 1B. 系统分区域池化弱监督分类 (SBx - PROMIS/TCIA)
-        if sys_grade_preds is not None and valid_sys.any():
-            s_g_p = sys_grade_preds[valid_sys]      
-            s_labels = sys_labels[valid_sys]        
-            s_g_p_flat = s_g_p.view(-1, s_g_p.size(-1)) 
-            s_labels_flat = s_labels.view(-1)           
-            valid_zones = s_labels_flat >= 0
+        # 1B. Systematic-biopsy region-level ISUP grade supervision.
+        if sys_grade_preds is not None and valid_sys_batch.any():
+            s_g_p = sys_grade_preds[valid_sys_batch]
+            s_labels = sys_labels[valid_sys_batch]
+            s_g_p_flat = s_g_p.reshape(-1, s_g_p.size(-1))
+            s_labels_flat = s_labels.reshape(-1)
+            valid_zones = s_labels_flat != self.invalid_sys_label
             if valid_zones.any():
                 loss_grade_sys = self.ce_loss(s_g_p_flat[valid_zones], s_labels_flat[valid_zones].long())
+                active["grade_sbx"] = True
 
-        # ===================================================================
-        # [任务 2]：Lesion 临床显著性病灶检测 (二分类)
-        # ===================================================================
-        if lesion_pred is not None and valid_lesion.any():
-            pred_l = lesion_pred[valid_lesion]
-            mask_l = lesion_mask[valid_lesion].float()
+        # 2A. Dense voxel-level lesion mask supervision.
+        if lesion_pred is not None and valid_lesion_batch.any():
+            pred_l = lesion_pred[valid_lesion_batch]
+            mask_l = lesion_mask[valid_lesion_batch].float()
             loss_lesion_dense = self.lesion_bce_loss(pred_l, mask_l) + self.lesion_focal_loss(pred_l, mask_l)
+            active["lesion_dense"] = True
 
-        if lesion_pred is not None and valid_target.any():
-            pred_t = lesion_pred[valid_target]
-            mask_t = target_mask[valid_target]
+        # 2B. Targeted-biopsy sparse csPCa supervision on needle-track voxels only.
+        if lesion_pred is not None and valid_target_batch.any():
+            pred_t = lesion_pred[valid_target_batch]
+            mask_t = target_mask[valid_target_batch]
             valid_pixels = mask_t > 0
             if valid_pixels.any():
                 target_lesion_label = (mask_t >= self.csPCa_threshold).float()
                 pred_valid = pred_t[valid_pixels]
                 label_valid = target_lesion_label[valid_pixels]
                 loss_lesion_sparse = self.lesion_bce_loss(pred_valid, label_valid) + self.lesion_focal_loss(pred_valid, label_valid)
+                active["lesion_sparse"] = True
 
-        if sys_lesion_preds is not None and valid_sys.any():
-            s_l_p = sys_lesion_preds[valid_sys]
-            s_labels = sys_labels[valid_sys]
-            s_l_p_flat = s_l_p.view(-1)
-            s_labels_flat = s_labels.view(-1)
-            valid_zones = s_labels_flat >= 0
+        # 2C. Systematic-biopsy region-level csPCa weak supervision.
+        if sys_lesion_preds is not None and valid_sys_batch.any():
+            s_l_p = sys_lesion_preds[valid_sys_batch]
+            s_labels = sys_labels[valid_sys_batch]
+            s_l_p_flat = s_l_p.reshape(-1)
+            s_labels_flat = s_labels.reshape(-1)
+            valid_zones = s_labels_flat != self.invalid_sys_label
             if valid_zones.any():
-                sys_lesion_label = (s_labels_flat >= self.csPCa_threshold).float()
+                sys_lesion_label = (s_labels_flat[valid_zones] >= self.csPCa_threshold).float()
                 pred_valid = s_l_p_flat[valid_zones]
-                label_valid = sys_lesion_label[valid_zones]
-                loss_lesion_sys = self.lesion_bce_loss(pred_valid, label_valid) + self.lesion_focal_loss(pred_valid, label_valid)
+                loss_lesion_sys = self.lesion_bce_loss(pred_valid, sys_lesion_label) + self.lesion_focal_loss(pred_valid, sys_lesion_label)
+                active["lesion_sys"] = True
 
-        # ===================================================================
-        # [任务 3]：Gland 腺体密集强监督
-        # ===================================================================
-        if gland_pred is not None and valid_gland.any():
-            g_pred_valid = gland_pred[valid_gland]
-            g_mask_valid = gland_mask[valid_gland].float()
+        # 3. Dense gland segmentation supervision.
+        if gland_pred is not None and valid_gland_batch.any():
+            g_pred_valid = gland_pred[valid_gland_batch]
+            g_mask_valid = gland_mask[valid_gland_batch].float()
             loss_gland = self.gland_bce_loss(g_pred_valid, g_mask_valid) + self.dice_loss(g_pred_valid, g_mask_valid)
+            active["gland"] = True
 
-        # ===================================================================
-        # 汇总返回 (包含全新的 Grade 子类拆分)
-        # ===================================================================
-        loss_grade_total = (self.g_w_tbx * loss_grade_target) + (self.g_w_sbx * loss_grade_sys)
-        
-        loss_lesion_total = (self.l_w_dense * loss_lesion_dense + 
-                             self.l_w_sparse * loss_lesion_sparse + 
-                             self.l_w_regional * loss_lesion_sys)
+        weighted_terms = []
+        if active["grade_tbx"]:
+            weighted_terms.append(self._weighted(loss_grade_target, "grade_tbx"))
+        if active["grade_sbx"]:
+            weighted_terms.append(self._weighted(loss_grade_sys, "grade_sbx"))
+        if active["lesion_dense"]:
+            weighted_terms.append(self._weighted(loss_lesion_dense, "lesion_dense"))
+        if active["lesion_sparse"]:
+            weighted_terms.append(self._weighted(loss_lesion_sparse, "lesion_sparse"))
+        if active["lesion_sys"]:
+            weighted_terms.append(self._weighted(loss_lesion_sys, "lesion_sys"))
+        if active["gland"]:
+            weighted_terms.append(self._weighted(loss_gland, "gland"))
 
-        total_loss = (self.lambda_grade * loss_grade_total) + \
-                     (self.lambda_lesion * loss_lesion_total) + \
-                     (self.lambda_gland * loss_gland)
-                      
-        # 返回 9 个变量 (新增了 loss_grade_total 及其子项)
-        return total_loss, loss_grade_total, loss_grade_target, loss_grade_sys, loss_lesion_total, loss_lesion_dense, loss_lesion_sparse, loss_lesion_sys, loss_gland
+        if weighted_terms:
+            total_loss = torch.stack([term.reshape(()) for term in weighted_terms]).sum()
+        else:
+            # Keeps graph valid in the unlikely event of a completely unsupervised batch.
+            total_loss = self._zero(device)
+
+        loss_grade_total = loss_grade_target + loss_grade_sys
+        loss_lesion_total = loss_lesion_dense + loss_lesion_sparse + loss_lesion_sys
+        em_weights = {k: torch.exp(-v.detach()).item() for k, v in self.log_vars.items()}
+        active_tasks = {k: float(v) for k, v in active.items()}
+
+        return (
+            total_loss,
+            loss_grade_total,
+            loss_grade_target,
+            loss_grade_sys,
+            loss_lesion_total,
+            loss_lesion_dense,
+            loss_lesion_sparse,
+            loss_lesion_sys,
+            loss_gland,
+            em_weights,
+            active_tasks,
+        )
