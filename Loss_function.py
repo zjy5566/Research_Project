@@ -41,10 +41,16 @@ class FocalLoss(nn.Module):
 
 class MixedSupervisionLoss(nn.Module):
     """
-    Mixed-supervision loss with uncertainty-based dynamic weighting.
+    Mixed-supervision loss with optional uncertainty-based dynamic weighting.
+
+    If use_em_weighting=True:
+        L_i * exp(-s_i) + s_i
+
+    If use_em_weighting=False:
+        fixed_weight_i * L_i
 
     Critical implementation detail:
-    A supervision branch is added to the total uncertainty-weighted loss only when that branch is active
+    A supervision branch is added to the total loss only when that branch is active
     in the current batch. This prevents absent tasks from optimizing their log_var term alone.
 
     Label conventions:
@@ -59,10 +65,31 @@ class MixedSupervisionLoss(nn.Module):
         pos_weight_val: float = 2.0,
         invalid_sys_label: int = -1,
         class_weights=None,
+        use_em_weighting: bool = True,
+        fixed_loss_weights=None,
     ):
         super().__init__()
         self.csPCa_threshold = int(csPCa_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
+        self.use_em_weighting = bool(use_em_weighting)
+
+        default_fixed_loss_weights = {
+            "grade_tbx": 1.0,
+            "grade_sbx": 1.0,
+            "lesion_dense": 1.0,
+            "lesion_sparse": 1.0,
+            "lesion_sys": 1.0,
+            "gland": 1.0,
+        }
+
+        if fixed_loss_weights is None:
+            fixed_loss_weights = default_fixed_loss_weights
+        else:
+            merged_weights = default_fixed_loss_weights.copy()
+            merged_weights.update(fixed_loss_weights)
+            fixed_loss_weights = merged_weights
+
+        self.fixed_loss_weights = fixed_loss_weights
 
         self.log_vars = nn.ParameterDict(
             {
@@ -87,8 +114,18 @@ class MixedSupervisionLoss(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=self.invalid_sys_label)
 
     def _weighted(self, loss, key: str):
-        """Uncertainty weighting: L_i * exp(-s_i) + s_i."""
-        return loss * torch.exp(-self.log_vars[key]) + self.log_vars[key]
+        """
+        EM weighting:
+            L_i * exp(-s_i) + s_i
+
+        Fixed weighting:
+            w_i * L_i
+        """
+        if self.use_em_weighting:
+            return loss * torch.exp(-self.log_vars[key]) + self.log_vars[key]
+
+        weight = float(self.fixed_loss_weights.get(key, 1.0))
+        return loss * weight
 
     def _zero(self, device):
         return torch.tensor(0.0, device=device)
@@ -217,7 +254,12 @@ class MixedSupervisionLoss(nn.Module):
 
         loss_grade_total = loss_grade_target + loss_grade_sys
         loss_lesion_total = loss_lesion_dense + loss_lesion_sparse + loss_lesion_sys
-        em_weights = {k: torch.exp(-v.detach()).item() for k, v in self.log_vars.items()}
+
+        if self.use_em_weighting:
+            em_weights = {k: torch.exp(-v.detach()).item() for k, v in self.log_vars.items()}
+        else:
+            em_weights = {k: float(self.fixed_loss_weights.get(k, 1.0)) for k in self.log_vars.keys()}
+
         active_tasks = {k: float(v) for k, v in active.items()}
 
         return (

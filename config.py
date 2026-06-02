@@ -61,7 +61,22 @@ class Config:
     # ==========================================
     # 5. Loss configuration
     # ==========================================
-    USE_EM_WEIGHTING = True
+    # ==========================================
+# 5. Loss configuration
+# ==========================================
+    USE_EM_WEIGHTING = False   # False = No EM weighting baseline
+
+    # Fixed loss weights for No-EM ablation.
+    # First baseline should use equal weights to test whether EM helps.
+    FIXED_LOSS_WEIGHTS = {
+        "grade_tbx": 1,
+        "grade_sbx": 0,
+        "lesion_dense": 1.0,
+        "lesion_sparse": 1.0,
+        "lesion_sys": 1.0,
+        "gland": 1.0,
+    }
+
     LESION_W_SMALL = 5
 
     # Best-model selection. Options:
@@ -100,9 +115,17 @@ class Config:
         print("-" * 50)
 
     @classmethod
+    # def get_experiment_name(cls):
+    #     time_str = datetime.now().strftime("%Y%m%d_%H%M")
+    #     name = f"{time_str}_EM_Weighting_LR{cls.LR}_{cls.BEST_MODEL_METRIC}"
+    #     if not getattr(cls, "USE_AUGMENTATION", True):
+    #         name += "_NoAug"
+    #     return name
+    @classmethod
     def get_experiment_name(cls):
         time_str = datetime.now().strftime("%Y%m%d_%H%M")
-        name = f"{time_str}_EM_Weighting_LR{cls.LR}_{cls.BEST_MODEL_METRIC}"
+        weighting_name = "EM_Weighting" if getattr(cls, "USE_EM_WEIGHTING", True) else "NoEM_FixedWeights"
+        name = f"{time_str}_{weighting_name}_LR{cls.LR}_{cls.BEST_MODEL_METRIC}"
         if not getattr(cls, "USE_AUGMENTATION", True):
             name += "_NoAug"
         return name

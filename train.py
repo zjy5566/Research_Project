@@ -135,6 +135,11 @@ def main():
     Config.set_seed()
     device = torch.device(Config.DEVICE)
     exp_name = Config.get_experiment_name()
+
+    # Keep Config unchanged, but make the folder name clear when running No-EM ablation.
+    if not getattr(Config, "USE_EM_WEIGHTING", True) and "NoEM" not in exp_name:
+        exp_name = exp_name.replace("EM_Weighting", "NoEM_FixedWeights")
+
     save_path = os.path.join(Config.EXP_DIR, exp_name)
     os.makedirs(save_path, exist_ok=True)
 
@@ -142,6 +147,12 @@ def main():
     sys.stdout = Logger(log_file_path)
     print(f"✅ Console outputs will be saved to: {log_file_path}")
     Config.show()
+
+    if getattr(Config, "USE_EM_WEIGHTING", True):
+        print("🧠 Loss weighting mode: EM / uncertainty-based dynamic weighting")
+    else:
+        print("🧪 Loss weighting mode: No EM / fixed loss weights")
+        print(f"🧪 Fixed loss weights: {getattr(Config, 'FIXED_LOSS_WEIGHTS', 'default all 1.0')}")
 
     train_loader = DataLoader(
         ProstateUnifiedDataset(Config.TRAIN_CSV, Config.UNIFIED_DATA_DIR, is_train=True),
@@ -162,15 +173,24 @@ def main():
     criterion = MixedSupervisionLoss(
         csPCa_threshold=getattr(Config, "CSPC_THRESHOLD", 3),
         invalid_sys_label=getattr(Config, "INVALID_SYS_LABEL", -1),
+        use_em_weighting=getattr(Config, "USE_EM_WEIGHTING", True),
+        fixed_loss_weights=getattr(Config, "FIXED_LOSS_WEIGHTS", None),
     ).to(device)
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model.parameters(), "lr": Config.LR, "weight_decay": Config.WEIGHT_DECAY},
-            # Do not apply weight decay to learned uncertainty/log-variance terms.
-            {"params": criterion.parameters(), "lr": Config.LR * 10, "weight_decay": 0.0},
-        ]
-    )
+    if getattr(Config, "USE_EM_WEIGHTING", True):
+        optimizer = torch.optim.Adam(
+            [
+                {"params": model.parameters(), "lr": Config.LR, "weight_decay": Config.WEIGHT_DECAY},
+                # Do not apply weight decay to learned uncertainty/log-variance terms.
+                {"params": criterion.parameters(), "lr": Config.LR * 10, "weight_decay": 0.0},
+            ]
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=Config.LR,
+            weight_decay=Config.WEIGHT_DECAY,
+        )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_EPOCHS)
 
@@ -187,8 +207,13 @@ def main():
         print(f"Train | {t_track.print_train_summary()}")
         print(f"Val   | {v_track.print_val_summary()}")
 
-        current_weights = {k: torch.exp(-v.detach()).item() for k, v in criterion.log_vars.items()}
-        print("--- Learned EM Multipliers ---")
+        if getattr(Config, "USE_EM_WEIGHTING", True):
+            current_weights = {k: torch.exp(-v.detach()).item() for k, v in criterion.log_vars.items()}
+            print("--- Learned EM Multipliers ---")
+        else:
+            current_weights = {k: float(criterion.fixed_loss_weights.get(k, 1.0)) for k in criterion.log_vars.keys()}
+            print("--- Fixed Loss Weights ---")
+
         print(f"Grade  [TBx: {current_weights['grade_tbx']:.3f} | SBx: {current_weights['grade_sbx']:.3f}]")
         print(
             f"Lesion [Dense: {current_weights['lesion_dense']:.3f} | "
