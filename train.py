@@ -1,5 +1,19 @@
+"""
+Training script for the revised lesion-segmentation + MIL setting.
+
+Main changes after the 2026-06-10 project revision:
+  - The model is treated as a segmentation/MIL model.
+  - Only lesion-related losses are logged: dense lesion, sparse TBx, and SBx MIL.
+  - Grade/gland outputs, losses, metrics, and best-model criteria are removed.
+  - The script accepts the new dictionary model/loss outputs, but is tolerant of
+    the old 5-output model during transition.
+"""
+
+from __future__ import annotations
+
 import os
 import sys
+from typing import Any, Dict
 
 import pandas as pd
 import torch
@@ -9,18 +23,25 @@ from tqdm import tqdm
 from config import Config
 from dataset import ProstateUnifiedDataset
 from Loss_function import MixedSupervisionLoss
-from model import ProstateMixedSupervisionNet
+
+# Prefer the new segmentation+MIL model class. Fall back to the old class name so
+# that the script can still run while files are being migrated.
+try:
+    from model import ProstateSegMILNet as ModelClass
+except ImportError:  # pragma: no cover - transition compatibility
+    from model import ProstateMixedSupervisionNet as ModelClass
+
 import utils
 
 
 class Logger:
     """Write console output to both terminal and a log file."""
 
-    def __init__(self, filename="Default.log"):
+    def __init__(self, filename: str = "Default.log"):
         self.terminal = sys.stdout
         self.log = open(filename, "a", encoding="utf-8")
 
-    def write(self, message):
+    def write(self, message: str):
         self.terminal.write(message)
         self.log.write(message)
         self.log.flush()
@@ -30,208 +51,313 @@ class Logger:
         self.log.flush()
 
 
-def unpack_loss_output(loss_output):
-    if len(loss_output) == 11:
+def _cfg(name: str, default: Any = None) -> Any:
+    return getattr(Config, name, default)
+
+
+def build_dataset(csv_path: str, is_train: bool):
+    """Create dataset with optional task argument when supported."""
+    task = _cfg("TASK", _cfg("DATASET_TASK", "mixed"))
+    try:
+        return ProstateUnifiedDataset(
+            csv_path=csv_path,
+            data_root=Config.UNIFIED_DATA_DIR,
+            is_train=is_train,
+            task=task,
+        )
+    except TypeError:
+        return ProstateUnifiedDataset(
+            csv_path=csv_path,
+            data_root=Config.UNIFIED_DATA_DIR,
+            is_train=is_train,
+        )
+
+
+def build_model(device: torch.device):
+    """Instantiate either the new SegMIL model or the old transition model."""
+    common_kwargs: Dict[str, Any] = {
+        "in_channels": _cfg("IN_CHANNELS", 3),
+        "max_zones": _cfg("MAX_ZONES", 20),
+    }
+
+    # New model signature.
+    try:
+        model = ModelClass(
+            **common_kwargs,
+            base_channels=_cfg("BASE_CHANNELS", 32),
+            mil_pooling=_cfg("MIL_POOLING", "lme"),
+            lme_r=_cfg("LME_R", 8.0),
+            return_dict=True,
+        )
+    except TypeError:
+        # Old model signature. num_grade_classes is ignored by new code paths.
+        model = ModelClass(
+            in_channels=_cfg("IN_CHANNELS", 3),
+            num_grade_classes=_cfg("NUM_CLASSES", 7),
+            max_zones=_cfg("MAX_ZONES", 20),
+        )
+    return model.to(device)
+
+
+def build_criterion(device: torch.device):
+    """Instantiate loss, preferring the new dict-returning segmentation/MIL loss."""
+    positive_threshold = _cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1))
+    kwargs = {
+        "positive_threshold": positive_threshold,
+        "invalid_sys_label": _cfg("INVALID_SYS_LABEL", -1),
+        "pos_weight_val": _cfg("POS_WEIGHT_VAL", 2.0),
+        "return_dict": True,
+    }
+    try:
+        criterion = MixedSupervisionLoss(**kwargs)
+    except TypeError:
+        # Compatibility with the old loss constructor.
+        criterion = MixedSupervisionLoss(
+            csPCa_threshold=positive_threshold,
+            invalid_sys_label=_cfg("INVALID_SYS_LABEL", -1),
+            pos_weight_val=_cfg("POS_WEIGHT_VAL", 2.0),
+        )
+    return criterion.to(device)
+
+
+def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+    if hasattr(utils, "move_batch_to_device"):
+        return utils.move_batch_to_device(batch, device)
+    out = {}
+    for key, value in batch.items():
+        out[key] = value.to(device) if torch.is_tensor(value) else value
+    return out
+
+
+def unpack_model_output(raw_outputs):
+    if hasattr(utils, "unpack_model_output"):
+        return utils.unpack_model_output(raw_outputs)
+    if isinstance(raw_outputs, dict):
+        return raw_outputs
+    if isinstance(raw_outputs, (tuple, list)) and len(raw_outputs) >= 5:
+        return {
+            "lesion_logits": raw_outputs[2],
+            "region_logits": raw_outputs[3],
+            "region_valid_mask": None,
+        }
+    if isinstance(raw_outputs, (tuple, list)) and len(raw_outputs) == 3:
+        return {
+            "lesion_logits": raw_outputs[0],
+            "region_logits": raw_outputs[1],
+            "region_valid_mask": raw_outputs[2],
+        }
+    raise TypeError("Unsupported model output format.")
+
+
+def call_loss(criterion, outputs, batch):
+    if hasattr(utils, "call_criterion"):
+        loss_output = utils.call_criterion(criterion, outputs, batch)
+    else:
+        loss_output = criterion(outputs, batch)
+
+    if hasattr(utils, "normalise_loss_output"):
+        return utils.normalise_loss_output(loss_output)
+
+    if isinstance(loss_output, dict):
         return loss_output
-    if len(loss_output) == 10:
-        return (*loss_output, None)
-    raise ValueError(f"Unexpected criterion return length: {len(loss_output)}")
+    raise TypeError("The current utils.py cannot normalise this loss output.")
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device: torch.device, epoch: int):
     model.train()
+    if hasattr(criterion, "set_epoch"):
+        criterion.set_epoch(epoch)
+
     tracker = utils.MetricTracker()
     pbar = tqdm(loader, desc="Training")
 
     for batch in pbar:
-        imgs = batch["input"].to(device)
-        z_mask = batch["zones_mask"].to(device)
+        batch = move_batch_to_device(batch, device)
+        imgs = batch["input"]
+        zones_mask = batch.get("zones_mask", None)
 
         optimizer.zero_grad(set_to_none=True)
-        g_p, s_g_p, l_p, s_l_p, gl_p = model(imgs, z_mask)
 
-        loss_output = criterion(
-            g_p,
-            s_g_p,
-            l_p,
-            s_l_p,
-            gl_p,
-            batch["target_mask"].to(device),
-            batch["sys_labels"].to(device),
-            batch["lesion_mask"].to(device),
-            batch["gland_mask"].to(device),
-            batch["has_target"].to(device),
-            batch["has_sys"].to(device),
-            batch["has_lesion"].to(device),
-            batch["has_gland"].to(device),
-        )
+        raw_outputs = model(imgs, zones_mask)
+        outputs = unpack_model_output(raw_outputs)
+        loss_dict = call_loss(criterion, outputs, batch)
+        total_loss = loss_dict["total_loss"]
 
-        total_loss, l_grad_tot, l_grad_tbx, l_grad_sbx, l_les_tot, l_les_dense, l_les_sparse, l_les_sys, l_gland, em_weights, active_tasks = unpack_loss_output(loss_output)
+        if torch.is_tensor(total_loss) and total_loss.requires_grad:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_cfg("GRAD_CLIP_NORM", 12.0))
+            optimizer.step()
 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
-        optimizer.step()
-
-        tracker.update_losses(
-            total_loss.item(),
-            l_grad_tot.item(),
-            l_grad_tbx.item(),
-            l_grad_sbx.item(),
-            l_les_tot.item(),
-            l_les_dense.item(),
-            l_les_sparse.item(),
-            l_les_sys.item(),
-            l_gland.item(),
-            em_weights=em_weights,
-            active_tasks=active_tasks,
-        )
-        pbar.set_postfix({"Total Loss": f"{total_loss.item():.4f}"})
+        tracker.update_losses(loss_dict)
+        pbar.set_postfix({"Total Loss": f"{float(total_loss.detach().cpu()):.4f}"})
 
     return tracker
 
 
-def select_validation_metric(v_track):
-    """Choose the score used for best-model saving and early stopping."""
-    metric_name = getattr(Config, "BEST_MODEL_METRIC", "composite")
+def select_validation_metric(v_track) -> float:
+    """Metric for best-model saving. Higher is better."""
+    metric_name = str(_cfg("BEST_MODEL_METRIC", "lesion_dice")).lower()
 
-    lesion_dice = v_track.lesion_dice.avg
-    gland_bacc = v_track.gland_bacc
-    region_bacc = v_track.region_bacc
-    grade_kappa = v_track.grade_kappa.avg
-    clinical_bacc = 0.5 * gland_bacc + 0.5 * region_bacc
-
+    if metric_name in {"loss", "val_loss", "val_loss_total"}:
+        return -float(v_track.loss_total.avg)
     if metric_name == "lesion_dice":
-        return lesion_dice
-    if metric_name == "clinical_bacc":
-        return clinical_bacc
+        return float(v_track.lesion_dice.avg)
+    if metric_name == "lesion_f1":
+        return float(v_track.lesion_f1.avg)
     if metric_name == "region_bacc":
-        return region_bacc
-    if metric_name == "gland_bacc":
-        return gland_bacc
-    if metric_name == "grade_kappa":
-        return grade_kappa
+        return float(v_track.region_bacc)
+    if metric_name == "region_auc":
+        return float(getattr(v_track, "region_auc", 0.0))
+    if metric_name == "patient_bacc":
+        return float(getattr(v_track, "patient_bacc", 0.0))
+    if metric_name == "patient_auc":
+        return float(getattr(v_track, "patient_auc", 0.0))
+    if metric_name == "clinical_bacc":
+        return 0.5 * float(getattr(v_track, "patient_bacc", 0.0)) + 0.5 * float(v_track.region_bacc)
+    if metric_name == "composite":
+        return (
+            0.50 * float(v_track.lesion_dice.avg)
+            + 0.25 * float(getattr(v_track, "patient_bacc", 0.0))
+            + 0.25 * float(v_track.region_bacc)
+        )
 
-    # Default composite metric for mixed-supervision training.
-    # Keeps dense lesion segmentation important while also rewarding clinical detection and grading.
-    return 0.40 * lesion_dice + 0.30 * gland_bacc + 0.20 * region_bacc + 0.10 * grade_kappa
+    print(f"⚠️ Unknown BEST_MODEL_METRIC='{metric_name}', using lesion_dice.")
+    return float(v_track.lesion_dice.avg)
 
 
-def save_checkpoint(path, model, criterion, optimizer, scheduler, epoch, best_metric, config_name):
+def save_checkpoint(path, model, criterion, optimizer, scheduler, epoch: int, best_metric: float, config_name: str):
     torch.save(
         {
             "epoch": epoch,
             "best_metric": best_metric,
             "config_name": config_name,
             "model_state_dict": model.state_dict(),
-            "criterion_state_dict": criterion.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            "criterion_state_dict": criterion.state_dict() if criterion is not None else None,
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         },
         path,
     )
 
 
+def get_experiment_name() -> str:
+    if hasattr(Config, "get_experiment_name"):
+        return Config.get_experiment_name()
+    return str(_cfg("EXP_NAME", "SegMIL_experiment"))
+
+
+def get_csv_path(name: str, fallback: str) -> str:
+    value = _cfg(name, None)
+    if value is not None:
+        return value
+    split_dir = _cfg("SPLIT_DIR", os.path.join(_cfg("UNIFIED_DATA_DIR", "."), "splits"))
+    return os.path.join(split_dir, fallback)
+
+
 def main():
-    Config.set_seed()
-    device = torch.device(Config.DEVICE)
-    exp_name = Config.get_experiment_name()
+    if hasattr(Config, "set_seed"):
+        Config.set_seed()
 
-    # Keep Config unchanged, but make the folder name clear when running No-EM ablation.
-    if not getattr(Config, "USE_EM_WEIGHTING", True) and "NoEM" not in exp_name:
-        exp_name = exp_name.replace("EM_Weighting", "NoEM_FixedWeights")
-
-    save_path = os.path.join(Config.EXP_DIR, exp_name)
+    device = torch.device(_cfg("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+    exp_name = get_experiment_name()
+    save_path = os.path.join(_cfg("EXP_DIR", "experiments"), exp_name)
     os.makedirs(save_path, exist_ok=True)
 
     log_file_path = os.path.join(save_path, "console_output.log")
     sys.stdout = Logger(log_file_path)
     print(f"✅ Console outputs will be saved to: {log_file_path}")
-    Config.show()
+    if hasattr(Config, "show"):
+        Config.show()
 
-    if getattr(Config, "USE_EM_WEIGHTING", True):
-        print("🧠 Loss weighting mode: EM / uncertainty-based dynamic weighting")
-    else:
-        print("🧪 Loss weighting mode: No EM / fixed loss weights")
-        print(f"🧪 Fixed loss weights: {getattr(Config, 'FIXED_LOSS_WEIGHTS', 'default all 1.0')}")
+    train_csv = get_csv_path("TRAIN_CSV", "N4_mixed_PUB_TCIA_train.csv")
+    val_csv = get_csv_path("VAL_CSV", "N4_mixed_PUB_TCIA_internal_val.csv")
+    print(f"📄 Train CSV: {train_csv}")
+    print(f"📄 Val CSV:   {val_csv}")
 
     train_loader = DataLoader(
-        ProstateUnifiedDataset(Config.TRAIN_CSV, Config.UNIFIED_DATA_DIR, is_train=True),
-        batch_size=Config.BATCH_SIZE,
+        build_dataset(train_csv, is_train=True),
+        batch_size=_cfg("BATCH_SIZE", 1),
         shuffle=True,
-        num_workers=Config.NUM_WORKERS,
+        num_workers=_cfg("NUM_WORKERS", 0),
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
-        ProstateUnifiedDataset(Config.VAL_CSV, Config.UNIFIED_DATA_DIR, is_train=False),
-        batch_size=Config.BATCH_SIZE,
+        build_dataset(val_csv, is_train=False),
+        batch_size=_cfg("BATCH_SIZE", 1),
         shuffle=False,
-        num_workers=Config.NUM_WORKERS,
+        num_workers=_cfg("NUM_WORKERS", 0),
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = ProstateMixedSupervisionNet(in_channels=Config.IN_CHANNELS, num_grade_classes=Config.NUM_CLASSES).to(device)
-    criterion = MixedSupervisionLoss(
-        csPCa_threshold=getattr(Config, "CSPC_THRESHOLD", 3),
-        invalid_sys_label=getattr(Config, "INVALID_SYS_LABEL", -1),
-        use_em_weighting=getattr(Config, "USE_EM_WEIGHTING", True),
-        fixed_loss_weights=getattr(Config, "FIXED_LOSS_WEIGHTS", None),
-    ).to(device)
+    model = build_model(device)
+    criterion = build_criterion(device)
 
-    if getattr(Config, "USE_EM_WEIGHTING", True):
-        optimizer = torch.optim.Adam(
-            [
-                {"params": model.parameters(), "lr": Config.LR, "weight_decay": Config.WEIGHT_DECAY},
-                # Do not apply weight decay to learned uncertainty/log-variance terms.
-                {"params": criterion.parameters(), "lr": Config.LR * 10, "weight_decay": 0.0},
-            ]
-        )
-    else:
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=Config.LR,
-            weight_decay=Config.WEIGHT_DECAY,
-        )
+    em_lr_multiplier = float(_cfg("EM_LR_MULTIPLIER", 10.0))
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.parameters(), "lr": _cfg("LR", 1e-4), "weight_decay": _cfg("WEIGHT_DECAY", 0.0)},
+            {"params": criterion.parameters(), "lr": _cfg("LR", 1e-4) * em_lr_multiplier, "weight_decay": 0.0},
+        ]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=_cfg("NUM_EPOCHS", 100))
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_EPOCHS)
-
-    best_metric = -1.0
+    best_metric = -float("inf")
     early_stop_counter = 0
     history = []
+    metric_name = str(_cfg("BEST_MODEL_METRIC", "lesion_dice"))
 
-    for epoch in range(1, Config.NUM_EPOCHS + 1):
-        print(f"\nEpoch {epoch}/{Config.NUM_EPOCHS}")
+    for epoch in range(1, int(_cfg("NUM_EPOCHS", 100)) + 1):
+        print(f"\nEpoch {epoch}/{_cfg('NUM_EPOCHS', 100)}")
+        if hasattr(criterion, "set_epoch"):
+            criterion.set_epoch(epoch)
 
-        t_track = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        v_track = utils.validate(model, val_loader, criterion, device, epoch, save_path)
+        if hasattr(criterion, "is_enabled"):
+            print(
+                "Curriculum/task status | "
+                f"Dense: {int(criterion.is_enabled('lesion_dense'))} | "
+                f"Sparse TBx: {int(criterion.is_enabled('lesion_sparse'))} | "
+                f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))}"
+            )
 
-        print(f"Train | {t_track.print_train_summary()}")
-        print(f"Val   | {v_track.print_val_summary()}")
+        train_track = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+        if hasattr(criterion, "set_epoch"):
+            criterion.set_epoch(epoch)
+        val_track = utils.validate(model, val_loader, criterion, device, epoch, save_path)
 
-        if getattr(Config, "USE_EM_WEIGHTING", True):
-            current_weights = {k: torch.exp(-v.detach()).item() for k, v in criterion.log_vars.items()}
-            print("--- Learned EM Multipliers ---")
-        else:
-            current_weights = {k: float(criterion.fixed_loss_weights.get(k, 1.0)) for k in criterion.log_vars.keys()}
-            print("--- Fixed Loss Weights ---")
+        print(f"Train | {train_track.print_train_summary()}")
+        print(f"Val   | {val_track.print_val_summary()}")
 
-        print(f"Grade  [TBx: {current_weights['grade_tbx']:.3f} | SBx: {current_weights['grade_sbx']:.3f}]")
+        current_weights = criterion.get_current_weights() if hasattr(criterion, "get_current_weights") else {}
+        print("--- Lesion EM / Loss Multipliers ---")
         print(
-            f"Lesion [Dense: {current_weights['lesion_dense']:.3f} | "
-            f"Sparse: {current_weights['lesion_sparse']:.3f} | Sys: {current_weights['lesion_sys']:.3f}]"
+            f"Dense: {current_weights.get('lesion_dense', 1.0):.3f} | "
+            f"Sparse TBx: {current_weights.get('lesion_sparse', 1.0):.3f} | "
+            f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f}"
         )
-        print(f"Gland  [Dense: {current_weights['gland']:.3f}]")
 
         epoch_log = {"epoch": epoch}
-        epoch_log.update(t_track.get_train_dict())
-        epoch_log.update(v_track.get_val_dict())
+        epoch_log.update(train_track.get_train_dict())
+        epoch_log.update(val_track.get_val_dict())
+        epoch_log.update(
+            {
+                "best_model_metric_name": metric_name,
+                "use_em_weighting": int(_cfg("USE_EM_WEIGHTING", True)),
+                "use_logvar_clamp": int(_cfg("USE_LOGVAR_CLAMP", False)),
+                "use_curriculum": int(_cfg("USE_CURRICULUM", False)),
+                "em_lr_multiplier": em_lr_multiplier,
+                "lesion_dense_enabled_this_epoch": int(criterion.is_enabled("lesion_dense")) if hasattr(criterion, "is_enabled") else 1,
+                "lesion_sparse_enabled_this_epoch": int(criterion.is_enabled("lesion_sparse")) if hasattr(criterion, "is_enabled") else 1,
+                "lesion_sys_enabled_this_epoch": int(criterion.is_enabled("lesion_sys")) if hasattr(criterion, "is_enabled") else 1,
+            }
+        )
         history.append(epoch_log)
 
         log_csv = os.path.join(save_path, "train_log.csv")
         pd.DataFrame(history).to_csv(log_csv, index=False)
         utils.plot_loss_curves(log_csv, os.path.join(save_path, "loss_curve.png"))
 
-        cur_metric = select_validation_metric(v_track)
-        print(f"Selection metric ({getattr(Config, 'BEST_MODEL_METRIC', 'composite')}): {cur_metric:.4f}")
+        cur_metric = select_validation_metric(val_track)
+        print(f"Selection metric ({metric_name}): {cur_metric:.4f}")
 
         if cur_metric > best_metric:
             best_metric = cur_metric
@@ -250,7 +376,7 @@ def main():
             print(f"--> Best Model Saved (Score: {best_metric:.4f})")
         else:
             early_stop_counter += 1
-            if early_stop_counter >= Config.EARLY_STOP_PATIENCE:
+            if early_stop_counter >= int(_cfg("EARLY_STOP_PATIENCE", 20)):
                 print(f"Early stop triggered at epoch {epoch}")
                 break
 

@@ -1,36 +1,103 @@
+"""
+Loss functions for the new segmentation + MIL setting.
+
+This file removes the old grade/gland branches and keeps only lesion-related
+supervision:
+  1) lesion_dense  : dense radiologist lesion-mask supervision, e.g. PUB
+  2) lesion_sparse : sparse TBx needle-track supervision, e.g. TCIA target biopsy
+  3) lesion_sys    : region-level MIL supervision from SBx zones, e.g. TCIA/PROMIS
+
+The optional EM/uncertainty weighting, log-var clamp, and curriculum gates are
+kept because they may still be useful for balancing dense and weak supervision.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from config import Config
+except Exception:  # pragma: no cover - allows standalone unit testing
+    Config = None
+
+
+TASK_KEYS: Tuple[str, ...] = (
+    "lesion_dense",
+    "lesion_sparse",
+    "lesion_sys",
+)
+
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def _cfg(name: str, default):
+    """Safely read a value from Config when it exists."""
+    return getattr(Config, name, default) if Config is not None else default
+
+
+def _default_task_switches_from_config() -> Dict[str, bool]:
+    """Read lesion-task switches from Config; enable all branches by default."""
+    return {
+        "lesion_dense": bool(_cfg("USE_LESION_DENSE_TASK", True)),
+        "lesion_sparse": bool(_cfg("USE_LESION_SPARSE_TASK", True)),
+        "lesion_sys": bool(_cfg("USE_LESION_SYS_TASK", True)),
+    }
+
+
+def _default_branch_start_epochs_from_config() -> Dict[str, int]:
+    """Read curriculum start epochs from Config; start all branches at epoch 1."""
+    return {
+        "lesion_dense": int(_cfg("LESION_DENSE_START_EPOCH", 1)),
+        "lesion_sparse": int(_cfg("LESION_SPARSE_START_EPOCH", 1)),
+        "lesion_sys": int(_cfg("LESION_SYS_START_EPOCH", 1)),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Basic losses
+# -----------------------------------------------------------------------------
 
 class DiceLoss(nn.Module):
+    """Binary Dice loss for dense voxel-level lesion masks."""
+
     def __init__(self, smooth: float = 1e-5):
         super().__init__()
-        self.smooth = smooth
+        self.smooth = float(smooth)
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
-        probs = probs.view(probs.size(0), -1)
-        targets = targets.view(targets.size(0), -1)
+        probs = probs.reshape(probs.size(0), -1)
+        targets = targets.float().reshape(targets.size(0), -1)
+
         intersection = (probs * targets).sum(dim=1)
-        union = probs.sum(dim=1) + targets.sum(dim=1)
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        denominator = probs.sum(dim=1) + targets.sum(dim=1)
+        dice = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
         return 1.0 - dice.mean()
 
 
 class FocalLoss(nn.Module):
+    """Binary focal loss for sparse/region labels with class imbalance."""
+
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
         self.reduction = reduction
 
-    def forward(self, logits, targets):
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         probs = torch.sigmoid(logits)
+
         p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
         alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
-        loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce_loss
+        loss = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
 
         if self.reduction == "mean":
             return loss.mean()
@@ -39,239 +106,378 @@ class FocalLoss(nn.Module):
         return loss
 
 
+# -----------------------------------------------------------------------------
+# Main mixed-supervision segmentation loss
+# -----------------------------------------------------------------------------
+
 class MixedSupervisionLoss(nn.Module):
     """
-    Mixed-supervision loss with optional uncertainty-based dynamic weighting.
+    Lesion segmentation loss with MIL weak supervision.
 
-    If use_em_weighting=True:
-        L_i * exp(-s_i) + s_i
+    Expected model output dictionary from the revised model.py:
+        outputs["lesion_logits"]      : (B, 1, D, H, W)
+        outputs["region_logits"]      : (B, max_zones, 1) or (B, max_zones)
+        outputs["region_valid_mask"]  : (B, max_zones), optional
 
-    If use_em_weighting=False:
-        fixed_weight_i * L_i
+    Expected batch dictionary from the revised dataset.py:
+        batch["lesion_mask"] : dense lesion mask for PUB cases
+        batch["target_mask"] : TBx needle-track labels for TCIA cases
+        batch["sys_labels"]  : SBx zone labels; invalid_sys_label means unsampled
+        batch["has_lesion"]  : 1 if dense lesion supervision exists
+        batch["has_target"]  : 1 if TBx supervision exists
+        batch["has_sys"]     : 1 if SBx supervision exists
 
-    Critical implementation detail:
-    A supervision branch is added to the total loss only when that branch is active
-    in the current batch. This prevents absent tasks from optimizing their log_var term alone.
+    Label convention:
+        sys_labels == invalid_sys_label : invalid / unsampled / no supervision
+        sys_labels == 0                 : valid benign / negative region
+        sys_labels >= positive_threshold: positive cancer/csPCa region
 
-    Label conventions:
-      - sys_labels == invalid_sys_label: unsampled / no supervision
-      - sys_labels == 0: valid negative systematic biopsy region
-      - sys_labels >= csPCa_threshold: clinically significant PCa
+    EM weighting, when enabled:
+        weighted_loss_i = loss_i * exp(-s_i) + s_i
     """
 
     def __init__(
         self,
-        csPCa_threshold: int = 3,
+        positive_threshold: Optional[int] = None,
         pos_weight_val: float = 2.0,
-        invalid_sys_label: int = -1,
-        class_weights=None,
-        use_em_weighting: bool = True,
-        fixed_loss_weights=None,
+        invalid_sys_label: Optional[int] = None,
+        use_em_weighting: Optional[bool] = None,
+        fixed_loss_weights: Optional[Dict[str, float]] = None,
+        task_switches: Optional[Dict[str, bool]] = None,
+        use_logvar_clamp: Optional[bool] = None,
+        logvar_min: Optional[float] = None,
+        logvar_max: Optional[float] = None,
+        use_curriculum: Optional[bool] = None,
+        branch_start_epochs: Optional[Dict[str, int]] = None,
+        return_dict: bool = True,
     ):
         super().__init__()
-        self.csPCa_threshold = int(csPCa_threshold)
+
+        # For cancer/no-cancer region supervision, set LESION_POSITIVE_THRESHOLD = 1.
+        # For csPCa supervision, set it to Config.CSPC_THRESHOLD.
+        if positive_threshold is None:
+            positive_threshold = _cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1))
+        if invalid_sys_label is None:
+            invalid_sys_label = _cfg("INVALID_SYS_LABEL", -1)
+        if use_em_weighting is None:
+            use_em_weighting = _cfg("USE_EM_WEIGHTING", True)
+        if use_logvar_clamp is None:
+            use_logvar_clamp = _cfg("USE_LOGVAR_CLAMP", False)
+        if logvar_min is None:
+            logvar_min = _cfg("LOGVAR_MIN", -3.0)
+        if logvar_max is None:
+            logvar_max = _cfg("LOGVAR_MAX", 3.0)
+        if use_curriculum is None:
+            use_curriculum = _cfg("USE_CURRICULUM", False)
+
+        self.positive_threshold = int(positive_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
         self.use_em_weighting = bool(use_em_weighting)
+        self.use_logvar_clamp = bool(use_logvar_clamp)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+        self.use_curriculum = bool(use_curriculum)
+        self.return_dict = bool(return_dict)
+        self.current_epoch = 1
 
         default_fixed_loss_weights = {
-            "grade_tbx": 1.0,
-            "grade_sbx": 1.0,
             "lesion_dense": 1.0,
             "lesion_sparse": 1.0,
             "lesion_sys": 1.0,
-            "gland": 1.0,
         }
+        cfg_fixed_loss_weights = _cfg("FIXED_LOSS_WEIGHTS", None)
+        if fixed_loss_weights is None and cfg_fixed_loss_weights is not None:
+            fixed_loss_weights = cfg_fixed_loss_weights
+        merged_weights = default_fixed_loss_weights.copy()
+        if fixed_loss_weights is not None:
+            # Ignore old grade/gland keys if they still exist in Config.FIXED_LOSS_WEIGHTS.
+            merged_weights.update({k: float(v) for k, v in fixed_loss_weights.items() if k in TASK_KEYS})
+        self.fixed_loss_weights = merged_weights
 
-        if fixed_loss_weights is None:
-            fixed_loss_weights = default_fixed_loss_weights
-        else:
-            merged_weights = default_fixed_loss_weights.copy()
-            merged_weights.update(fixed_loss_weights)
-            fixed_loss_weights = merged_weights
+        switches = _default_task_switches_from_config()
+        if task_switches is not None:
+            switches.update({k: bool(v) for k, v in task_switches.items() if k in TASK_KEYS})
+        self.task_switches = switches
 
-        self.fixed_loss_weights = fixed_loss_weights
+        starts = _default_branch_start_epochs_from_config()
+        if branch_start_epochs is not None:
+            starts.update({k: int(v) for k, v in branch_start_epochs.items() if k in TASK_KEYS})
+        self.branch_start_epochs = starts
 
-        self.log_vars = nn.ParameterDict(
-            {
-                "grade_tbx": nn.Parameter(torch.zeros(1)),
-                "grade_sbx": nn.Parameter(torch.zeros(1)),
-                "lesion_dense": nn.Parameter(torch.zeros(1)),
-                "lesion_sparse": nn.Parameter(torch.zeros(1)),
-                "lesion_sys": nn.Parameter(torch.zeros(1)),
-                "gland": nn.Parameter(torch.zeros(1)),
-            }
-        )
+        # Keep EM/log-var parameters only for lesion-related branches.
+        self.log_vars = nn.ParameterDict({key: nn.Parameter(torch.zeros(1)) for key in TASK_KEYS})
 
         self.register_buffer("pos_weight", torch.tensor([pos_weight_val], dtype=torch.float32))
-        self.lesion_bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
-        self.lesion_focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
-        self.gland_bce_loss = nn.BCEWithLogitsLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         self.dice_loss = DiceLoss()
+        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
 
-        if class_weights is None:
-            class_weights = [0.1, 0.5, 2.0, 2.0, 3.0, 3.0, 3.0]
-        self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
-        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=self.invalid_sys_label)
+    # ------------------------------------------------------------------
+    # Task gates and EM weighting
+    # ------------------------------------------------------------------
 
-    def _weighted(self, loss, key: str):
-        """
-        EM weighting:
-            L_i * exp(-s_i) + s_i
+    def set_epoch(self, epoch: int):
+        """Call once per epoch if curriculum learning is enabled."""
+        self.current_epoch = int(epoch)
 
-        Fixed weighting:
-            w_i * L_i
-        """
+    def is_enabled_by_switch(self, key: str) -> bool:
+        return bool(self.task_switches.get(key, True))
+
+    def is_started_by_curriculum(self, key: str) -> bool:
+        if not self.use_curriculum:
+            return True
+        return self.current_epoch >= int(self.branch_start_epochs.get(key, 1))
+
+    def is_enabled(self, key: str) -> bool:
+        return self.is_enabled_by_switch(key) and self.is_started_by_curriculum(key)
+
+    def _get_log_var_for_loss(self, key: str) -> torch.Tensor:
+        s = self.log_vars[key]
+        if self.use_logvar_clamp:
+            s = torch.clamp(s, min=self.logvar_min, max=self.logvar_max)
+        return s
+
+    def _weighted(self, loss: torch.Tensor, key: str) -> torch.Tensor:
         if self.use_em_weighting:
-            return loss * torch.exp(-self.log_vars[key]) + self.log_vars[key]
+            s = self._get_log_var_for_loss(key)
+            return loss * torch.exp(-s) + s
+        return loss * float(self.fixed_loss_weights.get(key, 1.0))
 
-        weight = float(self.fixed_loss_weights.get(key, 1.0))
-        return loss * weight
-
-    def _zero(self, device):
+    @staticmethod
+    def _zero(device: torch.device) -> torch.Tensor:
         return torch.tensor(0.0, device=device)
+
+    @staticmethod
+    def _infer_device(*tensors: Optional[torch.Tensor]) -> torch.device:
+        for tensor in tensors:
+            if tensor is not None:
+                return tensor.device
+        return torch.device("cpu")
+
+    def get_current_weights(self) -> Dict[str, float]:
+        """Displayed branch weights. Disabled/not-yet-started branches report 0."""
+        weights: Dict[str, float] = {}
+        for key in TASK_KEYS:
+            if not self.is_enabled(key):
+                weights[key] = 0.0
+            elif self.use_em_weighting:
+                s = self.log_vars[key].detach()
+                if self.use_logvar_clamp:
+                    s = torch.clamp(s, min=self.logvar_min, max=self.logvar_max)
+                weights[key] = torch.exp(-s).item()
+            else:
+                weights[key] = float(self.fixed_loss_weights.get(key, 1.0))
+        return weights
+
+    def get_curriculum_status(self) -> Dict[str, float]:
+        return {key: float(self.is_enabled(key)) for key in TASK_KEYS}
+
+    # ------------------------------------------------------------------
+    # Individual lesion losses
+    # ------------------------------------------------------------------
+
+    def _dense_lesion_loss(
+        self,
+        lesion_logits: torch.Tensor,
+        lesion_mask: torch.Tensor,
+        has_lesion: torch.Tensor,
+    ) -> Tuple[torch.Tensor, bool]:
+        """PUB/radiologist dense lesion mask loss."""
+        valid_batch = has_lesion > 0
+        if not (self.is_enabled("lesion_dense") and valid_batch.any()):
+            return self._zero(lesion_logits.device), False
+
+        pred = lesion_logits[valid_batch]
+        target = lesion_mask[valid_batch].float()
+        loss = self.bce_loss(pred, target) + self.dice_loss(pred, target)
+        return loss, True
+
+    def _sparse_tbx_loss(
+        self,
+        lesion_logits: torch.Tensor,
+        target_mask: torch.Tensor,
+        has_target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, bool]:
+        """TCIA TBx needle-track sparse voxel loss."""
+        valid_batch = has_target > 0
+        if not (self.is_enabled("lesion_sparse") and valid_batch.any()):
+            return self._zero(lesion_logits.device), False
+
+        pred = lesion_logits[valid_batch]
+        target_mask = target_mask[valid_batch]
+
+        valid_voxels = target_mask > 0
+        if not valid_voxels.any():
+            return self._zero(lesion_logits.device), False
+
+        # Convert biopsy grade/score on the sampled track into a binary lesion label.
+        target = (target_mask >= self.positive_threshold).float()
+        pred_valid = pred[valid_voxels]
+        target_valid = target[valid_voxels]
+
+        loss = self.bce_loss(pred_valid, target_valid) + self.focal_loss(pred_valid, target_valid)
+        return loss, True
+
+    def _region_mil_loss(
+        self,
+        region_logits: torch.Tensor,
+        sys_labels: torch.Tensor,
+        has_sys: torch.Tensor,
+        region_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, bool]:
+        """TCIA/PROMIS SBx region-level MIL loss from pooled lesion logits."""
+        valid_batch = has_sys > 0
+        if not (self.is_enabled("lesion_sys") and valid_batch.any()):
+            return self._zero(region_logits.device), False
+
+        logits = region_logits[valid_batch]
+        labels = sys_labels[valid_batch]
+
+        if logits.dim() == 3 and logits.size(-1) == 1:
+            logits = logits.squeeze(-1)
+        labels = labels[:, : logits.size(1)]
+
+        valid_regions = labels != self.invalid_sys_label
+        if region_valid_mask is not None:
+            rmask = region_valid_mask[valid_batch].bool()[:, : logits.size(1)]
+            valid_regions = valid_regions & rmask
+
+        if not valid_regions.any():
+            return self._zero(region_logits.device), False
+
+        target = (labels >= self.positive_threshold).float()
+        pred_valid = logits[valid_regions]
+        target_valid = target[valid_regions]
+
+        loss = self.bce_loss(pred_valid, target_valid) + self.focal_loss(pred_valid, target_valid)
+        return loss, True
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(
         self,
-        grade_preds,
-        sys_grade_preds,
-        lesion_pred,
-        sys_lesion_preds,
-        gland_pred,
-        target_mask,
-        sys_labels,
-        lesion_mask,
-        gland_mask,
-        has_target,
-        has_sys,
-        has_lesion,
-        has_gland,
-    ):
-        device = lesion_pred.device if lesion_pred is not None else grade_preds.device
+        outputs: Optional[Dict[str, torch.Tensor]] = None,
+        batch: Optional[Dict[str, torch.Tensor]] = None,
+        *,
+        lesion_logits: Optional[torch.Tensor] = None,
+        region_logits: Optional[torch.Tensor] = None,
+        region_valid_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
+        sys_labels: Optional[torch.Tensor] = None,
+        lesion_mask: Optional[torch.Tensor] = None,
+        has_target: Optional[torch.Tensor] = None,
+        has_sys: Optional[torch.Tensor] = None,
+        has_lesion: Optional[torch.Tensor] = None,
+    ) -> Union[Dict[str, object], Tuple[torch.Tensor, ...]]:
+        """
+        Preferred usage:
+            loss_dict = criterion(outputs, batch)
+            loss = loss_dict["total_loss"]
 
-        loss_grade_target = self._zero(device)
-        loss_grade_sys = self._zero(device)
-        loss_lesion_dense = self._zero(device)
-        loss_lesion_sparse = self._zero(device)
-        loss_lesion_sys = self._zero(device)
-        loss_gland = self._zero(device)
+        Direct usage is also supported through keyword arguments.
+        """
+        if outputs is not None:
+            lesion_logits = outputs.get("lesion_logits", lesion_logits)
+            region_logits = outputs.get("region_logits", region_logits)
+            region_valid_mask = outputs.get("region_valid_mask", region_valid_mask)
 
-        active = {
-            "grade_tbx": False,
-            "grade_sbx": False,
-            "lesion_dense": False,
-            "lesion_sparse": False,
-            "lesion_sys": False,
-            "gland": False,
+        if batch is not None:
+            target_mask = batch.get("target_mask", target_mask)
+            sys_labels = batch.get("sys_labels", sys_labels)
+            lesion_mask = batch.get("lesion_mask", lesion_mask)
+            has_target = batch.get("has_target", has_target)
+            has_sys = batch.get("has_sys", has_sys)
+            has_lesion = batch.get("has_lesion", has_lesion)
+
+        device = self._infer_device(lesion_logits, region_logits, lesion_mask, target_mask, sys_labels)
+
+        if lesion_logits is None:
+            raise ValueError("lesion_logits is required. Pass outputs['lesion_logits'] or lesion_logits=...")
+
+        batch_size = lesion_logits.size(0)
+        if has_lesion is None:
+            has_lesion = torch.zeros(batch_size, device=device)
+        if has_target is None:
+            has_target = torch.zeros(batch_size, device=device)
+        if has_sys is None:
+            has_sys = torch.zeros(batch_size, device=device)
+
+        has_lesion = has_lesion.to(device).bool()
+        has_target = has_target.to(device).bool()
+        has_sys = has_sys.to(device).bool()
+
+        raw_losses: Dict[str, torch.Tensor] = {
+            "lesion_dense": self._zero(device),
+            "lesion_sparse": self._zero(device),
+            "lesion_sys": self._zero(device),
         }
+        active_tasks: Dict[str, float] = {key: 0.0 for key in TASK_KEYS}
 
-        valid_target_batch = has_target > 0
-        valid_sys_batch = has_sys > 0
-        valid_lesion_batch = has_lesion > 0
-        valid_gland_batch = has_gland > 0
+        if lesion_mask is not None:
+            raw_losses["lesion_dense"], active = self._dense_lesion_loss(
+                lesion_logits=lesion_logits,
+                lesion_mask=lesion_mask.to(device),
+                has_lesion=has_lesion,
+            )
+            active_tasks["lesion_dense"] = float(active)
 
-        # 1A. Targeted-biopsy voxel-level ISUP grade supervision.
-        if grade_preds is not None and valid_target_batch.any():
-            g_p_t = grade_preds[valid_target_batch]
-            mask_t = target_mask[valid_target_batch]
-            if mask_t.dim() == 5 and mask_t.shape[1] == 1:
-                mask_t = mask_t.squeeze(1)
-            valid_pixels = mask_t > 0
-            if valid_pixels.any():
-                preds_valid = g_p_t.permute(0, 2, 3, 4, 1)[valid_pixels]
-                labels_valid = mask_t[valid_pixels].long()
-                loss_grade_target = self.ce_loss(preds_valid, labels_valid)
-                active["grade_tbx"] = True
+        if target_mask is not None:
+            raw_losses["lesion_sparse"], active = self._sparse_tbx_loss(
+                lesion_logits=lesion_logits,
+                target_mask=target_mask.to(device),
+                has_target=has_target,
+            )
+            active_tasks["lesion_sparse"] = float(active)
 
-        # 1B. Systematic-biopsy region-level ISUP grade supervision.
-        if sys_grade_preds is not None and valid_sys_batch.any():
-            s_g_p = sys_grade_preds[valid_sys_batch]
-            s_labels = sys_labels[valid_sys_batch]
-            s_g_p_flat = s_g_p.reshape(-1, s_g_p.size(-1))
-            s_labels_flat = s_labels.reshape(-1)
-            valid_zones = s_labels_flat != self.invalid_sys_label
-            if valid_zones.any():
-                loss_grade_sys = self.ce_loss(s_g_p_flat[valid_zones], s_labels_flat[valid_zones].long())
-                active["grade_sbx"] = True
-
-        # 2A. Dense voxel-level lesion mask supervision.
-        if lesion_pred is not None and valid_lesion_batch.any():
-            pred_l = lesion_pred[valid_lesion_batch]
-            mask_l = lesion_mask[valid_lesion_batch].float()
-            loss_lesion_dense = self.lesion_bce_loss(pred_l, mask_l) + self.lesion_focal_loss(pred_l, mask_l)
-            active["lesion_dense"] = True
-
-        # 2B. Targeted-biopsy sparse csPCa supervision on needle-track voxels only.
-        if lesion_pred is not None and valid_target_batch.any():
-            pred_t = lesion_pred[valid_target_batch]
-            mask_t = target_mask[valid_target_batch]
-            valid_pixels = mask_t > 0
-            if valid_pixels.any():
-                target_lesion_label = (mask_t >= self.csPCa_threshold).float()
-                pred_valid = pred_t[valid_pixels]
-                label_valid = target_lesion_label[valid_pixels]
-                loss_lesion_sparse = self.lesion_bce_loss(pred_valid, label_valid) + self.lesion_focal_loss(pred_valid, label_valid)
-                active["lesion_sparse"] = True
-
-        # 2C. Systematic-biopsy region-level csPCa weak supervision.
-        if sys_lesion_preds is not None and valid_sys_batch.any():
-            s_l_p = sys_lesion_preds[valid_sys_batch]
-            s_labels = sys_labels[valid_sys_batch]
-            s_l_p_flat = s_l_p.reshape(-1)
-            s_labels_flat = s_labels.reshape(-1)
-            valid_zones = s_labels_flat != self.invalid_sys_label
-            if valid_zones.any():
-                sys_lesion_label = (s_labels_flat[valid_zones] >= self.csPCa_threshold).float()
-                pred_valid = s_l_p_flat[valid_zones]
-                loss_lesion_sys = self.lesion_bce_loss(pred_valid, sys_lesion_label) + self.lesion_focal_loss(pred_valid, sys_lesion_label)
-                active["lesion_sys"] = True
-
-        # 3. Dense gland segmentation supervision.
-        if gland_pred is not None and valid_gland_batch.any():
-            g_pred_valid = gland_pred[valid_gland_batch]
-            g_mask_valid = gland_mask[valid_gland_batch].float()
-            loss_gland = self.gland_bce_loss(g_pred_valid, g_mask_valid) + self.dice_loss(g_pred_valid, g_mask_valid)
-            active["gland"] = True
+        if region_logits is not None and sys_labels is not None:
+            raw_losses["lesion_sys"], active = self._region_mil_loss(
+                region_logits=region_logits.to(device),
+                sys_labels=sys_labels.to(device),
+                has_sys=has_sys,
+                region_valid_mask=region_valid_mask.to(device) if region_valid_mask is not None else None,
+            )
+            active_tasks["lesion_sys"] = float(active)
 
         weighted_terms = []
-        if active["grade_tbx"]:
-            weighted_terms.append(self._weighted(loss_grade_target, "grade_tbx"))
-        if active["grade_sbx"]:
-            weighted_terms.append(self._weighted(loss_grade_sys, "grade_sbx"))
-        if active["lesion_dense"]:
-            weighted_terms.append(self._weighted(loss_lesion_dense, "lesion_dense"))
-        if active["lesion_sparse"]:
-            weighted_terms.append(self._weighted(loss_lesion_sparse, "lesion_sparse"))
-        if active["lesion_sys"]:
-            weighted_terms.append(self._weighted(loss_lesion_sys, "lesion_sys"))
-        if active["gland"]:
-            weighted_terms.append(self._weighted(loss_gland, "gland"))
+        for key in TASK_KEYS:
+            if active_tasks[key] > 0 and self.is_enabled(key):
+                weighted_terms.append(self._weighted(raw_losses[key], key))
 
-        if weighted_terms:
-            total_loss = torch.stack([term.reshape(()) for term in weighted_terms]).sum()
-        else:
-            # Keeps graph valid in the unlikely event of a completely unsupervised batch.
-            total_loss = self._zero(device)
-
-        loss_grade_total = loss_grade_target + loss_grade_sys
-        loss_lesion_total = loss_lesion_dense + loss_lesion_sparse + loss_lesion_sys
-
-        if self.use_em_weighting:
-            em_weights = {k: torch.exp(-v.detach()).item() for k, v in self.log_vars.items()}
-        else:
-            em_weights = {k: float(self.fixed_loss_weights.get(k, 1.0)) for k in self.log_vars.keys()}
-
-        active_tasks = {k: float(v) for k, v in active.items()}
-
-        return (
-            total_loss,
-            loss_grade_total,
-            loss_grade_target,
-            loss_grade_sys,
-            loss_lesion_total,
-            loss_lesion_dense,
-            loss_lesion_sparse,
-            loss_lesion_sys,
-            loss_gland,
-            em_weights,
-            active_tasks,
+        total_loss = (
+            torch.stack([term.reshape(()) for term in weighted_terms]).sum()
+            if weighted_terms
+            else self._zero(device)
         )
+        lesion_loss_total = raw_losses["lesion_dense"] + raw_losses["lesion_sparse"] + raw_losses["lesion_sys"]
+
+        result = {
+            "total_loss": total_loss,
+            "loss_lesion_total": lesion_loss_total,
+            "loss_lesion_dense": raw_losses["lesion_dense"],
+            "loss_lesion_sparse": raw_losses["lesion_sparse"],
+            "loss_lesion_sys": raw_losses["lesion_sys"],
+            "em_weights": self.get_current_weights(),
+            "active_tasks": active_tasks,
+            "curriculum_status": self.get_curriculum_status(),
+        }
+
+        if self.return_dict:
+            return result
+
+        # Optional compact tuple for simple legacy-style logging.
+        return (
+            result["total_loss"],
+            result["loss_lesion_total"],
+            result["loss_lesion_dense"],
+            result["loss_lesion_sparse"],
+            result["loss_lesion_sys"],
+            result["em_weights"],
+            result["active_tasks"],
+            result["curriculum_status"],
+        )
+
+
+# Clear alias for the new setting. Existing code can still import MixedSupervisionLoss.
+SegmentationMILLoss = MixedSupervisionLoss
