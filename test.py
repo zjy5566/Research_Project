@@ -59,6 +59,7 @@ def build_model(device: torch.device):
             in_channels=_cfg("IN_CHANNELS", 3),
             max_zones=_cfg("MAX_ZONES", 20),
             base_channels=_cfg("BASE_CHANNELS", 32),
+            dropout_rate=_cfg("DROPOUT_RATE", 0.0),
             mil_pooling=_cfg("MIL_POOLING", "lme"),
             lme_r=_cfg("LME_R", 8.0),
             return_dict=True,

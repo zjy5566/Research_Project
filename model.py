@@ -15,7 +15,14 @@ class ResBlock3D(nn.Module):
     GroupNorm is more stable than BatchNorm for small 3D medical-image batches.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, num_groups: int = 8):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        num_groups: int = 8,
+        dropout_rate: float = 0.0,
+    ):
         super().__init__()
 
         if out_channels % num_groups != 0:
@@ -31,6 +38,7 @@ class ResBlock3D(nn.Module):
         )
         self.norm1 = nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
         self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout3d(p=float(dropout_rate)) if dropout_rate > 0 else nn.Identity()
 
         self.conv2 = nn.Conv3d(
             out_channels,
@@ -56,6 +64,7 @@ class ResBlock3D(nn.Module):
         out = self.conv1(x)
         out = self.norm1(out)
         out = self.relu(out)
+        out = self.dropout(out)
 
         out = self.conv2(out)
         out = self.norm2(out)
@@ -95,6 +104,7 @@ class ProstateSegMILNet(nn.Module):
         in_channels: int = 3,
         max_zones: int = 20,
         base_channels: int = 32,
+        dropout_rate: float = 0.0,
         mil_pooling: str = "lme",
         lme_r: float = 8.0,
         return_dict: bool = True,
@@ -106,6 +116,7 @@ class ProstateSegMILNet(nn.Module):
             in_channels: number of input MRI channels, e.g. T2/DWI/ADC = 3.
             max_zones: maximum number of systematic biopsy regions, e.g. 20.
             base_channels: first-layer channel width.
+            dropout_rate: 3D feature dropout probability used inside residual blocks.
             mil_pooling: 'lme', 'max', or 'mean'. 'lme' is the recommended default.
             lme_r: sharpness parameter for log-mean-exp pooling.
             return_dict: if True, return a dictionary; if False, return a compact tuple.
@@ -116,6 +127,7 @@ class ProstateSegMILNet(nn.Module):
         self.mil_pooling = mil_pooling
         self.lme_r = float(lme_r)
         self.return_dict = bool(return_dict)
+        self.dropout_rate = float(dropout_rate)
 
         c1 = base_channels
         c2 = base_channels * 2
@@ -124,33 +136,33 @@ class ProstateSegMILNet(nn.Module):
         c5 = base_channels * 16
 
         # Encoder
-        self.enc1 = ResBlock3D(in_channels, c1)
+        self.enc1 = ResBlock3D(in_channels, c1, dropout_rate=self.dropout_rate)
         self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2)
 
-        self.enc2 = ResBlock3D(c1, c2)
+        self.enc2 = ResBlock3D(c1, c2, dropout_rate=self.dropout_rate)
         self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)
 
-        self.enc3 = ResBlock3D(c2, c3)
+        self.enc3 = ResBlock3D(c2, c3, dropout_rate=self.dropout_rate)
         self.pool3 = nn.MaxPool3d(kernel_size=2, stride=2)
 
-        self.enc4 = ResBlock3D(c3, c4)
+        self.enc4 = ResBlock3D(c3, c4, dropout_rate=self.dropout_rate)
         self.pool4 = nn.MaxPool3d(kernel_size=2, stride=2)
 
         # Bottleneck
-        self.bottleneck = ResBlock3D(c4, c5)
+        self.bottleneck = ResBlock3D(c4, c5, dropout_rate=self.dropout_rate)
 
         # Decoder
         self.up4 = nn.ConvTranspose3d(c5, c4, kernel_size=2, stride=2)
-        self.dec4 = ResBlock3D(c4 + c4, c4)
+        self.dec4 = ResBlock3D(c4 + c4, c4, dropout_rate=self.dropout_rate)
 
         self.up3 = nn.ConvTranspose3d(c4, c3, kernel_size=2, stride=2)
-        self.dec3 = ResBlock3D(c3 + c3, c3)
+        self.dec3 = ResBlock3D(c3 + c3, c3, dropout_rate=self.dropout_rate)
 
         self.up2 = nn.ConvTranspose3d(c3, c2, kernel_size=2, stride=2)
-        self.dec2 = ResBlock3D(c2 + c2, c2)
+        self.dec2 = ResBlock3D(c2 + c2, c2, dropout_rate=self.dropout_rate)
 
         self.up1 = nn.ConvTranspose3d(c2, c1, kernel_size=2, stride=2)
-        self.dec1 = ResBlock3D(c1 + c1, c1)
+        self.dec1 = ResBlock3D(c1 + c1, c1, dropout_rate=self.dropout_rate)
 
         # The only learnable output head.
         self.head_lesion = nn.Conv3d(c1, 1, kernel_size=1)

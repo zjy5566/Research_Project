@@ -85,6 +85,7 @@ def build_model(device: torch.device):
         model = ModelClass(
             **common_kwargs,
             base_channels=_cfg("BASE_CHANNELS", 32),
+            dropout_rate=_cfg("DROPOUT_RATE", 0.0),
             mil_pooling=_cfg("MIL_POOLING", "lme"),
             lme_r=_cfg("LME_R", 8.0),
             return_dict=True,

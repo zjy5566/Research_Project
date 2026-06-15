@@ -633,32 +633,32 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             region_valid_mask=outputs.get("region_valid_mask"),
         )
 
-        # Optional visualization.
-        for b in range(imgs.size(0)):
-            d_type = infer_dataset_type(batch, b)
-            if saved_counts.get(d_type, 0) >= max_saves_per_type:
-                continue
-            if random.random() >= plot_prob:
-                continue
+        # # Optional visualization.
+        # for b in range(imgs.size(0)):
+        #     d_type = infer_dataset_type(batch, b)
+        #     if saved_counts.get(d_type, 0) >= max_saves_per_type:
+        #         continue
+        #     if random.random() >= plot_prob:
+        #         continue
 
-            gt_dict = {
-                "type": d_type,
-                "lesion_mask": batch.get("lesion_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-                "target_mask": batch.get("target_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-                "zones_mask": batch.get("zones_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-                "sys_labels": batch.get("sys_labels", torch.empty(0, device=device))[b].detach().cpu().numpy()
-                    if "sys_labels" in batch else np.asarray([]),
-            }
-            pid = batch["pid"][b] if "pid" in batch else f"case_{b}"
-            vis_filename = f"{d_type}_{pid}.png"
-            visualize_predictions(
-                input_tensor=imgs[b],
-                risk_map=lesion_probs[b],
-                gt_dict=gt_dict,
-                save_path=os.path.join(vis_dir, vis_filename),
-                patient_id=pid,
-            )
-            saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
+        #     gt_dict = {
+        #         "type": d_type,
+        #         "lesion_mask": batch.get("lesion_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
+        #         "target_mask": batch.get("target_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
+        #         "zones_mask": batch.get("zones_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
+        #         "sys_labels": batch.get("sys_labels", torch.empty(0, device=device))[b].detach().cpu().numpy()
+        #             if "sys_labels" in batch else np.asarray([]),
+        #     }
+        #     pid = batch["pid"][b] if "pid" in batch else f"case_{b}"
+        #     vis_filename = f"{d_type}_{pid}.png"
+        #     visualize_predictions(
+        #         input_tensor=imgs[b],
+        #         risk_map=lesion_probs[b],
+        #         gt_dict=gt_dict,
+        #         save_path=os.path.join(vis_dir, vis_filename),
+        #         patient_id=pid,
+        #     )
+        #     saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
 
     mil_metrics = mil_evaluator.compute_metrics()
     tracker.patient_sens = mil_metrics["patient_sens"]
