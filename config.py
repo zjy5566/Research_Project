@@ -254,6 +254,9 @@ class Config:
         "gland": 0.0,
     }
 
+    TBX_POSITIVE_SOFT_LABEL = 0.9
+    TBX_NEGATIVE_SOFT_LABEL = 0.05
+
     GRADE_TBX_START_EPOCH = 1
     GRADE_SBX_START_EPOCH = 1
     GLAND_START_EPOCH = 1

@@ -1,8 +1,15 @@
 import os
 import shutil
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+
+
+def copy_sbx_labels_with_unsampled_invalid(src_path, dst_path):
+    labels = np.load(src_path).astype(np.int64)
+    labels[labels == 0] = -1
+    np.save(dst_path, labels)
 
 def create_unified_dataset(base_dir):
     # --- 1. 定义路径 (严格匹配最新物理结构) ---
@@ -59,7 +66,7 @@ def create_unified_dataset(base_dir):
             
             if has_sys_12:
                 shutil.copy2(sys_mask_path, os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
-                shutil.copy2(sys_label_path, os.path.join(dst_p_dir, 'systematic_labels_12.npy'))
+                copy_sbx_labels_with_unsampled_invalid(sys_label_path, os.path.join(dst_p_dir, 'systematic_labels_12.npy'))
             
             if has_target:
                 shutil.copy2(target_path, os.path.join(dst_p_dir, 'target_bx.nii.gz'))
@@ -92,7 +99,10 @@ def create_unified_dataset(base_dir):
             
             shutil.copy2(os.path.join(src_p_dir, 'input_tensor.npy'), os.path.join(dst_p_dir, 'input_tensor.npy'))
             shutil.copy2(os.path.join(src_p_dir, 'zones_mask.nii.gz'), os.path.join(dst_p_dir, 'zones_mask.nii.gz'))
-            shutil.copy2(os.path.join(src_p_dir, 'systematic_labels.npy'), os.path.join(dst_p_dir, 'systematic_labels_20.npy'))
+            copy_sbx_labels_with_unsampled_invalid(
+                os.path.join(src_p_dir, 'systematic_labels.npy'),
+                os.path.join(dst_p_dir, 'systematic_labels_20.npy')
+            )
             
             if has_gland:
                 shutil.copy2(os.path.join(src_p_dir, 'gland_mask.nii.gz'), os.path.join(dst_p_dir, 'gland_mask.nii.gz'))

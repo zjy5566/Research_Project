@@ -1,0 +1,99 @@
+✅ Console outputs will be saved to: /raid/candi/jiayi/RP/Experiments/20260616_1623_N2_PUB_TCIA_TBxOnly_CommonEval_FixedW_LesDense_LesSparseTBx_NoClamp_NoCurr_EMlrX10_LR0.0001_composite/console_output.log
+--------------------------------------------------
+Experiment Configurations:
+BASE_DIR                        : /raid/candi/jiayi/RP
+UNIFIED_DATA_DIR                : /raid/candi/jiayi/RP/data/Unified_Dataset
+SPLIT_DIR                       : /raid/candi/jiayi/RP/data/Unified_Dataset/splits
+EXP_DIR                         : /raid/candi/jiayi/RP/Experiments
+EXPERIMENT_MODE                 : N2_PUB_TCIA_TBX_ONLY
+COMMON_INTERNAL_VAL_CSV         : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+COMMON_BEST_MODEL_METRIC        : composite
+TRAIN_CSV                       : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N2_PUB_TCIA_TBx_only_train.csv
+VAL_CSV                         : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+TEST_CSV                        : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N2_PROMIS_external_val.csv
+TASK                            : mixed
+DATASET_TASK                    : mixed
+USE_GRADE_TBX_TASK              : False
+USE_GRADE_SBX_TASK              : False
+USE_LESION_DENSE_TASK           : True
+USE_LESION_SPARSE_TASK          : True
+USE_LESION_SYS_TASK             : False
+USE_GLAND_TASK                  : False
+USE_EM_WEIGHTING                : False
+USE_CURRICULUM                  : False
+LESION_DENSE_START_EPOCH        : 1
+LESION_SPARSE_START_EPOCH       : 1
+LESION_SYS_START_EPOCH          : 1
+BEST_MODEL_METRIC               : composite
+EXPERIMENT_TAG                  : N2_PUB_TCIA_TBxOnly_CommonEval
+TARGET_SPACING                  : [1.0, 1.0, 2.24]
+CROP_SIZE_SITK                  : [64, 64, 32]
+INPUT_SHAPE                     : (3, 32, 64, 64)
+NEEDLE_RADIUS                   : 2
+IN_CHANNELS                     : 3
+NUM_CLASSES                     : 7
+BASE_CHANNELS                   : 32
+MAX_ZONES                       : 20
+MIL_POOLING                     : lme
+LME_R                           : 8.0
+DROPOUT_RATE                    : 0.2
+CSPC_THRESHOLD                  : 3
+LESION_POSITIVE_THRESHOLD       : 3
+INVALID_SYS_LABEL               : -1
+PRED_PROB_THRESHOLD             : 0.5
+DEVICE                          : cuda
+SEED                            : 42
+NUM_EPOCHS                      : 100
+BATCH_SIZE                      : 4
+NUM_WORKERS                     : 2
+LR                              : 0.0001
+WEIGHT_DECAY                    : 0.0001
+LR_SCHEDULER                    : CosineAnnealing
+EARLY_STOP_PATIENCE             : 20
+GRAD_CLIP_NORM                  : 12.0
+POS_WEIGHT_VAL                  : 2
+EM_LR_MULTIPLIER                : 10.0
+USE_LOGVAR_CLAMP                : False
+LOGVAR_MIN                      : -3.0
+LOGVAR_MAX                      : 3.0
+FIXED_LOSS_WEIGHTS              : {'grade_tbx': 0.0, 'grade_sbx': 0.0, 'lesion_dense': 1.0, 'lesion_sparse': 1.0, 'lesion_sys': 1.0, 'gland': 0.0}
+GRADE_TBX_START_EPOCH           : 1
+GRADE_SBX_START_EPOCH           : 1
+GLAND_START_EPOCH               : 1
+LESION_W_SMALL                  : 5
+USE_AUGMENTATION                : True
+MASK_TARGET_IN_SYS              : True
+VIS_SUBDIR                      : visualizations
+--------------------------------------------------
+📄 Train CSV: /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N2_PUB_TCIA_TBx_only_train.csv
+📄 Val CSV:   /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+
+Epoch 1/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 1.7212 | L_Les: 1.7212 (Dense 0.8598, Sparse 0.8615, Sys 0.0000)
+Val   | Loss: 0.9653 | Les-Dice: 0.0000 | Les-F1: 0.0000 | Patient-BAcc: 0.5000 | Region-BAcc: 0.5000
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 1.000 | Sys MIL: 0.000
+Selection metric (composite): 0.2500
+--> Best Model Saved (Score: 0.2500)
+
+Epoch 2/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 1.6814 | L_Les: 1.6814 (Dense 0.8542, Sparse 0.8272, Sys 0.0000)
+Val   | Loss: 0.9370 | Les-Dice: 0.0027 | Les-F1: 0.0055 | Patient-BAcc: 0.5361 | Region-BAcc: 0.5000
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 1.000 | Sys MIL: 0.000
+Selection metric (composite): 0.2604
+--> Best Model Saved (Score: 0.2604)
+
+Epoch 3/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 1.6262 | L_Les: 1.6262 (Dense 0.7996, Sparse 0.8266, Sys 0.0000)
+Val   | Loss: 0.9344 | Les-Dice: 0.0332 | Les-F1: 0.0459 | Patient-BAcc: 0.5694 | Region-BAcc: 0.5000
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 1.000 | Sys MIL: 0.000
+Selection metric (composite): 0.2840
+--> Best Model Saved (Score: 0.2840)
+
+Epoch 4/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0

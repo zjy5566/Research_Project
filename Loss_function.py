@@ -149,6 +149,8 @@ class MixedSupervisionLoss(nn.Module):
         logvar_max: Optional[float] = None,
         use_curriculum: Optional[bool] = None,
         branch_start_epochs: Optional[Dict[str, int]] = None,
+        tbx_positive_soft_label: Optional[float] = None,
+        tbx_negative_soft_label: Optional[float] = None,
         return_dict: bool = True,
     ):
         super().__init__()
@@ -169,6 +171,10 @@ class MixedSupervisionLoss(nn.Module):
             logvar_max = _cfg("LOGVAR_MAX", 3.0)
         if use_curriculum is None:
             use_curriculum = _cfg("USE_CURRICULUM", False)
+        if tbx_positive_soft_label is None:
+            tbx_positive_soft_label = _cfg("TBX_POSITIVE_SOFT_LABEL", 1.0)
+        if tbx_negative_soft_label is None:
+            tbx_negative_soft_label = _cfg("TBX_NEGATIVE_SOFT_LABEL", 0.0)
 
         self.positive_threshold = int(positive_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
@@ -179,6 +185,8 @@ class MixedSupervisionLoss(nn.Module):
         self.use_curriculum = bool(use_curriculum)
         self.return_dict = bool(return_dict)
         self.current_epoch = 1
+        self.tbx_positive_soft_label = float(tbx_positive_soft_label)
+        self.tbx_negative_soft_label = float(tbx_negative_soft_label)
 
         default_fixed_loss_weights = {
             "lesion_dense": 1.0,
@@ -314,6 +322,11 @@ class MixedSupervisionLoss(nn.Module):
         target = (target_mask >= self.positive_threshold).float()
         pred_valid = pred[valid_voxels]
         target_valid = target[valid_voxels]
+        target_valid = torch.where(
+            target_valid > 0,
+            torch.full_like(target_valid, self.tbx_positive_soft_label),
+            torch.full_like(target_valid, self.tbx_negative_soft_label),
+        )
 
         loss = self.bce_loss(pred_valid, target_valid) + self.focal_loss(pred_valid, target_valid)
         return loss, True
