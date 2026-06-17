@@ -249,7 +249,7 @@ class Config:
         "grade_tbx": 0.0,
         "grade_sbx": 0.0,
         "lesion_dense": 1.0,
-        "lesion_sparse": 1.0,
+        "lesion_sparse": 0.25,
         "lesion_sys": 1.0,
         "gland": 0.0,
     }

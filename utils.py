@@ -491,11 +491,21 @@ class MetricTracker:
             l_sparse = kwargs.get("loss_lesion_sparse", 0.0)
             l_sys = kwargs.get("loss_lesion_sys", 0.0)
 
+        if active_tasks is not None:
+            dense_active = float(active_tasks.get("lesion_dense", 0.0)) > 0
+            sparse_active = float(active_tasks.get("lesion_sparse", 0.0)) > 0
+            sys_active = float(active_tasks.get("lesion_sys", 0.0)) > 0
+        else:
+            dense_active = sparse_active = sys_active = True
+
         self.loss_total.update(total)
         self.loss_lesion.update(l_tot)
-        self.loss_lesion_dense.update(l_dense)
-        self.loss_lesion_sparse.update(l_sparse)
-        self.loss_lesion_sys.update(l_sys)
+        if dense_active:
+            self.loss_lesion_dense.update(l_dense)
+        if sparse_active:
+            self.loss_lesion_sparse.update(l_sparse)
+        if sys_active:
+            self.loss_lesion_sys.update(l_sys)
 
         if em_weights is not None:
             self.em_w_lesion_dense.update(em_weights.get("lesion_dense", 1.0))
