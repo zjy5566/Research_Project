@@ -140,6 +140,10 @@ class MixedSupervisionLoss(nn.Module):
         self,
         positive_threshold: Optional[int] = None,
         pos_weight_val: float = 2.0,
+        sys_pos_weight_val: Optional[float] = None,
+        sys_focal_alpha: Optional[float] = None,
+        sys_focal_gamma: Optional[float] = None,
+        use_sys_class_balanced_bce: Optional[bool] = None,
         invalid_sys_label: Optional[int] = None,
         use_em_weighting: Optional[bool] = None,
         fixed_loss_weights: Optional[Dict[str, float]] = None,
@@ -175,6 +179,14 @@ class MixedSupervisionLoss(nn.Module):
             tbx_positive_soft_label = _cfg("TBX_POSITIVE_SOFT_LABEL", 1.0)
         if tbx_negative_soft_label is None:
             tbx_negative_soft_label = _cfg("TBX_NEGATIVE_SOFT_LABEL", 0.0)
+        if sys_pos_weight_val is None:
+            sys_pos_weight_val = _cfg("SYS_POS_WEIGHT_VAL", pos_weight_val)
+        if sys_focal_alpha is None:
+            sys_focal_alpha = _cfg("SYS_FOCAL_ALPHA", 0.75)
+        if sys_focal_gamma is None:
+            sys_focal_gamma = _cfg("SYS_FOCAL_GAMMA", 2.0)
+        if use_sys_class_balanced_bce is None:
+            use_sys_class_balanced_bce = _cfg("USE_SYS_CLASS_BALANCED_BCE", True)
 
         self.positive_threshold = int(positive_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
@@ -187,6 +199,7 @@ class MixedSupervisionLoss(nn.Module):
         self.current_epoch = 1
         self.tbx_positive_soft_label = float(tbx_positive_soft_label)
         self.tbx_negative_soft_label = float(tbx_negative_soft_label)
+        self.use_sys_class_balanced_bce = bool(use_sys_class_balanced_bce)
 
         default_fixed_loss_weights = {
             "lesion_dense": 1.0,
@@ -216,9 +229,11 @@ class MixedSupervisionLoss(nn.Module):
         self.log_vars = nn.ParameterDict({key: nn.Parameter(torch.zeros(1)) for key in TASK_KEYS})
 
         self.register_buffer("pos_weight", torch.tensor([pos_weight_val], dtype=torch.float32))
+        self.register_buffer("sys_pos_weight", torch.tensor([sys_pos_weight_val], dtype=torch.float32))
         self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         self.dice_loss = DiceLoss()
         self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
+        self.sys_focal_loss = FocalLoss(alpha=sys_focal_alpha, gamma=sys_focal_gamma)
 
     # ------------------------------------------------------------------
     # Task gates and EM weighting
@@ -254,6 +269,27 @@ class MixedSupervisionLoss(nn.Module):
     @staticmethod
     def _zero(device: torch.device) -> torch.Tensor:
         return torch.tensor(0.0, device=device)
+
+    def _class_balanced_bce_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Average positive and negative region BCE separately before combining."""
+        targets = targets.float()
+        per_region_loss = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            pos_weight=self.sys_pos_weight.to(device=logits.device, dtype=logits.dtype),
+            reduction="none",
+        )
+        positive_mask = targets > 0.5
+        negative_mask = ~positive_mask
+
+        terms = []
+        if positive_mask.any():
+            terms.append(per_region_loss[positive_mask].mean())
+        if negative_mask.any():
+            terms.append(per_region_loss[negative_mask].mean())
+        if not terms:
+            return self._zero(logits.device)
+        return torch.stack(terms).mean()
 
     @staticmethod
     def _infer_device(*tensors: Optional[torch.Tensor]) -> torch.device:
@@ -362,7 +398,15 @@ class MixedSupervisionLoss(nn.Module):
         pred_valid = logits[valid_regions]
         target_valid = target[valid_regions]
 
-        loss = self.bce_loss(pred_valid, target_valid) + self.focal_loss(pred_valid, target_valid)
+        if self.use_sys_class_balanced_bce:
+            bce_loss = self._class_balanced_bce_loss(pred_valid, target_valid)
+        else:
+            bce_loss = F.binary_cross_entropy_with_logits(
+                pred_valid,
+                target_valid,
+                pos_weight=self.sys_pos_weight.to(device=pred_valid.device, dtype=pred_valid.dtype),
+            )
+        loss = bce_loss + self.sys_focal_loss(pred_valid, target_valid)
         return loss, True
 
     # ------------------------------------------------------------------
@@ -427,6 +471,14 @@ class MixedSupervisionLoss(nn.Module):
             "lesion_sys": self._zero(device),
         }
         active_tasks: Dict[str, float] = {key: 0.0 for key in TASK_KEYS}
+        loss_counts: Dict[str, int] = {
+            "batch_size": int(batch_size),
+            "lesion_dense_cases": 0,
+            "lesion_sparse_cases": 0,
+            "lesion_sparse_voxels": 0,
+            "lesion_sys_cases": 0,
+            "lesion_sys_regions": 0,
+        }
 
         if lesion_mask is not None:
             raw_losses["lesion_dense"], active = self._dense_lesion_loss(
@@ -435,23 +487,44 @@ class MixedSupervisionLoss(nn.Module):
                 has_lesion=has_lesion,
             )
             active_tasks["lesion_dense"] = float(active)
+            if active:
+                loss_counts["lesion_dense_cases"] = int(has_lesion.sum().detach().cpu().item())
 
         if target_mask is not None:
+            target_mask_device = target_mask.to(device)
             raw_losses["lesion_sparse"], active = self._sparse_tbx_loss(
                 lesion_logits=lesion_logits,
-                target_mask=target_mask.to(device),
+                target_mask=target_mask_device,
                 has_target=has_target,
             )
             active_tasks["lesion_sparse"] = float(active)
+            if active:
+                valid_target_mask = target_mask_device[has_target] > 0
+                loss_counts["lesion_sparse_cases"] = int(has_target.sum().detach().cpu().item())
+                loss_counts["lesion_sparse_voxels"] = int(valid_target_mask.sum().detach().cpu().item())
 
         if region_logits is not None and sys_labels is not None:
+            region_logits_device = region_logits.to(device)
+            sys_labels_device = sys_labels.to(device)
+            region_valid_mask_device = region_valid_mask.to(device) if region_valid_mask is not None else None
             raw_losses["lesion_sys"], active = self._region_mil_loss(
-                region_logits=region_logits.to(device),
-                sys_labels=sys_labels.to(device),
+                region_logits=region_logits_device,
+                sys_labels=sys_labels_device,
                 has_sys=has_sys,
-                region_valid_mask=region_valid_mask.to(device) if region_valid_mask is not None else None,
+                region_valid_mask=region_valid_mask_device,
             )
             active_tasks["lesion_sys"] = float(active)
+            if active:
+                logits_for_count = region_logits_device[has_sys]
+                if logits_for_count.dim() == 3 and logits_for_count.size(-1) == 1:
+                    logits_for_count = logits_for_count.squeeze(-1)
+                labels_for_count = sys_labels_device[has_sys][:, : logits_for_count.size(1)]
+                valid_regions = labels_for_count != self.invalid_sys_label
+                if region_valid_mask_device is not None:
+                    rmask = region_valid_mask_device[has_sys].bool()[:, : logits_for_count.size(1)]
+                    valid_regions = valid_regions & rmask
+                loss_counts["lesion_sys_cases"] = int(has_sys.sum().detach().cpu().item())
+                loss_counts["lesion_sys_regions"] = int(valid_regions.sum().detach().cpu().item())
 
         weighted_terms = []
         for key in TASK_KEYS:
@@ -474,6 +547,7 @@ class MixedSupervisionLoss(nn.Module):
             "em_weights": self.get_current_weights(),
             "active_tasks": active_tasks,
             "curriculum_status": self.get_curriculum_status(),
+            "loss_counts": loss_counts,
         }
 
         if self.return_dict:

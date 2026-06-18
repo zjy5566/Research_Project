@@ -107,6 +107,10 @@ def build_criterion(device: torch.device):
         "positive_threshold": positive_threshold,
         "invalid_sys_label": _cfg("INVALID_SYS_LABEL", -1),
         "pos_weight_val": _cfg("POS_WEIGHT_VAL", 2.0),
+        "sys_pos_weight_val": _cfg("SYS_POS_WEIGHT_VAL", _cfg("POS_WEIGHT_VAL", 2.0)),
+        "sys_focal_alpha": _cfg("SYS_FOCAL_ALPHA", 0.75),
+        "sys_focal_gamma": _cfg("SYS_FOCAL_GAMMA", 2.0),
+        "use_sys_class_balanced_bce": _cfg("USE_SYS_CLASS_BALANCED_BCE", True),
         "return_dict": True,
     }
     try:

@@ -182,6 +182,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
             "em_weights": loss_output.get("em_weights", {}),
             "active_tasks": loss_output.get("active_tasks", {}),
             "curriculum_status": loss_output.get("curriculum_status", {}),
+            "loss_counts": loss_output.get("loss_counts", {}),
         }
 
     if isinstance(loss_output, (tuple, list)):
@@ -197,6 +198,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "em_weights": em_weights,
                 "active_tasks": active_tasks,
                 "curriculum_status": curriculum_status,
+                "loss_counts": {},
             }
 
         # Legacy 12-tuple from the old multi-task loss. Grade/gland values are ignored.
@@ -210,6 +212,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "em_weights": loss_output[9],
                 "active_tasks": loss_output[10],
                 "curriculum_status": loss_output[11],
+                "loss_counts": {},
             }
 
     raise ValueError(f"Unexpected loss output format: {type(loss_output)}")
@@ -455,6 +458,14 @@ class MetricTracker:
         self.active_lesion_sparse = AverageMeter()
         self.active_lesion_sys = AverageMeter()
 
+        self.loss_num_batches = 0
+        self.loss_num_cases = 0
+        self.loss_dense_cases = 0
+        self.loss_sparse_cases = 0
+        self.loss_sparse_voxels = 0
+        self.loss_sys_cases = 0
+        self.loss_sys_regions = 0
+
     def update_losses(self, *args, em_weights=None, active_tasks=None, **kwargs):
         """Update loss meters from either a loss_dict or legacy positional args.
 
@@ -474,6 +485,7 @@ class MetricTracker:
             l_sys = loss_dict["loss_lesion_sys"]
             em_weights = loss_dict.get("em_weights", em_weights)
             active_tasks = loss_dict.get("active_tasks", active_tasks)
+            loss_counts = loss_dict.get("loss_counts", {})
         elif len(args) >= 9:
             # Legacy multi-task order. Ignore grade/gland.
             total = args[0]
@@ -481,15 +493,19 @@ class MetricTracker:
             l_dense = args[5]
             l_sparse = args[6]
             l_sys = args[7]
+            loss_counts = {}
         elif len(args) >= 5:
             # Compact new order.
             total, l_tot, l_dense, l_sparse, l_sys = args[:5]
+            loss_counts = {}
         else:
             total = kwargs.get("total", kwargs.get("total_loss", 0.0))
             l_tot = kwargs.get("loss_lesion_total", 0.0)
             l_dense = kwargs.get("loss_lesion_dense", 0.0)
             l_sparse = kwargs.get("loss_lesion_sparse", 0.0)
             l_sys = kwargs.get("loss_lesion_sys", 0.0)
+            loss_counts = kwargs.get("loss_counts", {})
+        loss_counts = loss_counts or {}
 
         if active_tasks is not None:
             dense_active = float(active_tasks.get("lesion_dense", 0.0)) > 0
@@ -498,14 +514,29 @@ class MetricTracker:
         else:
             dense_active = sparse_active = sys_active = True
 
-        self.loss_total.update(total)
-        self.loss_lesion.update(l_tot)
+        batch_n = int(loss_counts.get("batch_size", 1) or 1)
+        dense_n = int(loss_counts.get("lesion_dense_cases", 0) or 0)
+        sparse_case_n = int(loss_counts.get("lesion_sparse_cases", 0) or 0)
+        sparse_voxel_n = int(loss_counts.get("lesion_sparse_voxels", 0) or 0)
+        sys_case_n = int(loss_counts.get("lesion_sys_cases", 0) or 0)
+        sys_region_n = int(loss_counts.get("lesion_sys_regions", 0) or 0)
+
+        self.loss_num_batches += 1
+        self.loss_num_cases += batch_n
+        self.loss_dense_cases += dense_n
+        self.loss_sparse_cases += sparse_case_n
+        self.loss_sparse_voxels += sparse_voxel_n
+        self.loss_sys_cases += sys_case_n
+        self.loss_sys_regions += sys_region_n
+
+        self.loss_total.update(total, n=batch_n)
+        self.loss_lesion.update(l_tot, n=batch_n)
         if dense_active:
-            self.loss_lesion_dense.update(l_dense)
+            self.loss_lesion_dense.update(l_dense, n=max(dense_n, 1))
         if sparse_active:
-            self.loss_lesion_sparse.update(l_sparse)
+            self.loss_lesion_sparse.update(l_sparse, n=max(sparse_voxel_n, sparse_case_n, 1))
         if sys_active:
-            self.loss_lesion_sys.update(l_sys)
+            self.loss_lesion_sys.update(l_sys, n=max(sys_region_n, sys_case_n, 1))
 
         if em_weights is not None:
             self.em_w_lesion_dense.update(em_weights.get("lesion_dense", 1.0))
@@ -548,6 +579,13 @@ class MetricTracker:
             "active_lesion_dense": self.active_lesion_dense.avg,
             "active_lesion_sparse": self.active_lesion_sparse.avg,
             "active_lesion_sys": self.active_lesion_sys.avg,
+            "train_loss_num_batches": self.loss_num_batches,
+            "train_loss_num_cases": self.loss_num_cases,
+            "train_loss_dense_cases": self.loss_dense_cases,
+            "train_loss_sparse_cases": self.loss_sparse_cases,
+            "train_loss_sparse_voxels": self.loss_sparse_voxels,
+            "train_loss_sys_cases": self.loss_sys_cases,
+            "train_loss_sys_regions": self.loss_sys_regions,
         }
 
     def get_val_dict(self) -> Dict[str, float]:
@@ -573,6 +611,13 @@ class MetricTracker:
             "val_region_auc": self.region_auc,
             "val_region_auprc": self.region_auprc,
             "val_region_n": self.region_n,
+            "val_loss_num_batches": self.loss_num_batches,
+            "val_loss_num_cases": self.loss_num_cases,
+            "val_loss_dense_cases": self.loss_dense_cases,
+            "val_loss_sparse_cases": self.loss_sparse_cases,
+            "val_loss_sparse_voxels": self.loss_sparse_voxels,
+            "val_loss_sys_cases": self.loss_sys_cases,
+            "val_loss_sys_regions": self.loss_sys_regions,
         }
 
 
