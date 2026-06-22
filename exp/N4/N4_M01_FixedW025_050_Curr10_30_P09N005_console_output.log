@@ -1,0 +1,478 @@
+✅ Console outputs will be saved to: /raid/candi/jiayi/RP/Experiments/20260621_0547_N4_M01_FixedW025_050_Curr10_30_P09N005_FixedW_LesDense_LesSparseTBx_LesSysSBx_NoClamp_Curr_EMlrX1_LR0.0001_composite/console_output.log
+--------------------------------------------------
+Experiment Configurations:
+BASE_DIR                        : /raid/candi/jiayi/RP
+UNIFIED_DATA_DIR                : /raid/candi/jiayi/RP/data/Unified_Dataset
+SPLIT_DIR                       : /raid/candi/jiayi/RP/data/Unified_Dataset/splits
+EXP_DIR                         : /raid/candi/jiayi/RP/Experiments
+EXPERIMENT_MODE                 : N4_MIXED
+COMMON_INTERNAL_VAL_CSV         : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+COMMON_BEST_MODEL_METRIC        : composite
+TRAIN_CSV                       : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N4_mixed_PUB_TCIA_train.csv
+VAL_CSV                         : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+TEST_CSV                        : /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N4_mixed_PROMIS_external_val.csv
+TASK                            : mixed
+DATASET_TASK                    : mixed
+USE_GRADE_TBX_TASK              : False
+USE_GRADE_SBX_TASK              : False
+USE_LESION_DENSE_TASK           : True
+USE_LESION_SPARSE_TASK          : True
+USE_LESION_SYS_TASK             : True
+USE_GLAND_TASK                  : False
+USE_EM_WEIGHTING                : False
+USE_CURRICULUM                  : True
+LESION_DENSE_START_EPOCH        : 1
+LESION_SPARSE_START_EPOCH       : 10
+LESION_SYS_START_EPOCH          : 30
+BEST_MODEL_METRIC               : composite
+EXPERIMENT_TAG                  : N4_M01_FixedW025_050_Curr10_30_P09N005
+TARGET_SPACING                  : [1.0, 1.0, 2.24]
+CROP_SIZE_SITK                  : [64, 64, 32]
+INPUT_SHAPE                     : (3, 32, 64, 64)
+NEEDLE_RADIUS                   : 2
+IN_CHANNELS                     : 3
+NUM_CLASSES                     : 7
+BASE_CHANNELS                   : 32
+MAX_ZONES                       : 20
+MIL_POOLING                     : lme
+LME_R                           : 8.0
+DROPOUT_RATE                    : 0.2
+CSPC_THRESHOLD                  : 3
+LESION_POSITIVE_THRESHOLD       : 3
+INVALID_SYS_LABEL               : -1
+PRED_PROB_THRESHOLD             : 0.5
+DEVICE                          : cuda
+SEED                            : 42
+NUM_EPOCHS                      : 100
+BATCH_SIZE                      : 4
+NUM_WORKERS                     : 2
+LR                              : 0.0001
+WEIGHT_DECAY                    : 0.0001
+LR_SCHEDULER                    : CosineAnnealing
+EARLY_STOP_PATIENCE             : 20
+GRAD_CLIP_NORM                  : 12.0
+POS_WEIGHT_VAL                  : 2
+SYS_POS_WEIGHT_VAL              : 1.0
+SYS_FOCAL_ALPHA                 : 0.75
+SYS_FOCAL_GAMMA                 : 2.0
+USE_SYS_CLASS_BALANCED_BCE      : True
+EM_LR_MULTIPLIER                : 1.0
+USE_LOGVAR_CLAMP                : False
+LOGVAR_MIN                      : -2.0
+LOGVAR_MAX                      : 2.0
+FIXED_LOSS_WEIGHTS              : {'grade_tbx': 0.0, 'grade_sbx': 0.0, 'lesion_dense': 1.0, 'lesion_sparse': 0.25, 'lesion_sys': 0.5, 'gland': 0.0}
+TBX_POSITIVE_SOFT_LABEL         : 0.9
+TBX_NEGATIVE_SOFT_LABEL         : 0.05
+GRADE_TBX_START_EPOCH           : 1
+GRADE_SBX_START_EPOCH           : 1
+GLAND_START_EPOCH               : 1
+LESION_W_SMALL                  : 5
+USE_AUGMENTATION                : True
+MASK_TARGET_IN_SYS              : True
+VIS_SUBDIR                      : visualizations
+--------------------------------------------------
+📄 Train CSV: /raid/candi/jiayi/RP/data/Unified_Dataset/splits/N4_mixed_PUB_TCIA_train.csv
+📄 Val CSV:   /raid/candi/jiayi/RP/data/Unified_Dataset/splits/common_internal_evaluation.csv
+
+Epoch 1/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.8359 | L_Les: 0.8359 (Dense 1.0698, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.3095 | Les-Dice: 0.1658 | Les-F1: 0.2064 | Patient-BAcc: 0.6865 | Region-BAcc: 0.5077
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3814
+--> Best Model Saved (Score: 0.3814)
+
+Epoch 2/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.7333 | L_Les: 0.7333 (Dense 0.9736, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2926 | Les-Dice: 0.2121 | Les-F1: 0.2424 | Patient-BAcc: 0.5306 | Region-BAcc: 0.5196
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3686
+
+Epoch 3/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.7328 | L_Les: 0.7328 (Dense 0.9392, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2833 | Les-Dice: 0.2279 | Les-F1: 0.2611 | Patient-BAcc: 0.5802 | Region-BAcc: 0.5467
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3957
+--> Best Model Saved (Score: 0.3957)
+
+Epoch 4/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.7009 | L_Les: 0.7009 (Dense 0.9057, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2744 | Les-Dice: 0.2433 | Les-F1: 0.2719 | Patient-BAcc: 0.5317 | Region-BAcc: 0.5498
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3920
+
+Epoch 5/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.6550 | L_Les: 0.6550 (Dense 0.8835, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2660 | Les-Dice: 0.2675 | Les-F1: 0.2975 | Patient-BAcc: 0.5063 | Region-BAcc: 0.5116
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3882
+
+Epoch 6/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.6625 | L_Les: 0.6625 (Dense 0.8673, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2635 | Les-Dice: 0.2679 | Les-F1: 0.2953 | Patient-BAcc: 0.4956 | Region-BAcc: 0.5414
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3932
+
+Epoch 7/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.6567 | L_Les: 0.6567 (Dense 0.8408, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2564 | Les-Dice: 0.2858 | Les-F1: 0.3253 | Patient-BAcc: 0.5099 | Region-BAcc: 0.5202
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.4004
+--> Best Model Saved (Score: 0.4004)
+
+Epoch 8/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.6395 | L_Les: 0.6395 (Dense 0.8321, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2565 | Les-Dice: 0.2825 | Les-F1: 0.3241 | Patient-BAcc: 0.4917 | Region-BAcc: 0.5381
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.3987
+
+Epoch 9/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 0 | Sys MIL: 0
+Train | Loss: 0.6748 | L_Les: 0.6748 (Dense 0.8271, Sparse 0.0000, Sys 0.0000)
+Val   | Loss: 0.2555 | Les-Dice: 0.2877 | Les-F1: 0.3235 | Patient-BAcc: 0.4940 | Region-BAcc: 0.5496
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.000 | Sys MIL: 0.000
+Selection metric (composite): 0.4047
+--> Best Model Saved (Score: 0.4047)
+
+Epoch 10/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.9219 | L_Les: 1.7118 (Dense 0.8539, Sparse 1.0551, Sys 0.0000)
+Val   | Loss: 0.4198 | Les-Dice: 0.2779 | Les-F1: 0.3171 | Patient-BAcc: 0.6929 | Region-BAcc: 0.5126
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4403
+--> Best Model Saved (Score: 0.4403)
+
+Epoch 11/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8578 | L_Les: 1.5410 (Dense 0.8266, Sparse 0.8922, Sys 0.0000)
+Val   | Loss: 0.4124 | Les-Dice: 0.2914 | Les-F1: 0.3247 | Patient-BAcc: 0.6048 | Region-BAcc: 0.5361
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4309
+
+Epoch 12/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8636 | L_Les: 1.5481 (Dense 0.8159, Sparse 0.8965, Sys 0.0000)
+Val   | Loss: 0.4096 | Les-Dice: 0.3070 | Les-F1: 0.3457 | Patient-BAcc: 0.7095 | Region-BAcc: 0.5107
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4586
+--> Best Model Saved (Score: 0.4586)
+
+Epoch 13/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8239 | L_Les: 1.4794 (Dense 0.8066, Sparse 0.8742, Sys 0.0000)
+Val   | Loss: 0.4091 | Les-Dice: 0.2970 | Les-F1: 0.3343 | Patient-BAcc: 0.6905 | Region-BAcc: 0.5066
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4478
+
+Epoch 14/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8366 | L_Les: 1.5098 (Dense 0.8031, Sparse 0.8757, Sys 0.0000)
+Val   | Loss: 0.4070 | Les-Dice: 0.3000 | Les-F1: 0.3309 | Patient-BAcc: 0.5885 | Region-BAcc: 0.5385
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4318
+
+Epoch 15/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8203 | L_Les: 1.4574 (Dense 0.8016, Sparse 0.8614, Sys 0.0000)
+Val   | Loss: 0.4021 | Les-Dice: 0.3108 | Les-F1: 0.3483 | Patient-BAcc: 0.7230 | Region-BAcc: 0.4950
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4599
+--> Best Model Saved (Score: 0.4599)
+
+Epoch 16/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8088 | L_Les: 1.4553 (Dense 0.7952, Sparse 0.8596, Sys 0.0000)
+Val   | Loss: 0.4056 | Les-Dice: 0.3014 | Les-F1: 0.3344 | Patient-BAcc: 0.6433 | Region-BAcc: 0.5141
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4401
+
+Epoch 17/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8410 | L_Les: 1.4887 (Dense 0.7914, Sparse 0.8568, Sys 0.0000)
+Val   | Loss: 0.3976 | Les-Dice: 0.3171 | Les-F1: 0.3627 | Patient-BAcc: 0.7000 | Region-BAcc: 0.5029
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4593
+
+Epoch 18/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8006 | L_Les: 1.4394 (Dense 0.7856, Sparse 0.8543, Sys 0.0000)
+Val   | Loss: 0.4000 | Les-Dice: 0.3184 | Les-F1: 0.3633 | Patient-BAcc: 0.6155 | Region-BAcc: 0.5206
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4432
+
+Epoch 19/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8062 | L_Les: 1.4412 (Dense 0.7791, Sparse 0.8547, Sys 0.0000)
+Val   | Loss: 0.4033 | Les-Dice: 0.3052 | Les-F1: 0.3499 | Patient-BAcc: 0.7127 | Region-BAcc: 0.5023
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4563
+
+Epoch 20/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7846 | L_Les: 1.4286 (Dense 0.7798, Sparse 0.8519, Sys 0.0000)
+Val   | Loss: 0.3988 | Les-Dice: 0.3181 | Les-F1: 0.3578 | Patient-BAcc: 0.6000 | Region-BAcc: 0.5112
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4369
+
+Epoch 21/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8205 | L_Les: 1.4589 (Dense 0.7747, Sparse 0.8528, Sys 0.0000)
+Val   | Loss: 0.3997 | Les-Dice: 0.3132 | Les-F1: 0.3597 | Patient-BAcc: 0.6893 | Region-BAcc: 0.5071
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4557
+
+Epoch 22/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7917 | L_Les: 1.4145 (Dense 0.7644, Sparse 0.8460, Sys 0.0000)
+Val   | Loss: 0.3952 | Les-Dice: 0.3270 | Les-F1: 0.3633 | Patient-BAcc: 0.6710 | Region-BAcc: 0.5074
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4581
+
+Epoch 23/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8023 | L_Les: 1.4385 (Dense 0.7648, Sparse 0.8474, Sys 0.0000)
+Val   | Loss: 0.4003 | Les-Dice: 0.3147 | Les-F1: 0.3521 | Patient-BAcc: 0.7083 | Region-BAcc: 0.5098
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4619
+--> Best Model Saved (Score: 0.4619)
+
+Epoch 24/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.8099 | L_Les: 1.4458 (Dense 0.7652, Sparse 0.8492, Sys 0.0000)
+Val   | Loss: 0.3982 | Les-Dice: 0.3193 | Les-F1: 0.3603 | Patient-BAcc: 0.6790 | Region-BAcc: 0.4971
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4537
+
+Epoch 25/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7899 | L_Les: 1.4420 (Dense 0.7647, Sparse 0.8523, Sys 0.0000)
+Val   | Loss: 0.3990 | Les-Dice: 0.3203 | Les-F1: 0.3621 | Patient-BAcc: 0.7119 | Region-BAcc: 0.5147
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4668
+--> Best Model Saved (Score: 0.4668)
+
+Epoch 26/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7693 | L_Les: 1.3937 (Dense 0.7566, Sparse 0.8380, Sys 0.0000)
+Val   | Loss: 0.3973 | Les-Dice: 0.3205 | Les-F1: 0.3628 | Patient-BAcc: 0.6909 | Region-BAcc: 0.5101
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4605
+
+Epoch 27/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7650 | L_Les: 1.3967 (Dense 0.7540, Sparse 0.8476, Sys 0.0000)
+Val   | Loss: 0.3932 | Les-Dice: 0.3293 | Les-F1: 0.3746 | Patient-BAcc: 0.6821 | Region-BAcc: 0.5104
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4628
+
+Epoch 28/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7866 | L_Les: 1.4312 (Dense 0.7451, Sparse 0.8394, Sys 0.0000)
+Val   | Loss: 0.3950 | Les-Dice: 0.3262 | Les-F1: 0.3736 | Patient-BAcc: 0.6520 | Region-BAcc: 0.5154
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4549
+
+Epoch 29/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 0
+Train | Loss: 0.7878 | L_Les: 1.4316 (Dense 0.7509, Sparse 0.8455, Sys 0.0000)
+Val   | Loss: 0.3909 | Les-Dice: 0.3373 | Les-F1: 0.3876 | Patient-BAcc: 0.7270 | Region-BAcc: 0.5083
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.000
+Selection metric (composite): 0.4775
+--> Best Model Saved (Score: 0.4775)
+
+Epoch 30/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0693 | L_Les: 2.0115 (Dense 0.7471, Sparse 0.8456, Sys 0.6373)
+Val   | Loss: 0.6275 | Les-Dice: 0.3331 | Les-F1: 0.3839 | Patient-BAcc: 0.7194 | Region-BAcc: 0.5070
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4732
+
+Epoch 31/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0846 | L_Les: 2.0315 (Dense 0.7382, Sparse 0.8509, Sys 0.6265)
+Val   | Loss: 0.6255 | Les-Dice: 0.3219 | Les-F1: 0.3706 | Patient-BAcc: 0.6758 | Region-BAcc: 0.5049
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4561
+
+Epoch 32/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0684 | L_Les: 1.9947 (Dense 0.7394, Sparse 0.8421, Sys 0.6278)
+Val   | Loss: 0.6339 | Les-Dice: 0.3190 | Les-F1: 0.3794 | Patient-BAcc: 0.7206 | Region-BAcc: 0.5012
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4650
+
+Epoch 33/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0821 | L_Les: 2.0202 (Dense 0.7438, Sparse 0.8466, Sys 0.6251)
+Val   | Loss: 0.6217 | Les-Dice: 0.3318 | Les-F1: 0.3867 | Patient-BAcc: 0.6571 | Region-BAcc: 0.5083
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4572
+
+Epoch 34/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0640 | L_Les: 2.0001 (Dense 0.7354, Sparse 0.8439, Sys 0.6347)
+Val   | Loss: 0.6203 | Les-Dice: 0.3302 | Les-F1: 0.3796 | Patient-BAcc: 0.6536 | Region-BAcc: 0.5231
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4593
+
+Epoch 35/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0602 | L_Les: 1.9971 (Dense 0.7282, Sparse 0.8407, Sys 0.6199)
+Val   | Loss: 0.6297 | Les-Dice: 0.3123 | Les-F1: 0.3620 | Patient-BAcc: 0.7290 | Region-BAcc: 0.5027
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4641
+
+Epoch 36/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0538 | L_Les: 1.9928 (Dense 0.7274, Sparse 0.8431, Sys 0.6156)
+Val   | Loss: 0.6228 | Les-Dice: 0.3300 | Les-F1: 0.3807 | Patient-BAcc: 0.6567 | Region-BAcc: 0.5201
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4592
+
+Epoch 37/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0662 | L_Les: 1.9895 (Dense 0.7343, Sparse 0.8492, Sys 0.6136)
+Val   | Loss: 0.6209 | Les-Dice: 0.3313 | Les-F1: 0.3784 | Patient-BAcc: 0.6619 | Region-BAcc: 0.5222
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4617
+
+Epoch 38/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0563 | L_Les: 1.9777 (Dense 0.7261, Sparse 0.8389, Sys 0.5943)
+Val   | Loss: 0.6254 | Les-Dice: 0.3333 | Les-F1: 0.3839 | Patient-BAcc: 0.6687 | Region-BAcc: 0.5155
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4627
+
+Epoch 39/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0739 | L_Les: 1.9998 (Dense 0.7187, Sparse 0.8429, Sys 0.6166)
+Val   | Loss: 0.6294 | Les-Dice: 0.3331 | Les-F1: 0.3779 | Patient-BAcc: 0.6687 | Region-BAcc: 0.5083
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4608
+
+Epoch 40/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0200 | L_Les: 1.9268 (Dense 0.7167, Sparse 0.8398, Sys 0.6046)
+Val   | Loss: 0.6255 | Les-Dice: 0.3289 | Les-F1: 0.3794 | Patient-BAcc: 0.6651 | Region-BAcc: 0.5204
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4608
+
+Epoch 41/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0484 | L_Les: 1.9900 (Dense 0.7127, Sparse 0.8444, Sys 0.6031)
+Val   | Loss: 0.6280 | Les-Dice: 0.3285 | Les-F1: 0.3799 | Patient-BAcc: 0.6758 | Region-BAcc: 0.5146
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4619
+
+Epoch 42/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0266 | L_Les: 1.9440 (Dense 0.7127, Sparse 0.8362, Sys 0.5972)
+Val   | Loss: 0.6269 | Les-Dice: 0.3307 | Les-F1: 0.3870 | Patient-BAcc: 0.7016 | Region-BAcc: 0.5140
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4693
+
+Epoch 43/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0553 | L_Les: 1.9863 (Dense 0.7026, Sparse 0.8345, Sys 0.6074)
+Val   | Loss: 0.6328 | Les-Dice: 0.3252 | Les-F1: 0.3789 | Patient-BAcc: 0.7258 | Region-BAcc: 0.5131
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4723
+
+Epoch 44/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0094 | L_Les: 1.8999 (Dense 0.7015, Sparse 0.8359, Sys 0.5835)
+Val   | Loss: 0.6382 | Les-Dice: 0.3366 | Les-F1: 0.3837 | Patient-BAcc: 0.6313 | Region-BAcc: 0.5296
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4585
+
+Epoch 45/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0538 | L_Les: 1.9605 (Dense 0.7001, Sparse 0.8411, Sys 0.5881)
+Val   | Loss: 0.6234 | Les-Dice: 0.3380 | Les-F1: 0.3920 | Patient-BAcc: 0.7048 | Region-BAcc: 0.5228
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4759
+
+Epoch 46/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0177 | L_Les: 1.9338 (Dense 0.6909, Sparse 0.8311, Sys 0.5887)
+Val   | Loss: 0.6248 | Les-Dice: 0.3372 | Les-F1: 0.3884 | Patient-BAcc: 0.6694 | Region-BAcc: 0.5435
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4718
+
+Epoch 47/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0354 | L_Les: 1.9596 (Dense 0.6879, Sparse 0.8334, Sys 0.5845)
+Val   | Loss: 0.6234 | Les-Dice: 0.3358 | Les-F1: 0.3846 | Patient-BAcc: 0.6909 | Region-BAcc: 0.5398
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4755
+
+Epoch 48/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0216 | L_Les: 1.9278 (Dense 0.6919, Sparse 0.8342, Sys 0.5912)
+Val   | Loss: 0.6256 | Les-Dice: 0.3291 | Les-F1: 0.3777 | Patient-BAcc: 0.6853 | Region-BAcc: 0.5280
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4678
+
+Epoch 49/100
+Curriculum/task status | Dense: 1 | Sparse TBx: 1 | Sys MIL: 1
+Train | Loss: 1.0157 | L_Les: 1.9206 (Dense 0.6822, Sparse 0.8310, Sys 0.5882)
+Val   | Loss: 0.6265 | Les-Dice: 0.3390 | Les-F1: 0.3927 | Patient-BAcc: 0.6234 | Region-BAcc: 0.5287
+--- Lesion EM / Loss Multipliers ---
+Dense: 1.000 | Sparse TBx: 0.250 | Sys MIL: 0.500
+Selection metric (composite): 0.4575
+Early stop triggered at epoch 49
