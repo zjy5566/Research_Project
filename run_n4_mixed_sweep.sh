@@ -176,26 +176,48 @@ run_exp() {
 #
 # Notes:
 #   - TBx is lesion_sparse; SBx is lesion_sys.
-#   - FIXED_LOSS_WEIGHTS only affect runs with USE_EM_WEIGHTING=False.
+#   - N2 best fixed setting: TBx weight 0.05, TBx start epoch 15.
+#   - N3 best fixed setting: SBx weight 0.25, SBx start epoch 15.
+#   - Previous best N4 fixed setting: TBx/SBx 0.10/0.25, starts 10/20.
+#   - Previous best N4 overall was EM10, TBx/SBx starts 10/30, soft labels
+#     0.85/0.10. Fixed weights are ignored when USE_EM_WEIGHTING=True.
 #   - mask_target_in_sys=True removes TBx voxels from SBx zone masks when both
 #     labels are present, avoiding duplicate supervision on the same voxels.
 
-set_n4_config "N4_M01_FixedW025_050_Curr10_30_P09N005" "False" "True" "10" "30" "0.25" "0.50" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M01_FixedW025_050_Curr10_30_P09N005"
+set_n4_config "N4_R01_FixedW005_025_Curr15_15_P09N005" "False" "True" "15" "15" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R01_FixedW005_025_Curr15_15_P09N005"
 
-set_n4_config "N4_M02_FixedW010_025_Curr10_20_P09N005" "False" "True" "10" "20" "0.10" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M02_FixedW010_025_Curr10_20_P09N005"
+set_n4_config "N4_R02_FixedW005_025_Curr15_20_P09N005" "False" "True" "15" "20" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R02_FixedW005_025_Curr15_20_P09N005"
 
-set_n4_config "N4_M03_EM1_Curr10_30_ClampN05P1_P09N005" "True" "True" "10" "30" "0.25" "0.50" "0.9" "0.05" "1.0" "True" "-0.5" "1.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M03_EM1_Curr10_30_ClampN05P1_P09N005"
+set_n4_config "N4_R03_FixedW005_025_Curr10_15_P09N005" "False" "True" "10" "15" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R03_FixedW005_025_Curr10_15_P09N005"
 
-set_n4_config "N4_M04_EM5_Curr10_20_ClampN1P2_P09N005" "True" "True" "10" "20" "0.25" "0.50" "0.9" "0.05" "5.0" "True" "-1.0" "2.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M04_EM5_Curr10_20_ClampN1P2_P09N005"
+set_n4_config "N4_R04_FixedW005_025_Curr10_20_P09N005" "False" "True" "10" "20" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R04_FixedW005_025_Curr10_20_P09N005"
 
-set_n4_config "N4_M05_EM10_Curr10_30_ClampN2P2_P085N010" "True" "True" "10" "30" "0.25" "0.50" "0.85" "0.10" "10.0" "True" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M05_EM10_Curr10_30_ClampN2P2_P085N010"
+set_n4_config "N4_R05_FixedW010_025_Curr15_15_P09N005" "False" "True" "15" "15" "0.10" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R05_FixedW010_025_Curr15_15_P09N005"
 
-set_n4_config "N4_M06_EM1_NoCurr_ClampN05P1_P09N005" "True" "False" "1" "1" "0.25" "0.50" "0.9" "0.05" "1.0" "True" "-0.5" "1.0" "1.0" "0.75" "2.0" "True"
-run_exp "N4_M06_EM1_NoCurr_ClampN05P1_P09N005"
+set_n4_config "N4_R06_FixedW010_025_Curr10_20_P09N005" "False" "True" "10" "20" "0.10" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R06_FixedW010_025_Curr10_20_P09N005"
+
+set_n4_config "N4_R07_FixedW005_050_Curr15_15_P09N005" "False" "True" "15" "15" "0.05" "0.50" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R07_FixedW005_050_Curr15_15_P09N005"
+
+set_n4_config "N4_R08_FixedW005_025_NoCurr_P09N005" "False" "False" "1" "1" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R08_FixedW005_025_NoCurr_P09N005"
+
+set_n4_config "N4_R09_EM10_Curr15_15_ClampN2P2_P09N005" "True" "True" "15" "15" "0.05" "0.25" "0.9" "0.05" "10.0" "True" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R09_EM10_Curr15_15_ClampN2P2_P09N005"
+
+set_n4_config "N4_R10_EM10_Curr15_20_ClampN2P2_P085N010" "True" "True" "15" "20" "0.05" "0.25" "0.85" "0.10" "10.0" "True" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R10_EM10_Curr15_20_ClampN2P2_P085N010"
+
+set_n4_config "N4_R11_FixedW005_025_Curr15_30_P09N005" "False" "True" "15" "30" "0.05" "0.25" "0.9" "0.05" "1.0" "False" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R11_FixedW005_025_Curr15_30_P09N005"
+
+set_n4_config "N4_R12_EM10_Curr15_30_ClampN2P2_P085N010" "True" "True" "15" "30" "0.05" "0.25" "0.85" "0.10" "10.0" "True" "-2.0" "2.0" "1.0" "0.75" "2.0" "True"
+run_exp "N4_R12_EM10_Curr15_30_ClampN2P2_P085N010"
 
 echo "All N4 mixed experiments finished at $(date)."

@@ -168,18 +168,18 @@ class Config:
         USE_LESION_SYS_TASK = True
         USE_GLAND_TASK = False
 
-        USE_EM_WEIGHTING = True
+        USE_EM_WEIGHTING = False
         USE_CURRICULUM = True
 
-        # Epoch 1-9:   PUB dense only
-        # Epoch 10-29: PUB dense + TCIA TBx
-        # Epoch 30+:   PUB dense + TCIA TBx + TCIA SBx
+        # Evidence-guided N4 default after N2/N3 sweeps:
+        # Epoch 1-14:  PUB dense only
+        # Epoch 15+:   PUB dense + TCIA TBx + TCIA SBx
         LESION_DENSE_START_EPOCH = 1
-        LESION_SPARSE_START_EPOCH = 10
-        LESION_SYS_START_EPOCH = 30
+        LESION_SPARSE_START_EPOCH = 15
+        LESION_SYS_START_EPOCH = 15
 
         BEST_MODEL_METRIC = COMMON_BEST_MODEL_METRIC
-        EXPERIMENT_TAG = "N4_Mixed_PUB_TCIA_CommonEval"
+        EXPERIMENT_TAG = "N4_FixedW005_025_Curr15_15_CommonEval"
 
     else:
         raise ValueError(
@@ -253,8 +253,8 @@ class Config:
         "grade_tbx": 0.0,
         "grade_sbx": 0.0,
         "lesion_dense": 1.0,
-        "lesion_sparse": 0.25,
-        "lesion_sys": 1.0,
+        "lesion_sparse": 0.05,
+        "lesion_sys": 0.25,
         "gland": 0.0,
     }
 
