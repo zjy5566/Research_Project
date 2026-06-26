@@ -39,7 +39,7 @@ def calculate_dataset_statistics(base_dir):
         # ==========================================
         elif pid.startswith('TCIA_'):
             # 2.1 统计 Target Biopsy 像素
-            target_path = os.path.join(p_dir, 'target_bx.nii.gz')
+            target_path = os.path.join(p_dir, 'target_mask.nii.gz')
             if os.path.exists(target_path):
                 img = sitk.ReadImage(target_path)
                 mask = sitk.GetArrayFromImage(img)
@@ -84,11 +84,11 @@ def calculate_dataset_statistics(base_dir):
         print(f" - Ratio (Lesion:Bg): 1 : {pub_bg/pub_lesion:.2f}  (约 {pub_ratio:.4%})")
 
     # 2. TCIA Target 打印
-    print(f"\n[TCIA Dataset - Targeted Biopsy] (Pixel-level)")
+    print(f"\n[TCIA Dataset - TBx-confirmed Target Lesion ROI] (Pixel-level)")
     target_bg = stats['TCIA_Target'].get(0, 0)
     target_lesion_total = sum(v for k, v in stats['TCIA_Target'].items() if k > 0)
     print(f" - Background Pixels: {target_bg:,}")
-    print(f" - Target Lesion Pixels (All ISUP): {target_lesion_total:,}")
+    print(f" - Target ROI Pixels (All ISUP): {target_lesion_total:,}")
     for k in sorted(stats['TCIA_Target'].keys()):
         if k > 0:
             print(f"    * ISUP {k}: {stats['TCIA_Target'][k]:,}")

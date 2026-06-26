@@ -3,7 +3,7 @@ Utility functions for the revised lesion-segmentation + MIL setting.
 
 This version matches the new project setup after 2026-06-10:
   - main voxel-level task: lesion segmentation
-  - weak supervision: TBx sparse needle-track labels and SBx/PROMIS region labels
+  - weak supervision: TCIA TBx-confirmed target lesion ROIs and SBx/PROMIS region labels
   - no grade-prediction metrics, no gland-segmentation metrics
 
 Expected model output from the revised model:
@@ -773,11 +773,11 @@ def plot_loss_curves(log_path: str, save_path: str):
             ("val_loss_total", "Val Total"),
             ("train_loss_lesion", "Train Lesion Total"),
             ("train_loss_lesion_dense", "Train Dense"),
-            ("train_loss_lesion_sparse", "Train Sparse TBx"),
+            ("train_loss_lesion_sparse", "Train TBx ROI"),
             ("train_loss_lesion_sys", "Train Sys MIL"),
             ("val_loss_lesion", "Val Lesion Total"),
             ("val_loss_lesion_dense", "Val Dense"),
-            ("val_loss_lesion_sparse", "Val Sparse TBx"),
+            ("val_loss_lesion_sparse", "Val TBx ROI"),
             ("val_loss_lesion_sys", "Val Sys MIL"),
         ]:
             if col in df.columns:
@@ -792,7 +792,7 @@ def plot_loss_curves(log_path: str, save_path: str):
         ax2 = axes[1]
         for col, label in [
             ("em_w_lesion_dense", "Dense Weight"),
-            ("em_w_lesion_sparse", "Sparse TBx Weight"),
+            ("em_w_lesion_sparse", "TBx ROI Weight"),
             ("em_w_lesion_sys", "Sys MIL Weight"),
         ]:
             if col in df.columns:
@@ -882,9 +882,9 @@ def _build_gt_slice(gt_dict: Mapping, s_idx: int):
         if target is not None and np.max(target) > 0:
             binary_target = (target[s_idx] >= positive_threshold).astype(np.float32)
             if binary_target.max() == 0:
-                # Show sampled track even when negative.
+                # Show TBx-confirmed target ROI even when benign-labelled.
                 binary_target = (target[s_idx] > 0).astype(np.float32)
-            return binary_target, f"GT: TBx Needle Track / Label (Slice {s_idx})", "autumn", 0, 1
+            return binary_target, f"GT: TBx-confirmed Target ROI (Slice {s_idx})", "autumn", 0, 1
 
     if d_type in {"TCIA", "PROMIS"}:
         zones = gt_dict.get("zones_mask")

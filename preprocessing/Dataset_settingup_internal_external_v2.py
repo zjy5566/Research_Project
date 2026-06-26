@@ -67,8 +67,8 @@ def create_internal_external_splits(df, splits_dir, external_source="PROMIS", va
     - Use remaining eligible sources for training and internal validation.
 
     Default setting:
-    - PUB: radiologist annotation, used for lesion segmentation strong-supervision baseline.
-    - TCIA: TBx/SBx, used for mixed-supervision training and internal classification validation.
+    - TCIA: TBx/SBx, used for the current biopsy-centred baseline and ablations.
+    - PUB: radiologist annotation, kept as legacy/reference dense supervision.
     - PROMIS: SBx, held out as external validation for classification/generalisation.
     """
     os.makedirs(splits_dir, exist_ok=True)
@@ -97,8 +97,8 @@ def create_internal_external_splits(df, splits_dir, external_source="PROMIS", va
     # If you later decide not to hold PROMIS entirely external, change external_source or pass a supervisor table.
     promis_external_df = promis_df.copy() if external_source == "PROMIS" else external_df.copy()
 
-    # Core experiment splits for the revised RP.
-    # N1: strong supervision baseline: Radiologist Annotation only.
+    # Core experiment splits for the older revised RP setup.
+    # Legacy N1: Radiologist Annotation only.
     exp_n1_train = pub_train_df[pub_train_df["can_seg"] == 1].copy()
     exp_n1_internal_val = pub_internal_val_df[pub_internal_val_df["can_seg"] == 1].copy()
     exp_n1_external_val = pd.DataFrame(columns=df.columns)  # no external lesion masks currently available
@@ -200,11 +200,13 @@ def create_unified_dataset(base_dir):
             if not os.path.exists(os.path.join(src_p_dir, "input_tensor.npy")):
                 continue
 
-            target_path = os.path.join(src_p_dir, "target_bx_needle_crop.nii.gz")
-            if not os.path.exists(target_path) and os.path.exists(os.path.join(src_p_dir, "tatarget_bx_needle_crop.nii.gz")):
-                target_path = os.path.join(src_p_dir, "tatarget_bx_needle_crop.nii.gz")
+            target_path = os.path.join(src_p_dir, "target_mask_crop.nii.gz")
+            if not os.path.exists(target_path) and os.path.exists(os.path.join(src_p_dir, "target_mask.nii.gz")):
+                target_path = os.path.join(src_p_dir, "target_mask.nii.gz")
 
             sys_mask_path = os.path.join(src_p_dir, "zones_mask_crop.nii.gz")
+            if not os.path.exists(sys_mask_path) and os.path.exists(os.path.join(src_p_dir, "zones_mask.nii.gz")):
+                sys_mask_path = os.path.join(src_p_dir, "zones_mask.nii.gz")
             sys_label_path = os.path.join(src_p_dir, "systematic_labels.npy")
             gland_path = os.path.join(src_p_dir, "gland_mask_crop.nii.gz")
 
@@ -223,7 +225,7 @@ def create_unified_dataset(base_dir):
                 shutil.copy2(sys_mask_path, os.path.join(dst_p_dir, "zones_mask.nii.gz"))
                 copy_sbx_labels_with_unsampled_invalid(sys_label_path, os.path.join(dst_p_dir, "systematic_labels_12.npy"))
             if has_target:
-                shutil.copy2(target_path, os.path.join(dst_p_dir, "target_bx.nii.gz"))
+                shutil.copy2(target_path, os.path.join(dst_p_dir, "target_mask.nii.gz"))
             if has_gland:
                 shutil.copy2(gland_path, os.path.join(dst_p_dir, "gland_mask.nii.gz"))
 

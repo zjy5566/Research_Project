@@ -241,7 +241,7 @@ def save_seg_mil_vis(
     if s_target.sum() > 0:
         target_pos = (s_target >= positive_threshold).astype(np.float32)
         axes[1, 0].imshow(np.ma.masked_where(target_pos == 0, target_pos), cmap="autumn", alpha=0.55)
-    axes[1, 0].set_title("TBx positive needle-track voxels")
+    axes[1, 0].set_title("TBx-positive target ROI voxels")
     axes[1, 0].axis("off")
 
     axes[1, 1].imshow(s_img, cmap="gray")

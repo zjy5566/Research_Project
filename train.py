@@ -320,7 +320,7 @@ def main():
             print(
                 "Curriculum/task status | "
                 f"Dense: {int(criterion.is_enabled('lesion_dense'))} | "
-                f"Sparse TBx: {int(criterion.is_enabled('lesion_sparse'))} | "
+                f"TBx ROI: {int(criterion.is_enabled('lesion_sparse'))} | "
                 f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))}"
             )
 
@@ -336,7 +336,7 @@ def main():
         print("--- Lesion EM / Loss Multipliers ---")
         print(
             f"Dense: {current_weights.get('lesion_dense', 1.0):.3f} | "
-            f"Sparse TBx: {current_weights.get('lesion_sparse', 1.0):.3f} | "
+            f"TBx ROI: {current_weights.get('lesion_sparse', 1.0):.3f} | "
             f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f}"
         )
 

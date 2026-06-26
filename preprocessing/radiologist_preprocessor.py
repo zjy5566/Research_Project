@@ -126,7 +126,7 @@ class ProstateDataPreprocessor:
         # 6. 多模态堆叠并执行前景局部归一化 (传入 final_zone)
         stacked_img = np.stack([
             self.normalize_array(t2_arr, final_zone), 
-            # self.normalize_array(dwi_arr, final_zone), 
+            self.normalize_array(dwi_arr, final_zone), 
             self.normalize_array(adc_arr, final_zone)
         ], axis=0).astype(np.float32)
 
@@ -136,6 +136,9 @@ class ProstateDataPreprocessor:
 
         # 8. 保存处理后的结果
         np.save(os.path.join(self.output_dir, f"{patient_id}_img.npy"), stacked_img)
+        # stacked_img_nii = sitk.GetImageFromArray(stacked_img, isVector=False)
+        # stacked_img_nii.CopyInformation(t2_crop)
+        # sitk.WriteImage(stacked_img_nii, os.path.join(self.output_dir, f"{patient_id}_img.nii.gz"))
         np.save(os.path.join(self.output_dir, f"{patient_id}_lab.npy"), final_label)
         np.save(os.path.join(self.output_dir, f"{patient_id}_zone.npy"), final_zone)
 

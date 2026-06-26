@@ -88,7 +88,7 @@ if __name__ == "__main__":
     
     # 【测试例 1】：查看 4D 多模态图像 (3, 32, 64, 64)
     # viewer = VolumeViewer(r'F:\RP_dataset\Target biosy\Processed_TCIA\Prostate-MRI-US-Biopsy-0001_90221\input_tensor.npy')
-    # viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI_dwi\000_img.npy')
+    viewer = VolumeViewer(r'F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI\000_img.npy')
 
     # viewer=VolumeViewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_dwi\P-10104751\input_tensor.npy')
     
@@ -98,5 +98,5 @@ if __name__ == "__main__":
     
     # 【测试例 3】：查看 1D 向量标签
     # npy_viewer(r'F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_Labels_NPY\P-12743658.npy')
-    npy_viewer(r'F:\RP_dataset\Unified_Dataset\TCIA_0005_24293\systematic_labels_12.npy')
+    # npy_viewer(r'F:\RP_dataset\Unified_Dataset\TCIA_0005_24293\systematic_labels_12.npy')
     # npy_viewer(r'F:\RP_dataset\Unified_Dataset\PROMIS_P-64863962\systematic_labels_20.npy')

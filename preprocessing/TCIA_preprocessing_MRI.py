@@ -4,6 +4,13 @@ import numpy as np
 import SimpleITK as sitk
 from tqdm import tqdm
 
+def find_existing_file(src_path, candidates):
+    for name in candidates:
+        path = os.path.join(src_path, name)
+        if os.path.exists(path):
+            return path
+    return None
+
 # --- 1. 核心配准函数 (保持不变) ---
 def register_images(fixed_image, moving_image, is_label=False):
     fixed_image = sitk.Cast(fixed_image, sitk.sitkFloat32)
@@ -83,23 +90,40 @@ def normalize_array(img, mask_arr):
     return (arr - mean_val) / (std_val + 1e-8)
 
 
+def crop_and_save_label(label_path, mask_res, reference_crop, output_path):
+    label = sitk.ReadImage(label_path)
+    label_res = resample_to_spacing(label, is_label=True)
+    label_crop = mask_centered_crop(label_res, mask_res)
+    label_crop.CopyInformation(reference_crop)
+    sitk.WriteImage(label_crop, output_path)
+
+
 # --- 5. 单个病例处理流程 ---
 def process_single_patient(folder_name, src_path, dst_root):
-    t2_file = os.path.join(src_path, 't2.nii.gz')
-    adc_file = os.path.join(src_path, 'adc.nii.gz')
-    dwi_file = os.path.join(src_path, 'dwi.nii.gz')
-    mask_file = os.path.join(src_path, 'gland_mask.nii.gz') 
-    
-    # 扩展：寻找额外的 Mask 文件和 NPY 文件
-    target_mask_file = os.path.join(src_path, 'target_mask.nii.gz') # 由 STL 生成的靶点
-    needle_mask_file = os.path.join(src_path, 'target_bx_needle.nii.gz') # 由 Excel 坐标生成的针道
-    zones_mask_file = os.path.join(src_path, 'zones_mask.nii.gz') # 由 12 分区算法生成的系统活检分区
-    sys_labels_file = os.path.join(src_path, 'systematic_labels.npy') # 系统活检结果
+    t2_file = find_existing_file(src_path, ['t2.nii.gz', 'T2.nii.gz', 't2w.nii.gz'])
+    adc_file = find_existing_file(src_path, ['adc.nii.gz', 'ADC.nii.gz'])
+    dwi_file = find_existing_file(src_path, ['dwi.nii.gz', 'DWI.nii.gz', 'hbv.nii.gz'])
+    mask_file = find_existing_file(
+        src_path,
+        ['gland_mask.nii.gz', 'prostate_mask.nii.gz', 'prostate_surface_mask.nii.gz'],
+    )
+    target_mask_file = find_existing_file(
+        src_path,
+        ['target_mask.nii.gz', 'target_lesion_mask.nii.gz'],
+    )
+    zones_mask_file = find_existing_file(
+        src_path,
+        ['zones_mask.nii.gz', 'systematic_zones_mask.nii.gz'],
+    )
+    sys_labels_file = find_existing_file(
+        src_path,
+        ['systematic_labels.npy', 'systematic_labels_12.npy'],
+    )
     
     save_dir = os.path.join(dst_root, folder_name)
 
-    # 1. 检查四要素是否齐全 (T2, ADC, DWI, Mask)
-    if not all([os.path.exists(f) for f in [t2_file, adc_file, dwi_file, mask_file]]):
+    # Required inputs for building the concatenated MRI tensor.
+    if not all([t2_file, adc_file, dwi_file, mask_file]):
         return "MISSING_DATA"
 
     try:
@@ -126,41 +150,6 @@ def process_single_patient(folder_name, src_path, dst_root):
         dwi_crop = mask_centered_crop(dwi_reg, mask_res)
         mask_crop = mask_centered_crop(mask_res, mask_res)
 
-        # 保存主要影像
-        sitk.WriteImage(t2_crop, os.path.join(save_dir, 't2_crop.nii.gz'))
-        sitk.WriteImage(adc_crop, os.path.join(save_dir, 'adc_crop.nii.gz'))
-        sitk.WriteImage(dwi_crop, os.path.join(save_dir, 'dwi_crop.nii.gz'))
-        sitk.WriteImage(mask_crop, os.path.join(save_dir, 'gland_mask_crop.nii.gz'))
-
-        # ========================================================
-        # [新增] 额外掩膜处理流程：完全沿用 T2/Gland 的裁剪逻辑
-        # ========================================================
-        # 1. 靶点 (Target STL 转化来的)
-        if os.path.exists(target_mask_file):
-            t_mask = sitk.ReadImage(target_mask_file)
-            t_mask_res = resample_to_spacing(t_mask, is_label=True)
-            # 使用前面算好的腺体 mask_res 作为参照进行空间切割
-            t_mask_crop = mask_centered_crop(t_mask_res, mask_res)
-            sitk.WriteImage(t_mask_crop, os.path.join(save_dir, 'target_mask_crop.nii.gz'))
-
-        # 2. 针道 (Excel 坐标生成)
-        if os.path.exists(needle_mask_file):
-            n_mask = sitk.ReadImage(needle_mask_file)
-            n_mask_res = resample_to_spacing(n_mask, is_label=True)
-            n_mask_crop = mask_centered_crop(n_mask_res, mask_res)
-            sitk.WriteImage(n_mask_crop, os.path.join(save_dir, 'target_bx_needle_crop.nii.gz'))
-
-        # 3. 12 分区系统活检掩膜
-        if os.path.exists(zones_mask_file):
-            z_mask = sitk.ReadImage(zones_mask_file)
-            z_mask_res = resample_to_spacing(z_mask, is_label=True)
-            z_mask_crop = mask_centered_crop(z_mask_res, mask_res)
-            sitk.WriteImage(z_mask_crop, os.path.join(save_dir, 'zones_mask_crop.nii.gz'))
-            
-        # 4. 拷贝系统活检结果的 NPY 文件
-        if os.path.exists(sys_labels_file):
-            shutil.copy2(sys_labels_file, os.path.join(save_dir, 'systematic_labels.npy'))
-
         # ========================================================
         # 提取 mask 数组并传入归一化函数构建多通道张量
         # ========================================================
@@ -173,6 +162,31 @@ def process_single_patient(folder_name, src_path, dst_root):
         ], axis=0)
         
         np.save(os.path.join(save_dir, 'input_tensor.npy'), input_tensor)
+
+        input_tensor_vector = np.moveaxis(input_tensor.astype(np.float32), 0, -1)
+        input_tensor_img = sitk.GetImageFromArray(input_tensor_vector, isVector=True)
+        input_tensor_img.CopyInformation(t2_crop)
+        sitk.WriteImage(input_tensor_img, os.path.join(save_dir, 'input_tensor.nii.gz'))
+
+        if target_mask_file:
+            crop_and_save_label(
+                target_mask_file,
+                mask_res,
+                t2_crop,
+                os.path.join(save_dir, 'target_mask.nii.gz'),
+            )
+
+        if zones_mask_file:
+            crop_and_save_label(
+                zones_mask_file,
+                mask_res,
+                t2_crop,
+                os.path.join(save_dir, 'zones_mask.nii.gz'),
+            )
+
+        if sys_labels_file:
+            shutil.copy2(sys_labels_file, os.path.join(save_dir, 'systematic_labels.npy'))
+
         return "SUCCESS"
     except Exception as e:
         print(f"\n[Error] {folder_name}: {e}")

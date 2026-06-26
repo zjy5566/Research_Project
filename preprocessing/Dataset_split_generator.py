@@ -5,17 +5,21 @@ This script does not copy, rename, or preprocess image files. It only reads an
 existing registry CSV and creates reproducible train/internal-validation/external-
 validation CSV files.
 
-Default experiment design:
+Default experiment design after 2026-06-23:
+    B1: TCIA TBx-confirmed radiologist target lesion ROIs only.
+    B2: TCIA SBx region supervision only.
+    B3: TCIA TBx-confirmed target ROIs + TCIA SBx supervision.
+
+Legacy/reference splits are also written:
     N1: PUB radiologist annotations only.
     N2: PUB + TCIA TBx supervision only.
     N3: PUB + TCIA SBx supervision only.
     N4: PUB + TCIA TBx and SBx mixed supervision.
 
-Training supervision differs across N1-N4, but all experiments use the same
-internal evaluation cohort:
-    - PUB internal-validation cases for lesion-level metrics;
-    - TCIA internal-validation cases with full biopsy labels for patient-level
-      and region-level metrics.
+Training supervision differs across experiments. The B-series uses TCIA-only
+internal evaluation so the new baseline is not framed around PUB radiologist
+annotation. The legacy N-series still uses the older common PUB + TCIA internal
+evaluation cohort.
 
 PROMIS is held out as the external validation source for every experiment.
 """
@@ -113,12 +117,12 @@ def _prepare_registry(df: pd.DataFrame) -> pd.DataFrame:
 
     def supervision_type(row: pd.Series) -> str:
         if row["source"] == "PUB":
-            return "radiologist_annotation"
+            return "pub_radiologist_annotation"
         if row["source"] == "TCIA":
             if row["can_tbx"] and row["can_sbx"]:
-                return "tbx_and_sbx"
+                return "tbx_confirmed_roi_and_sbx"
             if row["can_tbx"]:
-                return "tbx_only"
+                return "tbx_confirmed_roi_only"
             if row["can_sbx"]:
                 return "sbx_only"
         if row["source"] == "PROMIS" and row["can_sbx"]:
@@ -133,15 +137,15 @@ def _make_tbx_only_view(df: pd.DataFrame) -> pd.DataFrame:
     """Keep TBx-labelled TCIA cases and hide SBx supervision in the CSV.
 
     Cases that possess both TBx and SBx labels are retained, but their SBx
-    availability flags are set to zero. Therefore N2 exposes only TBx
-    supervision to the dataset/loss pipeline.
+    availability flags are set to zero. Therefore this view exposes only
+    TBx-confirmed target ROI supervision to the dataset/loss pipeline.
     """
     out = df[df["can_tbx"] == 1].copy()
     out["has_sys_12"] = 0
     out["has_sys_20"] = 0
     out["can_sbx"] = 0
     out["can_cls"] = out["can_tbx"]
-    out["supervision_type"] = "tbx_only_for_experiment"
+    out["supervision_type"] = "tbx_confirmed_roi_only_for_experiment"
     return out
 
 
@@ -183,13 +187,10 @@ def create_split_csvs(
 ) -> Dict[str, pd.DataFrame]:
     """Create experiment CSV files from an existing registry CSV.
 
-    PUB and TCIA are split once, and the same patient partitions are reused
-    across N1-N4. Training CSVs expose only the supervision allowed by each
-    experiment, whereas all N1-N4 internal-validation CSVs use the same common
-    evaluation cohort with the original TCIA TBx/SBx flags preserved. This
-    allows every experiment to report patient-level and region-level metrics
-    on exactly the same cases. PROMIS is never included in training or internal
-    validation.
+    PUB and TCIA are split once, and the same patient partitions are reused.
+    B-series training CSVs are TCIA-only. Legacy N-series CSVs keep the older
+    PUB + TCIA setup for backwards comparison. PROMIS is never included in
+    training or internal validation.
     """
     if not os.path.exists(registry_csv):
         raise FileNotFoundError(f"Registry CSV not found: {registry_csv}")
@@ -242,6 +243,27 @@ def create_split_csvs(
         tcia_common_internal_eval,
     )
 
+    # ------------------------------------------------------------------
+    # B-series: new TCIA-centred experiment story
+    # ------------------------------------------------------------------
+    # B1 is the main baseline: target-biopsy-confirmed radiologist target
+    # lesion ROIs only. B2 and B3 test whether adding biopsy-region
+    # supervision changes localisation/clinical performance.
+    b1_train = _make_tbx_only_view(tcia_train)
+    b1_internal_val = tcia_common_internal_eval.copy()
+    b1_external_val = promis_external.copy()
+
+    b2_train = _make_sbx_only_view(tcia_train)
+    b2_internal_val = tcia_common_internal_eval.copy()
+    b2_external_val = promis_external.copy()
+
+    b3_train = tcia_train[tcia_train["can_cls"] == 1].copy()
+    b3_internal_val = tcia_common_internal_eval.copy()
+    b3_external_val = promis_external.copy()
+
+    # ------------------------------------------------------------------
+    # Legacy/reference N-series: older PUB-centred setup
+    # ------------------------------------------------------------------
     # N1: train with PUB radiologist annotations only.
     n1_train = pub_train[pub_train["can_seg"] == 1].copy()
     n1_internal_val = common_internal_val.copy()
@@ -283,6 +305,19 @@ def create_split_csvs(
         "TCIA_common_internal_evaluation.csv": (
             tcia_common_internal_eval.copy()
         ),
+
+        # B-series: TCIA-centred baseline and ablations.
+        "B1_TCIA_TBx_baseline_train.csv": b1_train,
+        "B1_TCIA_TBx_baseline_internal_val.csv": b1_internal_val,
+        "B1_PROMIS_external_val.csv": b1_external_val,
+
+        "B2_TCIA_SBx_only_train.csv": b2_train,
+        "B2_TCIA_SBx_only_internal_val.csv": b2_internal_val,
+        "B2_PROMIS_external_val.csv": b2_external_val,
+
+        "B3_TCIA_TBx_SBx_train.csv": b3_train,
+        "B3_TCIA_TBx_SBx_internal_val.csv": b3_internal_val,
+        "B3_PROMIS_external_val.csv": b3_external_val,
 
         # N1.
         "N1_radiologist_only_train.csv": n1_train,
