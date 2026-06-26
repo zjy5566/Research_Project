@@ -495,6 +495,8 @@ class MixedSupervisionLoss(nn.Module):
             "batch_size": int(batch_size),
             "lesion_dense_cases": 0,
             "lesion_sparse_cases": 0,
+            "lesion_sparse_has_target_cases": 0,
+            "lesion_sparse_positive_cases": 0,
             "lesion_sparse_voxels": 0,
             "lesion_sys_cases": 0,
             "lesion_sys_regions": 0,
@@ -512,6 +514,21 @@ class MixedSupervisionLoss(nn.Module):
 
         if target_mask is not None:
             target_mask_device = target_mask.to(device)
+            loss_counts["lesion_sparse_has_target_cases"] = int(has_target.sum().detach().cpu().item())
+
+            if has_target.any():
+                if self.use_tbx_positive_only_loss:
+                    target_case_voxels = target_mask_device[has_target] >= self.positive_threshold
+                else:
+                    target_case_voxels = target_mask_device[has_target] > 0
+                target_case_has_voxels = target_case_voxels.reshape(target_case_voxels.size(0), -1).any(dim=1)
+                loss_counts["lesion_sparse_positive_cases"] = int(
+                    target_case_has_voxels.sum().detach().cpu().item()
+                )
+                loss_counts["lesion_sparse_voxels"] = int(
+                    target_case_voxels.sum().detach().cpu().item()
+                )
+
             raw_losses["lesion_sparse"], active = self._sparse_tbx_loss(
                 lesion_logits=lesion_logits,
                 target_mask=target_mask_device,
@@ -519,12 +536,7 @@ class MixedSupervisionLoss(nn.Module):
             )
             active_tasks["lesion_sparse"] = float(active)
             if active:
-                if self.use_tbx_positive_only_loss:
-                    valid_target_mask = target_mask_device[has_target] >= self.positive_threshold
-                else:
-                    valid_target_mask = target_mask_device[has_target] > 0
                 loss_counts["lesion_sparse_cases"] = int(has_target.sum().detach().cpu().item())
-                loss_counts["lesion_sparse_voxels"] = int(valid_target_mask.sum().detach().cpu().item())
 
         if region_logits is not None and sys_labels is not None:
             region_logits_device = region_logits.to(device)

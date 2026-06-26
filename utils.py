@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, average_precision_score
+from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, average_precision_score, roc_curve
 from tqdm import tqdm
 
 from config import Config
@@ -70,6 +70,25 @@ def compute_dice(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5)
     denominator = pred.sum(dim=1) + target.sum(dim=1)
     dice = (2.0 * intersection + smooth) / (denominator + smooth)
     return float(dice.mean().detach().cpu().item())
+
+
+def compute_dice_per_case(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> np.ndarray:
+    """Per-case Dice values for reporting mean +/- SD."""
+    pred = pred.float().contiguous().view(pred.shape[0], -1)
+    target = target.float().contiguous().view(target.shape[0], -1)
+    intersection = (pred * target).sum(dim=1)
+    denominator = pred.sum(dim=1) + target.sum(dim=1)
+    dice = (2.0 * intersection + smooth) / (denominator + smooth)
+    return dice.detach().cpu().numpy().astype(np.float64)
+
+
+def summarise_values(values) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {"mean": 0.0, "std": 0.0, "n": 0}
+    std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+    return {"mean": float(arr.mean()), "std": std, "n": int(arr.size)}
 
 
 def compute_f1(preds: torch.Tensor, targets: torch.Tensor) -> float:
@@ -114,6 +133,58 @@ def safe_auprc(y_true, y_score) -> float:
         return float(average_precision_score(y_true, y_score))
     except Exception:
         return 0.0
+
+
+def operating_point_metrics(
+    y_true,
+    y_score,
+    fixed_specificity: float = 0.90,
+    fixed_sensitivity: float = 0.90,
+) -> Dict[str, float]:
+    """Return ROC operating-point metrics.
+
+    Reports sensitivity at a minimum fixed specificity and specificity at a
+    minimum fixed sensitivity. Thresholds are selected from sklearn's ROC curve.
+    """
+    y_true = np.asarray(y_true).astype(np.int64)
+    y_score = np.asarray(y_score).astype(np.float32)
+    if len(y_true) == 0 or len(np.unique(y_true)) < 2:
+        return {
+            "fixed_spec_target": float(fixed_specificity),
+            "sens_at_fixed_spec": 0.0,
+            "actual_spec_at_fixed_spec": 0.0,
+            "threshold_at_fixed_spec": float("nan"),
+            "fixed_sens_target": float(fixed_sensitivity),
+            "spec_at_fixed_sens": 0.0,
+            "actual_sens_at_fixed_sens": 0.0,
+            "threshold_at_fixed_sens": float("nan"),
+        }
+
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, drop_intermediate=False)
+    specificity = 1.0 - fpr
+
+    spec_candidates = np.where(specificity >= fixed_specificity)[0]
+    if spec_candidates.size > 0:
+        idx_spec = spec_candidates[np.argmax(tpr[spec_candidates])]
+    else:
+        idx_spec = int(np.argmax(specificity))
+
+    sens_candidates = np.where(tpr >= fixed_sensitivity)[0]
+    if sens_candidates.size > 0:
+        idx_sens = sens_candidates[np.argmax(specificity[sens_candidates])]
+    else:
+        idx_sens = int(np.argmax(tpr))
+
+    return {
+        "fixed_spec_target": float(fixed_specificity),
+        "sens_at_fixed_spec": float(tpr[idx_spec]),
+        "actual_spec_at_fixed_spec": float(specificity[idx_spec]),
+        "threshold_at_fixed_spec": float(thresholds[idx_spec]),
+        "fixed_sens_target": float(fixed_sensitivity),
+        "spec_at_fixed_sens": float(specificity[idx_sens]),
+        "actual_sens_at_fixed_sens": float(tpr[idx_sens]),
+        "threshold_at_fixed_sens": float(thresholds[idx_sens]),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -255,10 +326,23 @@ class LesionMILEvaluator:
       - voxel-level lesion probability map pooled manually inside zones.
     """
 
-    def __init__(self, prob_threshold: float = 0.5, positive_threshold: int = 1, invalid_sys_label: int = -1):
+    def __init__(
+        self,
+        prob_threshold: float = 0.5,
+        positive_threshold: int = 1,
+        invalid_sys_label: int = -1,
+        fixed_specificity: Optional[float] = None,
+        fixed_sensitivity: Optional[float] = None,
+    ):
         self.prob_threshold = float(prob_threshold)
         self.positive_threshold = int(positive_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
+        if fixed_specificity is None:
+            fixed_specificity = _cfg("FIXED_SPECIFICITY_TARGET", 0.90)
+        if fixed_sensitivity is None:
+            fixed_sensitivity = _cfg("FIXED_SENSITIVITY_TARGET", 0.90)
+        self.fixed_specificity = float(fixed_specificity)
+        self.fixed_sensitivity = float(fixed_sensitivity)
 
         self.patient_true = []
         self.patient_score = []
@@ -347,8 +431,7 @@ class LesionMILEvaluator:
                 return float(lesion_prob_3d[gland_mask].max().detach().cpu().item())
         return float(lesion_prob_3d.max().detach().cpu().item())
 
-    @staticmethod
-    def _binary_metrics(y_true, y_score, threshold: float) -> Dict[str, float]:
+    def _binary_metrics(self, y_true, y_score, threshold: float) -> Dict[str, float]:
         y_true = np.asarray(y_true).astype(np.int64)
         y_score = np.asarray(y_score).astype(np.float32)
         if len(y_true) == 0:
@@ -359,6 +442,12 @@ class LesionMILEvaluator:
                 "auc": 0.0,
                 "auprc": 0.0,
                 "n": 0,
+                **operating_point_metrics(
+                    y_true,
+                    y_score,
+                    fixed_specificity=self.fixed_specificity,
+                    fixed_sensitivity=self.fixed_sensitivity,
+                ),
             }
         y_pred = (y_score >= threshold).astype(np.int64)
         tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -371,6 +460,12 @@ class LesionMILEvaluator:
             "auc": safe_auc(y_true, y_score),
             "auprc": safe_auprc(y_true, y_score),
             "n": int(len(y_true)),
+            **operating_point_metrics(
+                y_true,
+                y_score,
+                fixed_specificity=self.fixed_specificity,
+                fixed_sensitivity=self.fixed_sensitivity,
+            ),
         }
 
     def compute_metrics(self) -> Dict[str, float]:
@@ -383,12 +478,28 @@ class LesionMILEvaluator:
             "patient_auc": patient["auc"],
             "patient_auprc": patient["auprc"],
             "patient_n": patient["n"],
+            "patient_fixed_spec_target": patient["fixed_spec_target"],
+            "patient_sens_at_fixed_spec": patient["sens_at_fixed_spec"],
+            "patient_actual_spec_at_fixed_spec": patient["actual_spec_at_fixed_spec"],
+            "patient_threshold_at_fixed_spec": patient["threshold_at_fixed_spec"],
+            "patient_fixed_sens_target": patient["fixed_sens_target"],
+            "patient_spec_at_fixed_sens": patient["spec_at_fixed_sens"],
+            "patient_actual_sens_at_fixed_sens": patient["actual_sens_at_fixed_sens"],
+            "patient_threshold_at_fixed_sens": patient["threshold_at_fixed_sens"],
             "region_sens": region["sens"],
             "region_spec": region["spec"],
             "region_bacc": region["bacc"],
             "region_auc": region["auc"],
             "region_auprc": region["auprc"],
             "region_n": region["n"],
+            "region_fixed_spec_target": region["fixed_spec_target"],
+            "region_sens_at_fixed_spec": region["sens_at_fixed_spec"],
+            "region_actual_spec_at_fixed_spec": region["actual_spec_at_fixed_spec"],
+            "region_threshold_at_fixed_spec": region["threshold_at_fixed_spec"],
+            "region_fixed_sens_target": region["fixed_sens_target"],
+            "region_spec_at_fixed_sens": region["spec_at_fixed_sens"],
+            "region_actual_sens_at_fixed_sens": region["actual_sens_at_fixed_sens"],
+            "region_threshold_at_fixed_sens": region["threshold_at_fixed_sens"],
         }
 
 
@@ -432,6 +543,9 @@ class MetricTracker:
         self.loss_lesion_sys = AverageMeter()
 
         self.lesion_dice = AverageMeter()
+        self.lesion_dice_values = []
+        self.lesion_dice_std = 0.0
+        self.lesion_dice_n = 0
         self.lesion_f1 = AverageMeter()
         self.lesion_sens = AverageMeter()
         self.lesion_spec = AverageMeter()
@@ -442,6 +556,14 @@ class MetricTracker:
         self.patient_auc = 0.0
         self.patient_auprc = 0.0
         self.patient_n = 0
+        self.patient_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.90))
+        self.patient_sens_at_fixed_spec = 0.0
+        self.patient_actual_spec_at_fixed_spec = 0.0
+        self.patient_threshold_at_fixed_spec = float("nan")
+        self.patient_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
+        self.patient_spec_at_fixed_sens = 0.0
+        self.patient_actual_sens_at_fixed_sens = 0.0
+        self.patient_threshold_at_fixed_sens = float("nan")
 
         self.region_bacc = 0.0
         self.region_sens = 0.0
@@ -449,6 +571,14 @@ class MetricTracker:
         self.region_auc = 0.0
         self.region_auprc = 0.0
         self.region_n = 0
+        self.region_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.90))
+        self.region_sens_at_fixed_spec = 0.0
+        self.region_actual_spec_at_fixed_spec = 0.0
+        self.region_threshold_at_fixed_spec = float("nan")
+        self.region_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
+        self.region_spec_at_fixed_sens = 0.0
+        self.region_actual_sens_at_fixed_sens = 0.0
+        self.region_threshold_at_fixed_sens = float("nan")
 
         self.em_w_lesion_dense = AverageMeter()
         self.em_w_lesion_sparse = AverageMeter()
@@ -462,6 +592,8 @@ class MetricTracker:
         self.loss_num_cases = 0
         self.loss_dense_cases = 0
         self.loss_sparse_cases = 0
+        self.loss_sparse_has_target_cases = 0
+        self.loss_sparse_positive_cases = 0
         self.loss_sparse_voxels = 0
         self.loss_sys_cases = 0
         self.loss_sys_regions = 0
@@ -517,6 +649,8 @@ class MetricTracker:
         batch_n = int(loss_counts.get("batch_size", 1) or 1)
         dense_n = int(loss_counts.get("lesion_dense_cases", 0) or 0)
         sparse_case_n = int(loss_counts.get("lesion_sparse_cases", 0) or 0)
+        sparse_has_target_n = int(loss_counts.get("lesion_sparse_has_target_cases", sparse_case_n) or 0)
+        sparse_positive_n = int(loss_counts.get("lesion_sparse_positive_cases", 0) or 0)
         sparse_voxel_n = int(loss_counts.get("lesion_sparse_voxels", 0) or 0)
         sys_case_n = int(loss_counts.get("lesion_sys_cases", 0) or 0)
         sys_region_n = int(loss_counts.get("lesion_sys_regions", 0) or 0)
@@ -525,6 +659,8 @@ class MetricTracker:
         self.loss_num_cases += batch_n
         self.loss_dense_cases += dense_n
         self.loss_sparse_cases += sparse_case_n
+        self.loss_sparse_has_target_cases += sparse_has_target_n
+        self.loss_sparse_positive_cases += sparse_positive_n
         self.loss_sparse_voxels += sparse_voxel_n
         self.loss_sys_cases += sys_case_n
         self.loss_sys_regions += sys_region_n
@@ -548,6 +684,24 @@ class MetricTracker:
             self.active_lesion_sparse.update(active_tasks.get("lesion_sparse", 0.0))
             self.active_lesion_sys.update(active_tasks.get("lesion_sys", 0.0))
 
+    def update_lesion_dice_values(self, values):
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        self.lesion_dice_values.extend(values.tolist())
+        summary = summarise_values(self.lesion_dice_values)
+        self.lesion_dice.avg = summary["mean"]
+        self.lesion_dice.sum = summary["mean"] * summary["n"]
+        self.lesion_dice.count = summary["n"]
+        self.lesion_dice.val = float(values[-1])
+        self.lesion_dice_std = summary["std"]
+        self.lesion_dice_n = summary["n"]
+
+    @staticmethod
+    def _ratio(num: int, den: int) -> float:
+        return float(num) / float(den) if den else 0.0
+
     def print_train_summary(self) -> str:
         return (
             f"Loss: {self.loss_total.avg:.4f} | "
@@ -560,10 +714,10 @@ class MetricTracker:
     def print_val_summary(self) -> str:
         return (
             f"Loss: {self.loss_total.avg:.4f} | "
-            f"Les-Dice: {self.lesion_dice.avg:.4f} | "
-            f"Les-F1: {self.lesion_f1.avg:.4f} | "
-            f"Patient-BAcc: {self.patient_bacc:.4f} | "
-            f"Region-BAcc: {self.region_bacc:.4f}"
+            f"Les-Dice: {self.lesion_dice.avg:.4f}+/-{self.lesion_dice_std:.4f} (n={self.lesion_dice_n}) | "
+            f"Pat Sens@Spec{self.patient_fixed_spec_target:.2f}: {self.patient_sens_at_fixed_spec:.4f} | "
+            f"Pat Spec@Sens{self.patient_fixed_sens_target:.2f}: {self.patient_spec_at_fixed_sens:.4f} | "
+            f"Region Sens@Spec{self.region_fixed_spec_target:.2f}: {self.region_sens_at_fixed_spec:.4f}"
         )
 
     def get_train_dict(self) -> Dict[str, float]:
@@ -579,10 +733,18 @@ class MetricTracker:
             "active_lesion_dense": self.active_lesion_dense.avg,
             "active_lesion_sparse": self.active_lesion_sparse.avg,
             "active_lesion_sys": self.active_lesion_sys.avg,
+            "active_lesion_dense_batch_rate": self.active_lesion_dense.avg,
+            "active_lesion_sparse_batch_rate": self.active_lesion_sparse.avg,
+            "active_lesion_sys_batch_rate": self.active_lesion_sys.avg,
             "train_loss_num_batches": self.loss_num_batches,
             "train_loss_num_cases": self.loss_num_cases,
             "train_loss_dense_cases": self.loss_dense_cases,
             "train_loss_sparse_cases": self.loss_sparse_cases,
+            "train_loss_sparse_has_target_cases": self.loss_sparse_has_target_cases,
+            "train_loss_sparse_positive_cases": self.loss_sparse_positive_cases,
+            "train_loss_sparse_positive_case_rate": self._ratio(
+                self.loss_sparse_positive_cases, self.loss_sparse_has_target_cases
+            ),
             "train_loss_sparse_voxels": self.loss_sparse_voxels,
             "train_loss_sys_cases": self.loss_sys_cases,
             "train_loss_sys_regions": self.loss_sys_regions,
@@ -596,6 +758,9 @@ class MetricTracker:
             "val_loss_lesion_sparse": self.loss_lesion_sparse.avg,
             "val_loss_lesion_sys": self.loss_lesion_sys.avg,
             "val_lesion_dice": self.lesion_dice.avg,
+            "val_lesion_dice_mean": self.lesion_dice.avg,
+            "val_lesion_dice_std": self.lesion_dice_std,
+            "val_lesion_dice_n": self.lesion_dice_n,
             "val_lesion_f1": self.lesion_f1.avg,
             "val_lesion_sens": self.lesion_sens.avg,
             "val_lesion_spec": self.lesion_spec.avg,
@@ -605,16 +770,37 @@ class MetricTracker:
             "val_patient_auc": self.patient_auc,
             "val_patient_auprc": self.patient_auprc,
             "val_patient_n": self.patient_n,
+            "val_patient_fixed_spec_target": self.patient_fixed_spec_target,
+            "val_patient_sens_at_fixed_spec": self.patient_sens_at_fixed_spec,
+            "val_patient_actual_spec_at_fixed_spec": self.patient_actual_spec_at_fixed_spec,
+            "val_patient_threshold_at_fixed_spec": self.patient_threshold_at_fixed_spec,
+            "val_patient_fixed_sens_target": self.patient_fixed_sens_target,
+            "val_patient_spec_at_fixed_sens": self.patient_spec_at_fixed_sens,
+            "val_patient_actual_sens_at_fixed_sens": self.patient_actual_sens_at_fixed_sens,
+            "val_patient_threshold_at_fixed_sens": self.patient_threshold_at_fixed_sens,
             "val_region_bacc": self.region_bacc,
             "val_region_sens": self.region_sens,
             "val_region_spec": self.region_spec,
             "val_region_auc": self.region_auc,
             "val_region_auprc": self.region_auprc,
             "val_region_n": self.region_n,
+            "val_region_fixed_spec_target": self.region_fixed_spec_target,
+            "val_region_sens_at_fixed_spec": self.region_sens_at_fixed_spec,
+            "val_region_actual_spec_at_fixed_spec": self.region_actual_spec_at_fixed_spec,
+            "val_region_threshold_at_fixed_spec": self.region_threshold_at_fixed_spec,
+            "val_region_fixed_sens_target": self.region_fixed_sens_target,
+            "val_region_spec_at_fixed_sens": self.region_spec_at_fixed_sens,
+            "val_region_actual_sens_at_fixed_sens": self.region_actual_sens_at_fixed_sens,
+            "val_region_threshold_at_fixed_sens": self.region_threshold_at_fixed_sens,
             "val_loss_num_batches": self.loss_num_batches,
             "val_loss_num_cases": self.loss_num_cases,
             "val_loss_dense_cases": self.loss_dense_cases,
             "val_loss_sparse_cases": self.loss_sparse_cases,
+            "val_loss_sparse_has_target_cases": self.loss_sparse_has_target_cases,
+            "val_loss_sparse_positive_cases": self.loss_sparse_positive_cases,
+            "val_loss_sparse_positive_case_rate": self._ratio(
+                self.loss_sparse_positive_cases, self.loss_sparse_has_target_cases
+            ),
             "val_loss_sparse_voxels": self.loss_sparse_voxels,
             "val_loss_sys_cases": self.loss_sys_cases,
             "val_loss_sys_regions": self.loss_sys_regions,
@@ -675,7 +861,7 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             idx = batch["has_lesion"] > 0
             pred_bin = (lesion_probs[idx] >= prob_threshold).float()
             target = batch["lesion_mask"][idx].float()
-            tracker.lesion_dice.update(compute_dice(pred_bin, target))
+            tracker.update_lesion_dice_values(compute_dice_per_case(pred_bin, target))
             tracker.lesion_f1.update(compute_f1(pred_bin, target))
             tracker.lesion_sens.update(compute_sens(pred_bin, target))
             tracker.lesion_spec.update(compute_spec(pred_bin, target))
@@ -722,6 +908,14 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.patient_auc = mil_metrics["patient_auc"]
     tracker.patient_auprc = mil_metrics["patient_auprc"]
     tracker.patient_n = mil_metrics["patient_n"]
+    tracker.patient_fixed_spec_target = mil_metrics["patient_fixed_spec_target"]
+    tracker.patient_sens_at_fixed_spec = mil_metrics["patient_sens_at_fixed_spec"]
+    tracker.patient_actual_spec_at_fixed_spec = mil_metrics["patient_actual_spec_at_fixed_spec"]
+    tracker.patient_threshold_at_fixed_spec = mil_metrics["patient_threshold_at_fixed_spec"]
+    tracker.patient_fixed_sens_target = mil_metrics["patient_fixed_sens_target"]
+    tracker.patient_spec_at_fixed_sens = mil_metrics["patient_spec_at_fixed_sens"]
+    tracker.patient_actual_sens_at_fixed_sens = mil_metrics["patient_actual_sens_at_fixed_sens"]
+    tracker.patient_threshold_at_fixed_sens = mil_metrics["patient_threshold_at_fixed_sens"]
 
     tracker.region_sens = mil_metrics["region_sens"]
     tracker.region_spec = mil_metrics["region_spec"]
@@ -729,6 +923,14 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.region_auc = mil_metrics["region_auc"]
     tracker.region_auprc = mil_metrics["region_auprc"]
     tracker.region_n = mil_metrics["region_n"]
+    tracker.region_fixed_spec_target = mil_metrics["region_fixed_spec_target"]
+    tracker.region_sens_at_fixed_spec = mil_metrics["region_sens_at_fixed_spec"]
+    tracker.region_actual_spec_at_fixed_spec = mil_metrics["region_actual_spec_at_fixed_spec"]
+    tracker.region_threshold_at_fixed_spec = mil_metrics["region_threshold_at_fixed_spec"]
+    tracker.region_fixed_sens_target = mil_metrics["region_fixed_sens_target"]
+    tracker.region_spec_at_fixed_sens = mil_metrics["region_spec_at_fixed_sens"]
+    tracker.region_actual_sens_at_fixed_sens = mil_metrics["region_actual_sens_at_fixed_sens"]
+    tracker.region_threshold_at_fixed_sens = mil_metrics["region_threshold_at_fixed_sens"]
 
     return tracker
 

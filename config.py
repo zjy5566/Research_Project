@@ -84,7 +84,7 @@ class Config:
         LESION_SPARSE_START_EPOCH = 1
         LESION_SYS_START_EPOCH = 1
 
-        BEST_MODEL_METRIC = "patient_bacc"
+        BEST_MODEL_METRIC = "lesion_dice"
         EXPERIMENT_TAG = "B1_TCIA_TBxROI_PosOnlyBaseline"
 
     elif EXPERIMENT_MODE == "B2_TCIA_SBX_ONLY":
@@ -343,6 +343,8 @@ class Config:
     LESION_POSITIVE_THRESHOLD = CSPC_THRESHOLD
     INVALID_SYS_LABEL = -1
     PRED_PROB_THRESHOLD = 0.5
+    FIXED_SPECIFICITY_TARGET = 0.90
+    FIXED_SENSITIVITY_TARGET = 0.90
 
     # ==========================================
     # 5. Training hyperparameters

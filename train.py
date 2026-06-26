@@ -205,10 +205,18 @@ def select_validation_metric(v_track) -> float:
 
     if metric_name in {"loss", "val_loss", "val_loss_total"}:
         return -float(v_track.loss_total.avg)
-    if metric_name == "lesion_dice":
+    if metric_name in {"lesion_dice", "dice", "val_lesion_dice"}:
         return float(v_track.lesion_dice.avg)
     if metric_name == "lesion_f1":
         return float(v_track.lesion_f1.avg)
+    if metric_name == "patient_sens_at_fixed_spec":
+        return float(getattr(v_track, "patient_sens_at_fixed_spec", 0.0))
+    if metric_name == "patient_spec_at_fixed_sens":
+        return float(getattr(v_track, "patient_spec_at_fixed_sens", 0.0))
+    if metric_name == "region_sens_at_fixed_spec":
+        return float(getattr(v_track, "region_sens_at_fixed_spec", 0.0))
+    if metric_name == "region_spec_at_fixed_sens":
+        return float(getattr(v_track, "region_spec_at_fixed_sens", 0.0))
     if metric_name == "region_bacc":
         return float(v_track.region_bacc)
     if metric_name == "region_auc":

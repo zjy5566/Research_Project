@@ -90,9 +90,9 @@ def load_model_weights(model, model_path: str, device: torch.device):
 
     try:
         model.load_state_dict(cleaned, strict=True)
-        print("✅ Loaded model weights with strict=True")
+        print("Loaded model weights with strict=True")
     except RuntimeError as err:
-        print(f"⚠️ Strict loading failed: {err}")
+        print(f"Strict loading failed: {err}")
         model_state = model.state_dict()
         matched = {
             k: v for k, v in cleaned.items()
@@ -100,7 +100,7 @@ def load_model_weights(model, model_path: str, device: torch.device):
         }
         model_state.update(matched)
         model.load_state_dict(model_state, strict=False)
-        print(f"✅ Loaded {len(matched)}/{len(model_state)} matching tensors with strict=False")
+        print(f"Loaded {len(matched)}/{len(model_state)} matching tensors with strict=False")
 
     return checkpoint if isinstance(checkpoint, dict) else {"model_state_dict": cleaned}
 
@@ -292,7 +292,7 @@ def get_model_path(test_dir: str) -> str:
         candidate = os.path.join(test_dir, name)
         if os.path.exists(candidate):
             return candidate
-    raise FileNotFoundError(f"❌ 找不到模型文件，请检查 TEST_MODEL_PATH 或 {test_dir}")
+    raise FileNotFoundError(f"Model file not found. Check TEST_MODEL_PATH or {test_dir}")
 
 
 def main():
@@ -307,9 +307,9 @@ def main():
     model_path = get_model_path(test_dir)
     test_csv = get_test_csv()
 
-    print(f"🚀 [Test Start] Model: {model_path}")
-    print(f"📄 [Test CSV]   {test_csv}")
-    print(f"📷 [Vis Output] {vis_dir}")
+    print(f"[Test Start] Model: {model_path}")
+    print(f"[Test CSV]   {test_csv}")
+    print(f"[Vis Output] {vis_dir}")
 
     test_dataset = build_dataset(test_csv)
     test_loader = DataLoader(
@@ -439,35 +439,51 @@ def main():
     mil_metrics = mil_evaluator.compute_metrics()
 
     print("\n" + "=" * 60)
-    print("🎯 TEST METRICS SUMMARY: Lesion Segmentation + MIL")
+    print("TEST METRICS SUMMARY: Lesion Segmentation + MIL")
     print("=" * 60)
-    print(f"🖼️ Visualisations saved to: {vis_dir}")
-    print(f"📊 Per-patient metrics saved to: {csv_path}\n")
+    print(f"Visualisations saved to: {vis_dir}")
+    print(f"Per-patient metrics saved to: {csv_path}\n")
 
     if df_results["Lesion_Dice"].notna().any():
         dense_df = df_results[df_results["Lesion_Dice"].notna()]
-        print("📈 Dense lesion segmentation metrics:")
+        dice_std = dense_df["Lesion_Dice"].std(ddof=1) if len(dense_df) > 1 else 0.0
+        print("Dense lesion segmentation metrics:")
         print(f"   - N:         {len(dense_df)}")
-        print(f"   - Mean Dice: {dense_df['Lesion_Dice'].mean():.4f}")
+        print(f"   - Dice:      {dense_df['Lesion_Dice'].mean():.4f} +/- {dice_std:.4f}")
         print(f"   - Mean F1:   {dense_df['Lesion_F1'].mean():.4f}")
-        print(f"   - Mean Sens: {dense_df['Lesion_Sens'].mean():.4f}")
-        if dense_df["Lesion_Spec"].notna().any():
-            print(f"   - Mean Spec: {dense_df['Lesion_Spec'].mean():.4f}")
         print()
 
-    print("📈 Patient-level MIL metrics:")
+    print("Patient-level MIL metrics:")
     print(f"   - N:     {mil_metrics['patient_n']}")
-    print(f"   - Sens:  {mil_metrics['patient_sens']:.4f}")
-    print(f"   - Spec:  {mil_metrics['patient_spec']:.4f}")
-    print(f"   - BAcc:  {mil_metrics['patient_bacc']:.4f}")
+    print(
+        f"   - Sens @ Spec>={mil_metrics['patient_fixed_spec_target']:.2f}: "
+        f"{mil_metrics['patient_sens_at_fixed_spec']:.4f} "
+        f"(actual spec={mil_metrics['patient_actual_spec_at_fixed_spec']:.4f}, "
+        f"thr={mil_metrics['patient_threshold_at_fixed_spec']:.4f})"
+    )
+    print(
+        f"   - Spec @ Sens>={mil_metrics['patient_fixed_sens_target']:.2f}: "
+        f"{mil_metrics['patient_spec_at_fixed_sens']:.4f} "
+        f"(actual sens={mil_metrics['patient_actual_sens_at_fixed_sens']:.4f}, "
+        f"thr={mil_metrics['patient_threshold_at_fixed_sens']:.4f})"
+    )
     print(f"   - AUC:   {mil_metrics['patient_auc']:.4f}")
     print(f"   - AUPRC: {mil_metrics['patient_auprc']:.4f}\n")
 
-    print("📈 Region-level SBx MIL metrics:")
+    print("Region-level SBx MIL metrics:")
     print(f"   - N:     {mil_metrics['region_n']}")
-    print(f"   - Sens:  {mil_metrics['region_sens']:.4f}")
-    print(f"   - Spec:  {mil_metrics['region_spec']:.4f}")
-    print(f"   - BAcc:  {mil_metrics['region_bacc']:.4f}")
+    print(
+        f"   - Sens @ Spec>={mil_metrics['region_fixed_spec_target']:.2f}: "
+        f"{mil_metrics['region_sens_at_fixed_spec']:.4f} "
+        f"(actual spec={mil_metrics['region_actual_spec_at_fixed_spec']:.4f}, "
+        f"thr={mil_metrics['region_threshold_at_fixed_spec']:.4f})"
+    )
+    print(
+        f"   - Spec @ Sens>={mil_metrics['region_fixed_sens_target']:.2f}: "
+        f"{mil_metrics['region_spec_at_fixed_sens']:.4f} "
+        f"(actual sens={mil_metrics['region_actual_sens_at_fixed_sens']:.4f}, "
+        f"thr={mil_metrics['region_threshold_at_fixed_sens']:.4f})"
+    )
     print(f"   - AUC:   {mil_metrics['region_auc']:.4f}")
     print(f"   - AUPRC: {mil_metrics['region_auprc']:.4f}")
     print("=" * 60)
