@@ -446,7 +446,8 @@ def main():
                 "Curriculum/task status | "
                 f"Dense: {int(criterion.is_enabled('lesion_dense'))} | "
                 f"TBx ROI BCE: {int(criterion.is_enabled('lesion_sparse'))} | "
-                f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))}"
+                f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))} | "
+                f"Outside gland: {int(criterion.is_enabled('lesion_outside_gland'))}"
             )
 
         train_track = train_one_epoch(
@@ -471,7 +472,8 @@ def main():
         print(
             f"Dense: {current_weights.get('lesion_dense', 1.0):.3f} | "
             f"TBx ROI BCE: {current_weights.get('lesion_sparse', 1.0):.3f} | "
-            f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f}"
+            f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f} | "
+            f"Outside gland: {current_weights.get('lesion_outside_gland', 0.0):.3f}"
         )
 
         epoch_log = {"epoch": epoch}
@@ -487,6 +489,7 @@ def main():
                 "lesion_dense_enabled_this_epoch": int(criterion.is_enabled("lesion_dense")) if hasattr(criterion, "is_enabled") else 1,
                 "lesion_sparse_enabled_this_epoch": int(criterion.is_enabled("lesion_sparse")) if hasattr(criterion, "is_enabled") else 1,
                 "lesion_sys_enabled_this_epoch": int(criterion.is_enabled("lesion_sys")) if hasattr(criterion, "is_enabled") else 1,
+                "lesion_outside_gland_enabled_this_epoch": int(criterion.is_enabled("lesion_outside_gland")) if hasattr(criterion, "is_enabled") else 0,
             }
         )
         history.append(epoch_log)

@@ -303,6 +303,7 @@ class ProstateUnifiedDataset(Dataset):
         has_sys = has_sys_12 or has_sys_20
         has_lesion = self._as_bool(row.get("has_lesion", 0))
         has_gland = self._as_bool(row.get("has_gland", 0))
+        try_optional_gland = bool(getattr(Config, "USE_OUTSIDE_GLAND_PENALTY", False))
 
         masks_to_aug = {"target": None, "zones": None, "lesion": None, "gland": None}
 
@@ -335,19 +336,26 @@ class ProstateUnifiedDataset(Dataset):
             masks_to_aug["lesion"] = self._ensure_mask_4d(l_arr, expected_dhw, "lesion_mask")
 
         # D. Dense gland mask. PUB may store npy; TCIA/PROMIS may store nii.gz.
-        if has_gland:
+        # When outside-gland suppression is enabled, opportunistically load an
+        # existing gland mask even if an older split CSV lacks has_gland=1. This
+        # keeps historical split files usable while letting B1 add the prior.
+        if has_gland or try_optional_gland:
             g_path_nii = os.path.join(p_dir, "gland_mask.nii.gz")
             g_path_npy = os.path.join(p_dir, "gland_mask.npy")
             if os.path.exists(g_path_nii):
                 g_arr = self._load_nii(g_path_nii)
             elif os.path.exists(g_path_npy):
                 g_arr = np.load(g_path_npy)
+            elif try_optional_gland and not has_gland:
+                g_arr = None
             else:
                 raise FileNotFoundError(
                     f"has_gland=1 but neither gland_mask.nii.gz nor gland_mask.npy exists for {pid}"
                 )
-            g_arr = (g_arr > 0).astype(np.float32)
-            masks_to_aug["gland"] = self._ensure_mask_4d(g_arr, expected_dhw, "gland_mask")
+            if g_arr is not None:
+                has_gland = True
+                g_arr = (g_arr > 0).astype(np.float32)
+                masks_to_aug["gland"] = self._ensure_mask_4d(g_arr, expected_dhw, "gland_mask")
 
         # Apply spatial augmentation only to images and spatial masks.
         if self.is_train and getattr(Config, "USE_AUGMENTATION", False):

@@ -302,6 +302,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
             "loss_lesion_dense": loss_output.get("loss_lesion_dense", 0.0),
             "loss_lesion_sparse": loss_output.get("loss_lesion_sparse", 0.0),
             "loss_lesion_sys": loss_output.get("loss_lesion_sys", 0.0),
+            "loss_lesion_outside_gland": loss_output.get("loss_lesion_outside_gland", 0.0),
             "em_weights": loss_output.get("em_weights", {}),
             "active_tasks": loss_output.get("active_tasks", {}),
             "curriculum_status": loss_output.get("curriculum_status", {}),
@@ -318,6 +319,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "loss_lesion_dense": dense,
                 "loss_lesion_sparse": sparse,
                 "loss_lesion_sys": sys,
+                "loss_lesion_outside_gland": 0.0,
                 "em_weights": em_weights,
                 "active_tasks": active_tasks,
                 "curriculum_status": curriculum_status,
@@ -332,6 +334,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "loss_lesion_dense": loss_output[5],
                 "loss_lesion_sparse": loss_output[6],
                 "loss_lesion_sys": loss_output[7],
+                "loss_lesion_outside_gland": 0.0,
                 "em_weights": loss_output[9],
                 "active_tasks": loss_output[10],
                 "curriculum_status": loss_output[11],
@@ -594,6 +597,7 @@ class MetricTracker:
         self.loss_lesion_dense = AverageMeter()
         self.loss_lesion_sparse = AverageMeter()
         self.loss_lesion_sys = AverageMeter()
+        self.loss_lesion_outside_gland = AverageMeter()
 
         self.lesion_dice = AverageMeter()
         self.lesion_dice_values = []
@@ -672,10 +676,12 @@ class MetricTracker:
         self.em_w_lesion_dense = AverageMeter()
         self.em_w_lesion_sparse = AverageMeter()
         self.em_w_lesion_sys = AverageMeter()
+        self.em_w_lesion_outside_gland = AverageMeter()
 
         self.active_lesion_dense = AverageMeter()
         self.active_lesion_sparse = AverageMeter()
         self.active_lesion_sys = AverageMeter()
+        self.active_lesion_outside_gland = AverageMeter()
 
         self.loss_num_batches = 0
         self.loss_num_cases = 0
@@ -690,6 +696,9 @@ class MetricTracker:
         self.loss_sparse_negative_voxels = 0
         self.loss_sys_cases = 0
         self.loss_sys_regions = 0
+        self.loss_outside_gland_cases = 0
+        self.loss_outside_gland_voxels = 0
+        self.outside_gland_prob_mean = AverageMeter()
         self.tbx_pos_prob_mean = AverageMeter()
         self.tbx_neg_prob_mean = AverageMeter()
         self.tbx_neg_1mp_mean = AverageMeter()
@@ -713,6 +722,7 @@ class MetricTracker:
             l_dense = loss_dict["loss_lesion_dense"]
             l_sparse = loss_dict["loss_lesion_sparse"]
             l_sys = loss_dict["loss_lesion_sys"]
+            l_outside_gland = loss_dict.get("loss_lesion_outside_gland", 0.0)
             em_weights = loss_dict.get("em_weights", em_weights)
             active_tasks = loss_dict.get("active_tasks", active_tasks)
             loss_counts = loss_dict.get("loss_counts", {})
@@ -723,10 +733,12 @@ class MetricTracker:
             l_dense = args[5]
             l_sparse = args[6]
             l_sys = args[7]
+            l_outside_gland = 0.0
             loss_counts = {}
         elif len(args) >= 5:
             # Compact new order.
             total, l_tot, l_dense, l_sparse, l_sys = args[:5]
+            l_outside_gland = 0.0
             loss_counts = {}
         else:
             total = kwargs.get("total", kwargs.get("total_loss", 0.0))
@@ -734,6 +746,7 @@ class MetricTracker:
             l_dense = kwargs.get("loss_lesion_dense", 0.0)
             l_sparse = kwargs.get("loss_lesion_sparse", 0.0)
             l_sys = kwargs.get("loss_lesion_sys", 0.0)
+            l_outside_gland = kwargs.get("loss_lesion_outside_gland", 0.0)
             loss_counts = kwargs.get("loss_counts", {})
         loss_counts = loss_counts or {}
 
@@ -741,8 +754,9 @@ class MetricTracker:
             dense_active = float(active_tasks.get("lesion_dense", 0.0)) > 0
             sparse_active = float(active_tasks.get("lesion_sparse", 0.0)) > 0
             sys_active = float(active_tasks.get("lesion_sys", 0.0)) > 0
+            outside_gland_active = float(active_tasks.get("lesion_outside_gland", 0.0)) > 0
         else:
-            dense_active = sparse_active = sys_active = True
+            dense_active = sparse_active = sys_active = outside_gland_active = True
 
         batch_n = int(loss_counts.get("batch_size", 1) or 1)
         dense_n = int(loss_counts.get("lesion_dense_cases", 0) or 0)
@@ -756,6 +770,9 @@ class MetricTracker:
         sparse_negative_voxel_n = int(loss_counts.get("lesion_sparse_negative_voxels", 0) or 0)
         sys_case_n = int(loss_counts.get("lesion_sys_cases", 0) or 0)
         sys_region_n = int(loss_counts.get("lesion_sys_regions", 0) or 0)
+        outside_gland_case_n = int(loss_counts.get("lesion_outside_gland_cases", 0) or 0)
+        outside_gland_voxel_n = int(loss_counts.get("lesion_outside_gland_voxels", 0) or 0)
+        outside_gland_prob_mean = loss_counts.get("outside_gland_prob_mean", None)
         tbx_pos_prob_mean = loss_counts.get("tbx_pos_prob_mean", None)
         tbx_neg_prob_mean = loss_counts.get("tbx_neg_prob_mean", None)
         tbx_neg_1mp_mean = loss_counts.get("tbx_neg_1mp_mean", None)
@@ -775,6 +792,10 @@ class MetricTracker:
         self.loss_sparse_negative_voxels += sparse_negative_voxel_n
         self.loss_sys_cases += sys_case_n
         self.loss_sys_regions += sys_region_n
+        # Track the auxiliary prior separately so it can be monitored without
+        # conflating it with the biopsy-supervised TBx ROI BCE.
+        self.loss_outside_gland_cases += outside_gland_case_n
+        self.loss_outside_gland_voxels += outside_gland_voxel_n
 
         self.loss_total.update(total, n=batch_n)
         self.loss_lesion.update(l_tot, n=batch_n)
@@ -784,6 +805,13 @@ class MetricTracker:
             self.loss_lesion_sparse.update(l_sparse, n=max(sparse_voxel_n, sparse_case_n, 1))
         if sys_active:
             self.loss_lesion_sys.update(l_sys, n=max(sys_region_n, sys_case_n, 1))
+        if outside_gland_active:
+            self.loss_lesion_outside_gland.update(
+                l_outside_gland,
+                n=max(outside_gland_voxel_n, outside_gland_case_n, 1),
+            )
+        if outside_gland_voxel_n > 0:
+            self.outside_gland_prob_mean.update(outside_gland_prob_mean, n=outside_gland_voxel_n)
 
         if sparse_positive_voxel_n > 0:
             self.tbx_pos_prob_mean.update(tbx_pos_prob_mean, n=sparse_positive_voxel_n)
@@ -797,11 +825,13 @@ class MetricTracker:
             self.em_w_lesion_dense.update(em_weights.get("lesion_dense", 1.0))
             self.em_w_lesion_sparse.update(em_weights.get("lesion_sparse", 1.0))
             self.em_w_lesion_sys.update(em_weights.get("lesion_sys", 1.0))
+            self.em_w_lesion_outside_gland.update(em_weights.get("lesion_outside_gland", 1.0))
 
         if active_tasks is not None:
             self.active_lesion_dense.update(active_tasks.get("lesion_dense", 0.0))
             self.active_lesion_sparse.update(active_tasks.get("lesion_sparse", 0.0))
             self.active_lesion_sys.update(active_tasks.get("lesion_sys", 0.0))
+            self.active_lesion_outside_gland.update(active_tasks.get("lesion_outside_gland", 0.0))
 
     def update_lesion_dice_values(self, values):
         values = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -942,10 +972,12 @@ class MetricTracker:
             f"L_Les: {self.loss_lesion.avg:.4f} "
             f"(Dense {self.loss_lesion_dense.avg:.4f}, "
             f"Sparse {self.loss_lesion_sparse.avg:.4f}, "
-            f"Sys {self.loss_lesion_sys.avg:.4f}) | "
+            f"Sys {self.loss_lesion_sys.avg:.4f}, "
+            f"OutGland {self.loss_lesion_outside_gland.avg:.4f}) | "
             f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
             f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
-            f"1-p-: {self.tbx_neg_1mp_mean.avg:.4f}"
+            f"1-p-: {self.tbx_neg_1mp_mean.avg:.4f}, "
+            f"p(out): {self.outside_gland_prob_mean.avg:.4f}"
         )
 
     def print_val_summary(self) -> str:
@@ -958,6 +990,7 @@ class MetricTracker:
             f"TopKDice: {self.target_cspca_topk_dice.avg:.4f} | "
             f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
             f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
+            f"p(out): {self.outside_gland_prob_mean.avg:.4f}, "
             f"TBx ROI AUC/AUPRC: {self.tbx_roi_auc:.4f}/{self.tbx_roi_auprc:.4f} | "
             f"TBx ROI Sens@FPR{1.0 - self.tbx_roi_fixed_spec_target:.2f}: "
             f"{self.tbx_roi_sens_at_fixed_spec:.4f} | "
@@ -973,15 +1006,19 @@ class MetricTracker:
             "train_loss_lesion_dense": self.loss_lesion_dense.avg,
             "train_loss_lesion_sparse": self.loss_lesion_sparse.avg,
             "train_loss_lesion_sys": self.loss_lesion_sys.avg,
+            "train_loss_lesion_outside_gland": self.loss_lesion_outside_gland.avg,
             "em_w_lesion_dense": self.em_w_lesion_dense.avg,
             "em_w_lesion_sparse": self.em_w_lesion_sparse.avg,
             "em_w_lesion_sys": self.em_w_lesion_sys.avg,
+            "em_w_lesion_outside_gland": self.em_w_lesion_outside_gland.avg,
             "active_lesion_dense": self.active_lesion_dense.avg,
             "active_lesion_sparse": self.active_lesion_sparse.avg,
             "active_lesion_sys": self.active_lesion_sys.avg,
+            "active_lesion_outside_gland": self.active_lesion_outside_gland.avg,
             "active_lesion_dense_batch_rate": self.active_lesion_dense.avg,
             "active_lesion_sparse_batch_rate": self.active_lesion_sparse.avg,
             "active_lesion_sys_batch_rate": self.active_lesion_sys.avg,
+            "active_lesion_outside_gland_batch_rate": self.active_lesion_outside_gland.avg,
             "train_loss_num_batches": self.loss_num_batches,
             "train_loss_num_cases": self.loss_num_cases,
             "train_loss_dense_cases": self.loss_dense_cases,
@@ -1004,6 +1041,9 @@ class MetricTracker:
             "train_tbx_neg_1mp_mean": self.tbx_neg_1mp_mean.avg,
             "train_tbx_pos_bce": self.tbx_pos_bce.avg,
             "train_tbx_neg_bce": self.tbx_neg_bce.avg,
+            "train_loss_outside_gland_cases": self.loss_outside_gland_cases,
+            "train_loss_outside_gland_voxels": self.loss_outside_gland_voxels,
+            "train_outside_gland_prob_mean": self.outside_gland_prob_mean.avg,
             "train_loss_sys_cases": self.loss_sys_cases,
             "train_loss_sys_regions": self.loss_sys_regions,
         }
@@ -1015,6 +1055,7 @@ class MetricTracker:
             "val_loss_lesion_dense": self.loss_lesion_dense.avg,
             "val_loss_lesion_sparse": self.loss_lesion_sparse.avg,
             "val_loss_lesion_sys": self.loss_lesion_sys.avg,
+            "val_loss_lesion_outside_gland": self.loss_lesion_outside_gland.avg,
             "val_lesion_dice": self.lesion_dice.avg,
             "val_lesion_dice_mean": self.lesion_dice.avg,
             "val_lesion_dice_std": self.lesion_dice_std,
@@ -1104,6 +1145,9 @@ class MetricTracker:
             "val_tbx_neg_1mp_mean": self.tbx_neg_1mp_mean.avg,
             "val_tbx_pos_bce": self.tbx_pos_bce.avg,
             "val_tbx_neg_bce": self.tbx_neg_bce.avg,
+            "val_loss_outside_gland_cases": self.loss_outside_gland_cases,
+            "val_loss_outside_gland_voxels": self.loss_outside_gland_voxels,
+            "val_outside_gland_prob_mean": self.outside_gland_prob_mean.avg,
             "val_loss_sys_cases": self.loss_sys_cases,
             "val_loss_sys_regions": self.loss_sys_regions,
         }

@@ -119,6 +119,48 @@ def test_pub_dense_cases_do_not_enter_patient_metrics():
     assert abs(evaluator.patient_score[0] - 0.8) < 1e-6
 
 
+def test_outside_gland_penalty_uses_only_outside_gland_voxels():
+    criterion = MixedSupervisionLoss(
+        use_em_weighting=False,
+        fixed_loss_weights={
+            "lesion_dense": 0.0,
+            "lesion_sparse": 0.0,
+            "lesion_sys": 0.0,
+            "lesion_outside_gland": 0.5,
+        },
+        task_switches={
+            "lesion_dense": False,
+            "lesion_sparse": False,
+            "lesion_sys": False,
+            "lesion_outside_gland": True,
+        },
+        return_dict=True,
+    )
+
+    lesion_logits = torch.tensor([[[[[0.0, 1.0, -1.0, 2.0]]]]])
+    gland_mask = torch.tensor([[[[[0.0, 1.0, 0.0, 1.0]]]]])
+    batch = {
+        "gland_mask": gland_mask,
+        "has_gland": torch.tensor([1.0]),
+        "has_target": torch.tensor([0.0]),
+        "has_lesion": torch.tensor([0.0]),
+        "has_sys": torch.tensor([0.0]),
+    }
+
+    loss_dict = criterion({"lesion_logits": lesion_logits}, batch)
+    expected_raw = torch.nn.functional.softplus(torch.tensor([0.0, -1.0])).mean()
+
+    torch.testing.assert_close(loss_dict["loss_lesion_outside_gland"], expected_raw)
+    torch.testing.assert_close(loss_dict["total_loss"], expected_raw * 0.5)
+    counts = loss_dict["loss_counts"]
+    assert counts["lesion_outside_gland_cases"] == 1
+    assert counts["lesion_outside_gland_voxels"] == 2
+    torch.testing.assert_close(
+        torch.tensor(counts["outside_gland_prob_mean"]),
+        torch.sigmoid(torch.tensor([0.0, -1.0])).mean(),
+    )
+
+
 def test_target_cspca_dice_uses_only_positive_target_cases():
     tracker = MetricTracker()
     positive_threshold = 3
@@ -187,6 +229,7 @@ def test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound():
 if __name__ == "__main__":
     test_tbx_pos_neg_bce_uses_sampled_roi_and_ignores_unsampled()
     test_pub_dense_cases_do_not_enter_patient_metrics()
+    test_outside_gland_penalty_uses_only_outside_gland_voxels()
     test_target_cspca_dice_uses_only_positive_target_cases()
     test_tbx_roi_metrics_report_sensitivity_at_fixed_fpr()
     test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound()
