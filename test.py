@@ -36,8 +36,15 @@ def _cfg(name: str, default: Any = None) -> Any:
     return getattr(Config, name, default)
 
 
+def get_dataset_task() -> str:
+    return _cfg(
+        "TEST_DATASET_TASK",
+        _cfg("VAL_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed"))),
+    )
+
+
 def build_dataset(csv_path: str):
-    task = _cfg("TASK", _cfg("DATASET_TASK", "mixed"))
+    task = get_dataset_task()
     try:
         return ProstateUnifiedDataset(
             csv_path=csv_path,
@@ -145,18 +152,19 @@ def infer_dataset_type(batch: Dict, b: int) -> str:
 
 
 def compute_patient_label(batch: Dict, b: int, positive_threshold: int, invalid_sys_label: int) -> int:
-    """Positive if any available supervision indicates cancer/csPCa."""
+    """Biopsy-based patient label; PUB dense masks are lesion-Dice labels only."""
+    has_target = batch.get("has_target", torch.zeros(1))[b].item() > 0
+    has_sys = batch.get("has_sys", torch.zeros(1))[b].item() > 0
+    if not (has_target or has_sys):
+        return invalid_sys_label
+
     label = 0
 
-    if batch.get("has_lesion", torch.zeros(1))[b].item() > 0:
-        if batch["lesion_mask"][b].max().item() > 0:
-            label = 1
-
-    if batch.get("has_target", torch.zeros(1))[b].item() > 0:
+    if has_target:
         if batch["target_mask"][b].max().item() >= positive_threshold:
             label = 1
 
-    if batch.get("has_sys", torch.zeros(1))[b].item() > 0:
+    if has_sys:
         labels = batch["sys_labels"][b]
         valid = labels != invalid_sys_label
         if valid.any() and labels[valid].max().item() >= positive_threshold:
@@ -376,7 +384,7 @@ def main():
             gland_tensor = batch["gland_mask"][0, 0] if has_gland and "gland_mask" in batch else None
             patient_score = compute_patient_score(lesion_prob_3d, gland_tensor)
             patient_label = compute_patient_label(batch, 0, positive_threshold, invalid_sys_label)
-            patient_pred = int(patient_score >= prob_threshold)
+            patient_pred = int(patient_score >= prob_threshold) if patient_label != invalid_sys_label else np.nan
 
             # Summarise model-pooled region scores for this patient when available.
             region_positive_gt = np.nan

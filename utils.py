@@ -82,6 +82,44 @@ def compute_dice_per_case(pred: torch.Tensor, target: torch.Tensor, smooth: floa
     return dice.detach().cpu().numpy().astype(np.float64)
 
 
+def compute_topk_dice_per_case(
+    prob: torch.Tensor,
+    target: torch.Tensor,
+    mode: str = "target_volume",
+    top_percent: float = 1.0,
+    smooth: float = 1e-5,
+) -> np.ndarray:
+    """Per-case Dice from top-scoring voxels.
+
+    mode="target_volume" uses the ground-truth positive voxel count as k, so it
+    is an optimistic localisation upper bound rather than a deployable metric.
+    mode="percent" uses a fixed percentage of all voxels.
+    """
+    prob = prob.float().contiguous().view(prob.shape[0], -1)
+    target = target.float().contiguous().view(target.shape[0], -1)
+    values = []
+    for case_idx in range(prob.shape[0]):
+        target_flat = target[case_idx]
+        num_voxels = int(target_flat.numel())
+        if mode == "target_volume":
+            k = int(target_flat.sum().detach().cpu().item())
+        elif mode == "percent":
+            k = int(np.ceil(num_voxels * max(float(top_percent), 0.0) / 100.0))
+        else:
+            raise ValueError(f"Unknown top-k Dice mode: {mode}")
+        if k <= 0 or num_voxels <= 0:
+            continue
+        k = min(k, num_voxels)
+        top_idx = torch.topk(prob[case_idx], k=k, largest=True, sorted=False).indices
+        pred_flat = torch.zeros_like(target_flat)
+        pred_flat[top_idx] = 1.0
+        intersection = (pred_flat * target_flat).sum()
+        denominator = pred_flat.sum() + target_flat.sum()
+        dice = (2.0 * intersection + smooth) / (denominator + smooth)
+        values.append(float(dice.detach().cpu().item()))
+    return np.asarray(values, dtype=np.float64)
+
+
 def summarise_values(values) -> Dict[str, float]:
     arr = np.asarray(values, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
@@ -89,6 +127,18 @@ def summarise_values(values) -> Dict[str, float]:
         return {"mean": 0.0, "std": 0.0, "n": 0}
     std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
     return {"mean": float(arr.mean()), "std": std, "n": int(arr.size)}
+
+
+def configured_target_dice_thresholds() -> Tuple[float, ...]:
+    thresholds = _cfg("TARGET_DICE_SWEEP_THRESHOLDS", None)
+    if thresholds is None:
+        thresholds = np.arange(0.05, 1.00, 0.05)
+    if isinstance(thresholds, str):
+        thresholds = [float(item.strip()) for item in thresholds.split(",") if item.strip()]
+    thresholds = tuple(
+        sorted({round(float(th), 6) for th in thresholds if 0.0 <= float(th) <= 1.0})
+    )
+    return thresholds or (0.5,)
 
 
 def compute_f1(preds: torch.Tensor, targets: torch.Tensor) -> float:
@@ -138,7 +188,7 @@ def safe_auprc(y_true, y_score) -> float:
 def operating_point_metrics(
     y_true,
     y_score,
-    fixed_specificity: float = 0.90,
+    fixed_specificity: float = 0.95,
     fixed_sensitivity: float = 0.90,
 ) -> Dict[str, float]:
     """Return ROC operating-point metrics.
@@ -153,6 +203,7 @@ def operating_point_metrics(
             "fixed_spec_target": float(fixed_specificity),
             "sens_at_fixed_spec": 0.0,
             "actual_spec_at_fixed_spec": 0.0,
+            "actual_fpr_at_fixed_spec": 0.0,
             "threshold_at_fixed_spec": float("nan"),
             "fixed_sens_target": float(fixed_sensitivity),
             "spec_at_fixed_sens": 0.0,
@@ -179,6 +230,7 @@ def operating_point_metrics(
         "fixed_spec_target": float(fixed_specificity),
         "sens_at_fixed_spec": float(tpr[idx_spec]),
         "actual_spec_at_fixed_spec": float(specificity[idx_spec]),
+        "actual_fpr_at_fixed_spec": float(1.0 - specificity[idx_spec]),
         "threshold_at_fixed_spec": float(thresholds[idx_spec]),
         "fixed_sens_target": float(fixed_sensitivity),
         "spec_at_fixed_sens": float(specificity[idx_sens]),
@@ -338,7 +390,7 @@ class LesionMILEvaluator:
         self.positive_threshold = int(positive_threshold)
         self.invalid_sys_label = int(invalid_sys_label)
         if fixed_specificity is None:
-            fixed_specificity = _cfg("FIXED_SPECIFICITY_TARGET", 0.90)
+            fixed_specificity = _cfg("FIXED_SPECIFICITY_TARGET", 0.95)
         if fixed_sensitivity is None:
             fixed_sensitivity = _cfg("FIXED_SENSITIVITY_TARGET", 0.90)
         self.fixed_specificity = float(fixed_specificity)
@@ -374,9 +426,12 @@ class LesionMILEvaluator:
         for b in range(B):
             has_sys = bool(batch.get("has_sys", torch.zeros(B))[b].item() > 0)
             has_target = bool(batch.get("has_target", torch.zeros(B))[b].item() > 0)
-            has_lesion = bool(batch.get("has_lesion", torch.zeros(B))[b].item() > 0)
+            # Patient-level GT is biopsy-based. PUB dense lesion masks are used
+            # for lesion Dice only and must not enter patient BAcc/AUC.
+            if not (has_sys or has_target):
+                continue
 
-            # Patient-level GT: positive if any available supervision is positive.
+            # Patient-level GT: positive if any available biopsy supervision is positive.
             patient_gt = 0
             if has_sys and "sys_labels" in batch:
                 labels = batch["sys_labels"][b].to(device)
@@ -386,10 +441,6 @@ class LesionMILEvaluator:
             if has_target and "target_mask" in batch:
                 target_mask = batch["target_mask"][b].to(device)
                 if target_mask.max().item() >= self.positive_threshold:
-                    patient_gt = 1
-            if has_lesion and "lesion_mask" in batch:
-                lesion_mask = batch["lesion_mask"][b].to(device)
-                if lesion_mask.max().item() > 0:
                     patient_gt = 1
 
             patient_score = self._patient_score(lesion_probs[b, 0], batch, b, device)
@@ -481,6 +532,7 @@ class LesionMILEvaluator:
             "patient_fixed_spec_target": patient["fixed_spec_target"],
             "patient_sens_at_fixed_spec": patient["sens_at_fixed_spec"],
             "patient_actual_spec_at_fixed_spec": patient["actual_spec_at_fixed_spec"],
+            "patient_actual_fpr_at_fixed_spec": patient["actual_fpr_at_fixed_spec"],
             "patient_threshold_at_fixed_spec": patient["threshold_at_fixed_spec"],
             "patient_fixed_sens_target": patient["fixed_sens_target"],
             "patient_spec_at_fixed_sens": patient["spec_at_fixed_sens"],
@@ -495,6 +547,7 @@ class LesionMILEvaluator:
             "region_fixed_spec_target": region["fixed_spec_target"],
             "region_sens_at_fixed_spec": region["sens_at_fixed_spec"],
             "region_actual_spec_at_fixed_spec": region["actual_spec_at_fixed_spec"],
+            "region_actual_fpr_at_fixed_spec": region["actual_fpr_at_fixed_spec"],
             "region_threshold_at_fixed_spec": region["threshold_at_fixed_spec"],
             "region_fixed_sens_target": region["fixed_sens_target"],
             "region_spec_at_fixed_sens": region["spec_at_fixed_sens"],
@@ -549,6 +602,40 @@ class MetricTracker:
         self.lesion_f1 = AverageMeter()
         self.lesion_sens = AverageMeter()
         self.lesion_spec = AverageMeter()
+        self.target_cspca_dice = AverageMeter()
+        self.target_cspca_dice_values = []
+        self.target_cspca_dice_std = 0.0
+        self.target_cspca_dice_n = 0
+        self.target_cspca_dice_sweep_thresholds = configured_target_dice_thresholds()
+        self.target_cspca_dice_sweep_values = {
+            threshold: [] for threshold in self.target_cspca_dice_sweep_thresholds
+        }
+        self.target_cspca_best_threshold_dice = 0.0
+        self.target_cspca_best_threshold_dice_std = 0.0
+        self.target_cspca_best_threshold_dice_n = 0
+        self.target_cspca_best_threshold = float("nan")
+        self.target_cspca_topk_dice = AverageMeter()
+        self.target_cspca_topk_dice_values = []
+        self.target_cspca_topk_dice_std = 0.0
+        self.target_cspca_topk_dice_n = 0
+        self.target_cspca_top_percent = float(_cfg("TARGET_DICE_TOP_PERCENT", 1.0))
+        self.target_cspca_top_percent_dice = AverageMeter()
+        self.target_cspca_top_percent_dice_values = []
+        self.target_cspca_top_percent_dice_std = 0.0
+        self.target_cspca_top_percent_dice_n = 0
+        self.tbx_roi_true = []
+        self.tbx_roi_score = []
+        self.tbx_roi_bacc = 0.0
+        self.tbx_roi_sens = 0.0
+        self.tbx_roi_spec = 0.0
+        self.tbx_roi_auc = 0.0
+        self.tbx_roi_auprc = 0.0
+        self.tbx_roi_n = 0
+        self.tbx_roi_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
+        self.tbx_roi_sens_at_fixed_spec = 0.0
+        self.tbx_roi_actual_spec_at_fixed_spec = 0.0
+        self.tbx_roi_actual_fpr_at_fixed_spec = 0.0
+        self.tbx_roi_threshold_at_fixed_spec = float("nan")
 
         self.patient_bacc = 0.0
         self.patient_sens = 0.0
@@ -556,9 +643,10 @@ class MetricTracker:
         self.patient_auc = 0.0
         self.patient_auprc = 0.0
         self.patient_n = 0
-        self.patient_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.90))
+        self.patient_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
         self.patient_sens_at_fixed_spec = 0.0
         self.patient_actual_spec_at_fixed_spec = 0.0
+        self.patient_actual_fpr_at_fixed_spec = 0.0
         self.patient_threshold_at_fixed_spec = float("nan")
         self.patient_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
         self.patient_spec_at_fixed_sens = 0.0
@@ -571,9 +659,10 @@ class MetricTracker:
         self.region_auc = 0.0
         self.region_auprc = 0.0
         self.region_n = 0
-        self.region_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.90))
+        self.region_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
         self.region_sens_at_fixed_spec = 0.0
         self.region_actual_spec_at_fixed_spec = 0.0
+        self.region_actual_fpr_at_fixed_spec = 0.0
         self.region_threshold_at_fixed_spec = float("nan")
         self.region_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
         self.region_spec_at_fixed_sens = 0.0
@@ -593,10 +682,19 @@ class MetricTracker:
         self.loss_dense_cases = 0
         self.loss_sparse_cases = 0
         self.loss_sparse_has_target_cases = 0
+        self.loss_sparse_sampled_cases = 0
         self.loss_sparse_positive_cases = 0
+        self.loss_sparse_negative_cases = 0
         self.loss_sparse_voxels = 0
+        self.loss_sparse_positive_voxels = 0
+        self.loss_sparse_negative_voxels = 0
         self.loss_sys_cases = 0
         self.loss_sys_regions = 0
+        self.tbx_pos_prob_mean = AverageMeter()
+        self.tbx_neg_prob_mean = AverageMeter()
+        self.tbx_neg_1mp_mean = AverageMeter()
+        self.tbx_pos_bce = AverageMeter()
+        self.tbx_neg_bce = AverageMeter()
 
     def update_losses(self, *args, em_weights=None, active_tasks=None, **kwargs):
         """Update loss meters from either a loss_dict or legacy positional args.
@@ -650,18 +748,31 @@ class MetricTracker:
         dense_n = int(loss_counts.get("lesion_dense_cases", 0) or 0)
         sparse_case_n = int(loss_counts.get("lesion_sparse_cases", 0) or 0)
         sparse_has_target_n = int(loss_counts.get("lesion_sparse_has_target_cases", sparse_case_n) or 0)
+        sparse_sampled_n = int(loss_counts.get("lesion_sparse_sampled_cases", sparse_case_n) or 0)
         sparse_positive_n = int(loss_counts.get("lesion_sparse_positive_cases", 0) or 0)
+        sparse_negative_n = int(loss_counts.get("lesion_sparse_negative_cases", 0) or 0)
         sparse_voxel_n = int(loss_counts.get("lesion_sparse_voxels", 0) or 0)
+        sparse_positive_voxel_n = int(loss_counts.get("lesion_sparse_positive_voxels", 0) or 0)
+        sparse_negative_voxel_n = int(loss_counts.get("lesion_sparse_negative_voxels", 0) or 0)
         sys_case_n = int(loss_counts.get("lesion_sys_cases", 0) or 0)
         sys_region_n = int(loss_counts.get("lesion_sys_regions", 0) or 0)
+        tbx_pos_prob_mean = loss_counts.get("tbx_pos_prob_mean", None)
+        tbx_neg_prob_mean = loss_counts.get("tbx_neg_prob_mean", None)
+        tbx_neg_1mp_mean = loss_counts.get("tbx_neg_1mp_mean", None)
+        tbx_pos_bce = loss_counts.get("tbx_pos_bce", None)
+        tbx_neg_bce = loss_counts.get("tbx_neg_bce", None)
 
         self.loss_num_batches += 1
         self.loss_num_cases += batch_n
         self.loss_dense_cases += dense_n
         self.loss_sparse_cases += sparse_case_n
         self.loss_sparse_has_target_cases += sparse_has_target_n
+        self.loss_sparse_sampled_cases += sparse_sampled_n
         self.loss_sparse_positive_cases += sparse_positive_n
+        self.loss_sparse_negative_cases += sparse_negative_n
         self.loss_sparse_voxels += sparse_voxel_n
+        self.loss_sparse_positive_voxels += sparse_positive_voxel_n
+        self.loss_sparse_negative_voxels += sparse_negative_voxel_n
         self.loss_sys_cases += sys_case_n
         self.loss_sys_regions += sys_region_n
 
@@ -673,6 +784,14 @@ class MetricTracker:
             self.loss_lesion_sparse.update(l_sparse, n=max(sparse_voxel_n, sparse_case_n, 1))
         if sys_active:
             self.loss_lesion_sys.update(l_sys, n=max(sys_region_n, sys_case_n, 1))
+
+        if sparse_positive_voxel_n > 0:
+            self.tbx_pos_prob_mean.update(tbx_pos_prob_mean, n=sparse_positive_voxel_n)
+            self.tbx_pos_bce.update(tbx_pos_bce, n=sparse_positive_voxel_n)
+        if sparse_negative_voxel_n > 0:
+            self.tbx_neg_prob_mean.update(tbx_neg_prob_mean, n=sparse_negative_voxel_n)
+            self.tbx_neg_1mp_mean.update(tbx_neg_1mp_mean, n=sparse_negative_voxel_n)
+            self.tbx_neg_bce.update(tbx_neg_bce, n=sparse_negative_voxel_n)
 
         if em_weights is not None:
             self.em_w_lesion_dense.update(em_weights.get("lesion_dense", 1.0))
@@ -698,6 +817,121 @@ class MetricTracker:
         self.lesion_dice_std = summary["std"]
         self.lesion_dice_n = summary["n"]
 
+    def update_target_cspca_dice_values(self, values):
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        self.target_cspca_dice_values.extend(values.tolist())
+        summary = summarise_values(self.target_cspca_dice_values)
+        self.target_cspca_dice.avg = summary["mean"]
+        self.target_cspca_dice.sum = summary["mean"] * summary["n"]
+        self.target_cspca_dice.count = summary["n"]
+        self.target_cspca_dice.val = float(values[-1])
+        self.target_cspca_dice_std = summary["std"]
+        self.target_cspca_dice_n = summary["n"]
+
+    def update_target_cspca_aux_dice(self, probs: torch.Tensor, target: torch.Tensor):
+        if probs.numel() == 0 or target.numel() == 0:
+            return
+
+        for threshold in self.target_cspca_dice_sweep_thresholds:
+            values = compute_dice_per_case((probs >= threshold).float(), target)
+            values = values[np.isfinite(values)]
+            if values.size > 0:
+                self.target_cspca_dice_sweep_values[threshold].extend(values.tolist())
+
+        topk_values = compute_topk_dice_per_case(probs, target, mode="target_volume")
+        self._update_value_summary(
+            topk_values,
+            self.target_cspca_topk_dice_values,
+            self.target_cspca_topk_dice,
+            "target_cspca_topk_dice_std",
+            "target_cspca_topk_dice_n",
+        )
+
+        top_percent_values = compute_topk_dice_per_case(
+            probs,
+            target,
+            mode="percent",
+            top_percent=self.target_cspca_top_percent,
+        )
+        self._update_value_summary(
+            top_percent_values,
+            self.target_cspca_top_percent_dice_values,
+            self.target_cspca_top_percent_dice,
+            "target_cspca_top_percent_dice_std",
+            "target_cspca_top_percent_dice_n",
+        )
+
+    def finalize_target_cspca_aux_dice(self):
+        best_threshold = float("nan")
+        best_summary = {"mean": 0.0, "std": 0.0, "n": 0}
+        for threshold, values in self.target_cspca_dice_sweep_values.items():
+            summary = summarise_values(values)
+            if summary["n"] == 0:
+                continue
+            if summary["mean"] > best_summary["mean"]:
+                best_threshold = float(threshold)
+                best_summary = summary
+
+        self.target_cspca_best_threshold = best_threshold
+        self.target_cspca_best_threshold_dice = best_summary["mean"]
+        self.target_cspca_best_threshold_dice_std = best_summary["std"]
+        self.target_cspca_best_threshold_dice_n = best_summary["n"]
+
+    def _update_value_summary(self, values, store, meter, std_attr: str, n_attr: str):
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return
+        store.extend(values.tolist())
+        summary = summarise_values(store)
+        meter.avg = summary["mean"]
+        meter.sum = summary["mean"] * summary["n"]
+        meter.count = summary["n"]
+        meter.val = float(values[-1])
+        setattr(self, std_attr, summary["std"])
+        setattr(self, n_attr, summary["n"])
+
+    def update_tbx_roi_samples(self, y_true, y_score):
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_score = np.asarray(y_score, dtype=np.float32).reshape(-1)
+        valid = np.isfinite(y_score)
+        if valid.size == 0 or not valid.any():
+            return
+        self.tbx_roi_true.extend(y_true[valid].tolist())
+        self.tbx_roi_score.extend(y_score[valid].tolist())
+
+    def finalize_tbx_roi_metrics(self, threshold: float):
+        y_true = np.asarray(self.tbx_roi_true, dtype=np.int64)
+        y_score = np.asarray(self.tbx_roi_score, dtype=np.float32)
+        self.tbx_roi_n = int(len(y_true))
+        if self.tbx_roi_n == 0:
+            return
+
+        y_pred = (y_score >= float(threshold)).astype(np.int64)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        sens = tp / (tp + fn + 1e-8)
+        spec = tn / (tn + fp + 1e-8)
+        op = operating_point_metrics(
+            y_true,
+            y_score,
+            fixed_specificity=self.tbx_roi_fixed_spec_target,
+            fixed_sensitivity=float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90)),
+        )
+
+        self.tbx_roi_sens = float(sens)
+        self.tbx_roi_spec = float(spec)
+        self.tbx_roi_bacc = float((sens + spec) / 2.0)
+        self.tbx_roi_auc = safe_auc(y_true, y_score)
+        self.tbx_roi_auprc = safe_auprc(y_true, y_score)
+        self.tbx_roi_fixed_spec_target = op["fixed_spec_target"]
+        self.tbx_roi_sens_at_fixed_spec = op["sens_at_fixed_spec"]
+        self.tbx_roi_actual_spec_at_fixed_spec = op["actual_spec_at_fixed_spec"]
+        self.tbx_roi_actual_fpr_at_fixed_spec = op["actual_fpr_at_fixed_spec"]
+        self.tbx_roi_threshold_at_fixed_spec = op["threshold_at_fixed_spec"]
+
     @staticmethod
     def _ratio(num: int, den: int) -> float:
         return float(num) / float(den) if den else 0.0
@@ -708,13 +942,25 @@ class MetricTracker:
             f"L_Les: {self.loss_lesion.avg:.4f} "
             f"(Dense {self.loss_lesion_dense.avg:.4f}, "
             f"Sparse {self.loss_lesion_sparse.avg:.4f}, "
-            f"Sys {self.loss_lesion_sys.avg:.4f})"
+            f"Sys {self.loss_lesion_sys.avg:.4f}) | "
+            f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
+            f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
+            f"1-p-: {self.tbx_neg_1mp_mean.avg:.4f}"
         )
 
     def print_val_summary(self) -> str:
         return (
             f"Loss: {self.loss_total.avg:.4f} | "
             f"Les-Dice: {self.lesion_dice.avg:.4f}+/-{self.lesion_dice_std:.4f} (n={self.lesion_dice_n}) | "
+            f"Target-csPCa Dice@0.5: {self.target_cspca_dice.avg:.4f}+/-{self.target_cspca_dice_std:.4f} "
+            f"(n={self.target_cspca_dice_n}) | "
+            f"BestThrDice: {self.target_cspca_best_threshold_dice:.4f}@{self.target_cspca_best_threshold:.2f} | "
+            f"TopKDice: {self.target_cspca_topk_dice.avg:.4f} | "
+            f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
+            f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
+            f"TBx ROI AUC/AUPRC: {self.tbx_roi_auc:.4f}/{self.tbx_roi_auprc:.4f} | "
+            f"TBx ROI Sens@FPR{1.0 - self.tbx_roi_fixed_spec_target:.2f}: "
+            f"{self.tbx_roi_sens_at_fixed_spec:.4f} | "
             f"Pat Sens@Spec{self.patient_fixed_spec_target:.2f}: {self.patient_sens_at_fixed_spec:.4f} | "
             f"Pat Spec@Sens{self.patient_fixed_sens_target:.2f}: {self.patient_spec_at_fixed_sens:.4f} | "
             f"Region Sens@Spec{self.region_fixed_spec_target:.2f}: {self.region_sens_at_fixed_spec:.4f}"
@@ -741,11 +987,23 @@ class MetricTracker:
             "train_loss_dense_cases": self.loss_dense_cases,
             "train_loss_sparse_cases": self.loss_sparse_cases,
             "train_loss_sparse_has_target_cases": self.loss_sparse_has_target_cases,
+            "train_loss_sparse_sampled_cases": self.loss_sparse_sampled_cases,
             "train_loss_sparse_positive_cases": self.loss_sparse_positive_cases,
+            "train_loss_sparse_negative_cases": self.loss_sparse_negative_cases,
             "train_loss_sparse_positive_case_rate": self._ratio(
                 self.loss_sparse_positive_cases, self.loss_sparse_has_target_cases
             ),
+            "train_loss_sparse_negative_case_rate": self._ratio(
+                self.loss_sparse_negative_cases, self.loss_sparse_has_target_cases
+            ),
             "train_loss_sparse_voxels": self.loss_sparse_voxels,
+            "train_loss_sparse_positive_voxels": self.loss_sparse_positive_voxels,
+            "train_loss_sparse_negative_voxels": self.loss_sparse_negative_voxels,
+            "train_tbx_pos_prob_mean": self.tbx_pos_prob_mean.avg,
+            "train_tbx_neg_prob_mean": self.tbx_neg_prob_mean.avg,
+            "train_tbx_neg_1mp_mean": self.tbx_neg_1mp_mean.avg,
+            "train_tbx_pos_bce": self.tbx_pos_bce.avg,
+            "train_tbx_neg_bce": self.tbx_neg_bce.avg,
             "train_loss_sys_cases": self.loss_sys_cases,
             "train_loss_sys_regions": self.loss_sys_regions,
         }
@@ -764,6 +1022,36 @@ class MetricTracker:
             "val_lesion_f1": self.lesion_f1.avg,
             "val_lesion_sens": self.lesion_sens.avg,
             "val_lesion_spec": self.lesion_spec.avg,
+            "val_target_cspca_dice": self.target_cspca_dice.avg,
+            "val_target_cspca_dice_at_prob_threshold": self.target_cspca_dice.avg,
+            "val_target_cspca_dice_mean": self.target_cspca_dice.avg,
+            "val_target_cspca_dice_std": self.target_cspca_dice_std,
+            "val_target_cspca_dice_n": self.target_cspca_dice_n,
+            "val_target_cspca_best_threshold_dice": self.target_cspca_best_threshold_dice,
+            "val_target_cspca_best_threshold_dice_mean": self.target_cspca_best_threshold_dice,
+            "val_target_cspca_best_threshold_dice_std": self.target_cspca_best_threshold_dice_std,
+            "val_target_cspca_best_threshold_dice_n": self.target_cspca_best_threshold_dice_n,
+            "val_target_cspca_best_threshold": self.target_cspca_best_threshold,
+            "val_target_cspca_topk_dice": self.target_cspca_topk_dice.avg,
+            "val_target_cspca_topk_dice_mean": self.target_cspca_topk_dice.avg,
+            "val_target_cspca_topk_dice_std": self.target_cspca_topk_dice_std,
+            "val_target_cspca_topk_dice_n": self.target_cspca_topk_dice_n,
+            "val_target_cspca_top_percent": self.target_cspca_top_percent,
+            "val_target_cspca_top_percent_dice": self.target_cspca_top_percent_dice.avg,
+            "val_target_cspca_top_percent_dice_mean": self.target_cspca_top_percent_dice.avg,
+            "val_target_cspca_top_percent_dice_std": self.target_cspca_top_percent_dice_std,
+            "val_target_cspca_top_percent_dice_n": self.target_cspca_top_percent_dice_n,
+            "val_tbx_roi_bacc": self.tbx_roi_bacc,
+            "val_tbx_roi_sens": self.tbx_roi_sens,
+            "val_tbx_roi_spec": self.tbx_roi_spec,
+            "val_tbx_roi_auc": self.tbx_roi_auc,
+            "val_tbx_roi_auprc": self.tbx_roi_auprc,
+            "val_tbx_roi_n": self.tbx_roi_n,
+            "val_tbx_roi_fixed_spec_target": self.tbx_roi_fixed_spec_target,
+            "val_tbx_roi_sens_at_fixed_spec": self.tbx_roi_sens_at_fixed_spec,
+            "val_tbx_roi_actual_spec_at_fixed_spec": self.tbx_roi_actual_spec_at_fixed_spec,
+            "val_tbx_roi_actual_fpr_at_fixed_spec": self.tbx_roi_actual_fpr_at_fixed_spec,
+            "val_tbx_roi_threshold_at_fixed_spec": self.tbx_roi_threshold_at_fixed_spec,
             "val_patient_bacc": self.patient_bacc,
             "val_patient_sens": self.patient_sens,
             "val_patient_spec": self.patient_spec,
@@ -773,6 +1061,7 @@ class MetricTracker:
             "val_patient_fixed_spec_target": self.patient_fixed_spec_target,
             "val_patient_sens_at_fixed_spec": self.patient_sens_at_fixed_spec,
             "val_patient_actual_spec_at_fixed_spec": self.patient_actual_spec_at_fixed_spec,
+            "val_patient_actual_fpr_at_fixed_spec": self.patient_actual_fpr_at_fixed_spec,
             "val_patient_threshold_at_fixed_spec": self.patient_threshold_at_fixed_spec,
             "val_patient_fixed_sens_target": self.patient_fixed_sens_target,
             "val_patient_spec_at_fixed_sens": self.patient_spec_at_fixed_sens,
@@ -787,6 +1076,7 @@ class MetricTracker:
             "val_region_fixed_spec_target": self.region_fixed_spec_target,
             "val_region_sens_at_fixed_spec": self.region_sens_at_fixed_spec,
             "val_region_actual_spec_at_fixed_spec": self.region_actual_spec_at_fixed_spec,
+            "val_region_actual_fpr_at_fixed_spec": self.region_actual_fpr_at_fixed_spec,
             "val_region_threshold_at_fixed_spec": self.region_threshold_at_fixed_spec,
             "val_region_fixed_sens_target": self.region_fixed_sens_target,
             "val_region_spec_at_fixed_sens": self.region_spec_at_fixed_sens,
@@ -797,11 +1087,23 @@ class MetricTracker:
             "val_loss_dense_cases": self.loss_dense_cases,
             "val_loss_sparse_cases": self.loss_sparse_cases,
             "val_loss_sparse_has_target_cases": self.loss_sparse_has_target_cases,
+            "val_loss_sparse_sampled_cases": self.loss_sparse_sampled_cases,
             "val_loss_sparse_positive_cases": self.loss_sparse_positive_cases,
+            "val_loss_sparse_negative_cases": self.loss_sparse_negative_cases,
             "val_loss_sparse_positive_case_rate": self._ratio(
                 self.loss_sparse_positive_cases, self.loss_sparse_has_target_cases
             ),
+            "val_loss_sparse_negative_case_rate": self._ratio(
+                self.loss_sparse_negative_cases, self.loss_sparse_has_target_cases
+            ),
             "val_loss_sparse_voxels": self.loss_sparse_voxels,
+            "val_loss_sparse_positive_voxels": self.loss_sparse_positive_voxels,
+            "val_loss_sparse_negative_voxels": self.loss_sparse_negative_voxels,
+            "val_tbx_pos_prob_mean": self.tbx_pos_prob_mean.avg,
+            "val_tbx_neg_prob_mean": self.tbx_neg_prob_mean.avg,
+            "val_tbx_neg_1mp_mean": self.tbx_neg_1mp_mean.avg,
+            "val_tbx_pos_bce": self.tbx_pos_bce.avg,
+            "val_tbx_neg_bce": self.tbx_neg_bce.avg,
             "val_loss_sys_cases": self.loss_sys_cases,
             "val_loss_sys_regions": self.loss_sys_regions,
         }
@@ -866,6 +1168,26 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             tracker.lesion_sens.update(compute_sens(pred_bin, target))
             tracker.lesion_spec.update(compute_spec(pred_bin, target))
 
+        # B-series csPCa localisation metric on biopsy-confirmed target ROIs.
+        if "has_target" in batch and "target_mask" in batch and batch["has_target"].sum() > 0:
+            target_cspca = (batch["target_mask"] >= positive_threshold).float()
+            positive_target_cases = (batch["has_target"] > 0) & target_cspca.reshape(target_cspca.size(0), -1).any(dim=1)
+            if positive_target_cases.any():
+                positive_probs = lesion_probs[positive_target_cases]
+                positive_target = target_cspca[positive_target_cases]
+                pred_bin = (positive_probs >= prob_threshold).float()
+                tracker.update_target_cspca_dice_values(
+                    compute_dice_per_case(pred_bin, positive_target)
+                )
+                tracker.update_target_cspca_aux_dice(positive_probs, positive_target)
+
+            sampled_tbx_roi = (batch["has_target"] > 0).view(-1, 1, 1, 1, 1) & (batch["target_mask"] > 0)
+            if sampled_tbx_roi.any():
+                tracker.update_tbx_roi_samples(
+                    target_cspca[sampled_tbx_roi].detach().cpu().numpy(),
+                    lesion_probs[sampled_tbx_roi].detach().cpu().numpy(),
+                )
+
         # Patient-level and region-level MIL metrics.
         mil_evaluator.update_from_batch(
             lesion_probs=lesion_probs,
@@ -902,6 +1224,9 @@ def validate(model, loader, criterion, device, epoch, save_dir):
         #     saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
 
     mil_metrics = mil_evaluator.compute_metrics()
+    tracker.finalize_target_cspca_aux_dice()
+    tracker.finalize_tbx_roi_metrics(prob_threshold)
+
     tracker.patient_sens = mil_metrics["patient_sens"]
     tracker.patient_spec = mil_metrics["patient_spec"]
     tracker.patient_bacc = mil_metrics["patient_bacc"]
@@ -911,6 +1236,7 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.patient_fixed_spec_target = mil_metrics["patient_fixed_spec_target"]
     tracker.patient_sens_at_fixed_spec = mil_metrics["patient_sens_at_fixed_spec"]
     tracker.patient_actual_spec_at_fixed_spec = mil_metrics["patient_actual_spec_at_fixed_spec"]
+    tracker.patient_actual_fpr_at_fixed_spec = mil_metrics["patient_actual_fpr_at_fixed_spec"]
     tracker.patient_threshold_at_fixed_spec = mil_metrics["patient_threshold_at_fixed_spec"]
     tracker.patient_fixed_sens_target = mil_metrics["patient_fixed_sens_target"]
     tracker.patient_spec_at_fixed_sens = mil_metrics["patient_spec_at_fixed_sens"]
@@ -926,6 +1252,7 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.region_fixed_spec_target = mil_metrics["region_fixed_spec_target"]
     tracker.region_sens_at_fixed_spec = mil_metrics["region_sens_at_fixed_spec"]
     tracker.region_actual_spec_at_fixed_spec = mil_metrics["region_actual_spec_at_fixed_spec"]
+    tracker.region_actual_fpr_at_fixed_spec = mil_metrics["region_actual_fpr_at_fixed_spec"]
     tracker.region_threshold_at_fixed_spec = mil_metrics["region_threshold_at_fixed_spec"]
     tracker.region_fixed_sens_target = mil_metrics["region_fixed_sens_target"]
     tracker.region_spec_at_fixed_sens = mil_metrics["region_spec_at_fixed_sens"]

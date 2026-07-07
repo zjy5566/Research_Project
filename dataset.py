@@ -19,7 +19,7 @@ class ProstateUnifiedDataset(Dataset):
       1) B1 / main baseline:
          - TCIA only
          - TBx-confirmed radiologist target lesion ROI supervision
-         - positive-only lesion evidence in the loss
+         - positive and negative sampled target ROI voxels in the loss
 
       2) B2-B3 / biopsy-supervision ablations:
          - B2 uses TCIA SBx region labels only

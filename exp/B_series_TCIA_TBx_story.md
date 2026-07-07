@@ -8,10 +8,11 @@ target lesion ROI supervision:
 
 - A radiologist first marks a suspicious MRI lesion.
 - Target biopsy confirms the sampled target.
-- Only the target ROI is treated as positive evidence when the biopsy-confirmed
-  grade passes `LESION_POSITIVE_THRESHOLD`.
-- Unsampled voxels and biopsy-negative/low-grade target ROIs are not used as
-  background negatives in the TCIA TBx ROI loss.
+- Sampled target ROI voxels are supervised by biopsy-confirmed grade:
+  `target_mask >= LESION_POSITIVE_THRESHOLD` is positive, while
+  `0 < target_mask < LESION_POSITIVE_THRESHOLD` is negative.
+- Unsampled voxels outside sampled target ROIs are not used as background
+  negatives in the TCIA TBx ROI loss.
 
 This makes the baseline a clinically grounded weak-localisation setup rather
 than a needle-track proxy or a pure public radiologist-mask baseline.
@@ -27,15 +28,18 @@ than a needle-track proxy or a pure public radiologist-mask baseline.
 
 ## Loss definition
 
-For TCIA TBx ROI supervision, the default loss is positive-only:
+For TCIA TBx ROI supervision, the default loss is hard-label BCE on sampled
+target ROI voxels:
 
 ```text
-L_TBx = mean_{v: target_mask(v) >= positive_threshold} -log p(v)
+valid(v) = target_mask(v) > 0
+y(v) = 1[target_mask(v) >= positive_threshold]
+L_TBx = mean_{v: valid(v)} BCEWithLogits(logit(v), y(v))
 ```
 
-There is no `(1 - y) * log(1 - p)` term for unlabelled voxels or
-biopsy-negative target ROIs. This avoids teaching the network that unsampled
-or biopsy-negative regions are true voxel-level background.
+There is still no background term for unlabelled voxels where
+`target_mask == 0`. Biopsy-negative or below-threshold sampled target ROI
+voxels are valid negative evidence for the TBx baseline.
 
 SBx/PROMIS region supervision remains region-level MIL and can still use
 sampled benign regions as valid negatives.

@@ -16,10 +16,9 @@ Legacy/reference splits are also written:
     N3: PUB + TCIA SBx supervision only.
     N4: PUB + TCIA TBx and SBx mixed supervision.
 
-Training supervision differs across experiments. The B-series uses TCIA-only
-internal evaluation so the new baseline is not framed around PUB radiologist
-annotation. The legacy N-series still uses the older common PUB + TCIA internal
-evaluation cohort.
+Training supervision differs across experiments. The B-series trains on TCIA,
+but uses the shared PUB + TCIA internal evaluation cohort so the baseline can
+report PUB lesion Dice alongside biopsy-based TCIA/PROMIS clinical metrics.
 
 PROMIS is held out as the external validation source for every experiment.
 """
@@ -250,7 +249,7 @@ def create_split_csvs(
     # lesion ROIs only. B2 and B3 test whether adding biopsy-region
     # supervision changes localisation/clinical performance.
     b1_train = _make_tbx_only_view(tcia_train)
-    b1_internal_val = tcia_common_internal_eval.copy()
+    b1_internal_val = common_internal_val.copy()
     b1_external_val = promis_external.copy()
 
     b2_train = _make_sbx_only_view(tcia_train)

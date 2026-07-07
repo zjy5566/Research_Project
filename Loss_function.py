@@ -4,7 +4,7 @@ Loss functions for the new segmentation + MIL setting.
 This file removes the old grade/gland branches and keeps only lesion-related
 supervision:
   1) lesion_dense  : dense radiologist lesion-mask supervision, e.g. PUB
-  2) lesion_sparse : positive-only TCIA TBx-confirmed target ROI supervision
+  2) lesion_sparse : TCIA TBx-confirmed target ROI positive/negative BCE
   3) lesion_sys    : region-level MIL supervision from SBx zones, e.g. TCIA/PROMIS
 
 The optional EM/uncertainty weighting, log-var clamp, and curriculum gates are
@@ -134,9 +134,13 @@ class MixedSupervisionLoss(nn.Module):
         sys_labels >= positive_threshold: positive cancer/csPCa region
 
     TCIA TBx ROI loss convention:
-        By default only target_mask >= positive_threshold voxels contribute
-        a positive BCE term, -log(p). Unlabelled voxels and biopsy-negative
-        target ROI voxels are not treated as background negatives.
+        By default, sampled target ROI voxels use hard-label BCE:
+        target_mask >= positive_threshold is positive, and
+        0 < target_mask < positive_threshold is negative. Unlabelled voxels
+        where target_mask == 0 remain no-supervision and do not contribute.
+        In binary cross entropy terms, TBx-confirmed positive ROI voxels
+        contribute the -log(p) term, while TBx-confirmed negative ROI voxels
+        contribute the -log(1-p) term.
 
     EM weighting, when enabled:
         weighted_loss_i = loss_i * exp(-s_i) + s_i
@@ -188,7 +192,7 @@ class MixedSupervisionLoss(nn.Module):
         if tbx_negative_soft_label is None:
             tbx_negative_soft_label = _cfg("TBX_NEGATIVE_SOFT_LABEL", 0.0)
         if use_tbx_positive_only_loss is None:
-            use_tbx_positive_only_loss = _cfg("USE_TBX_POSITIVE_ONLY_LOSS", True)
+            use_tbx_positive_only_loss = _cfg("USE_TBX_POSITIVE_ONLY_LOSS", False)
         if sys_pos_weight_val is None:
             sys_pos_weight_val = _cfg("SYS_POS_WEIGHT_VAL", pos_weight_val)
         if sys_focal_alpha is None:
@@ -353,7 +357,7 @@ class MixedSupervisionLoss(nn.Module):
         target_mask: torch.Tensor,
         has_target: torch.Tensor,
     ) -> Tuple[torch.Tensor, bool]:
-        """TCIA TBx-confirmed target ROI loss."""
+        """TCIA TBx-confirmed target ROI positive/negative BCE loss."""
         valid_batch = has_target > 0
         if not (self.is_enabled("lesion_sparse") and valid_batch.any()):
             return self._zero(lesion_logits.device), False
@@ -374,17 +378,16 @@ class MixedSupervisionLoss(nn.Module):
         if not valid_voxels.any():
             return self._zero(lesion_logits.device), False
 
-        # Fallback legacy mode: soft-label BCE/Focal over sampled target ROI.
+        # Pos+neg baseline: hard-label BCE over sampled target ROI voxels only.
         target = (target_mask >= self.positive_threshold).float()
         pred_valid = pred[valid_voxels]
         target_valid = target[valid_voxels]
-        target_valid = torch.where(
-            target_valid > 0,
-            torch.full_like(target_valid, self.tbx_positive_soft_label),
-            torch.full_like(target_valid, self.tbx_negative_soft_label),
-        )
 
-        loss = self.bce_loss(pred_valid, target_valid) + self.focal_loss(pred_valid, target_valid)
+        loss = F.binary_cross_entropy_with_logits(
+            pred_valid,
+            target_valid,
+            pos_weight=self.pos_weight.to(device=pred_valid.device, dtype=pred_valid.dtype),
+        )
         return loss, True
 
     def _region_mil_loss(
@@ -491,15 +494,24 @@ class MixedSupervisionLoss(nn.Module):
             "lesion_sys": self._zero(device),
         }
         active_tasks: Dict[str, float] = {key: 0.0 for key in TASK_KEYS}
-        loss_counts: Dict[str, int] = {
+        loss_counts: Dict[str, Union[int, float]] = {
             "batch_size": int(batch_size),
             "lesion_dense_cases": 0,
             "lesion_sparse_cases": 0,
             "lesion_sparse_has_target_cases": 0,
+            "lesion_sparse_sampled_cases": 0,
             "lesion_sparse_positive_cases": 0,
+            "lesion_sparse_negative_cases": 0,
             "lesion_sparse_voxels": 0,
+            "lesion_sparse_positive_voxels": 0,
+            "lesion_sparse_negative_voxels": 0,
             "lesion_sys_cases": 0,
             "lesion_sys_regions": 0,
+            "tbx_pos_prob_mean": 0.0,
+            "tbx_neg_prob_mean": 0.0,
+            "tbx_neg_1mp_mean": 0.0,
+            "tbx_pos_bce": 0.0,
+            "tbx_neg_bce": 0.0,
         }
 
         if lesion_mask is not None:
@@ -517,17 +529,45 @@ class MixedSupervisionLoss(nn.Module):
             loss_counts["lesion_sparse_has_target_cases"] = int(has_target.sum().detach().cpu().item())
 
             if has_target.any():
-                if self.use_tbx_positive_only_loss:
-                    target_case_voxels = target_mask_device[has_target] >= self.positive_threshold
-                else:
-                    target_case_voxels = target_mask_device[has_target] > 0
-                target_case_has_voxels = target_case_voxels.reshape(target_case_voxels.size(0), -1).any(dim=1)
+                sampled_voxels = target_mask_device[has_target] > 0
+                positive_voxels = target_mask_device[has_target] >= self.positive_threshold
+                negative_voxels = sampled_voxels & ~positive_voxels
+
+                sampled_case_has_voxels = sampled_voxels.reshape(sampled_voxels.size(0), -1).any(dim=1)
+                positive_case_has_voxels = positive_voxels.reshape(positive_voxels.size(0), -1).any(dim=1)
+                negative_case_has_voxels = negative_voxels.reshape(negative_voxels.size(0), -1).any(dim=1)
+                loss_counts["lesion_sparse_sampled_cases"] = int(
+                    sampled_case_has_voxels.sum().detach().cpu().item()
+                )
                 loss_counts["lesion_sparse_positive_cases"] = int(
-                    target_case_has_voxels.sum().detach().cpu().item()
+                    positive_case_has_voxels.sum().detach().cpu().item()
+                )
+                loss_counts["lesion_sparse_negative_cases"] = int(
+                    negative_case_has_voxels.sum().detach().cpu().item()
                 )
                 loss_counts["lesion_sparse_voxels"] = int(
-                    target_case_voxels.sum().detach().cpu().item()
+                    sampled_voxels.sum().detach().cpu().item()
                 )
+                loss_counts["lesion_sparse_positive_voxels"] = int(
+                    positive_voxels.sum().detach().cpu().item()
+                )
+                loss_counts["lesion_sparse_negative_voxels"] = int(
+                    negative_voxels.sum().detach().cpu().item()
+                )
+                pred_tbx = lesion_logits[has_target]
+                if positive_voxels.any():
+                    pos_logits = pred_tbx[positive_voxels]
+                    pos_probs = torch.sigmoid(pos_logits)
+                    loss_counts["tbx_pos_prob_mean"] = float(pos_probs.mean().detach().cpu().item())
+                    # Diagnostic unweighted positive BCE term: -log(p).
+                    loss_counts["tbx_pos_bce"] = float(F.softplus(-pos_logits).mean().detach().cpu().item())
+                if negative_voxels.any():
+                    neg_logits = pred_tbx[negative_voxels]
+                    neg_probs = torch.sigmoid(neg_logits)
+                    loss_counts["tbx_neg_prob_mean"] = float(neg_probs.mean().detach().cpu().item())
+                    loss_counts["tbx_neg_1mp_mean"] = float((1.0 - neg_probs).mean().detach().cpu().item())
+                    # Diagnostic unweighted negative BCE term: -log(1 - p).
+                    loss_counts["tbx_neg_bce"] = float(F.softplus(neg_logits).mean().detach().cpu().item())
 
             raw_losses["lesion_sparse"], active = self._sparse_tbx_loss(
                 lesion_logits=lesion_logits,

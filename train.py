@@ -1,9 +1,12 @@
 """
-Training script for the revised lesion-segmentation + MIL setting.
+Training script for the current lesion-risk-map + MIL setting.
 
-Main changes after the 2026-06-10 project revision:
-  - The model is treated as a segmentation/MIL model.
-  - Only lesion-related losses are logged: dense lesion, sparse TBx, and SBx MIL.
+Current training contract:
+  - The model learns one voxel-level lesion risk map.
+  - Only lesion-related losses are logged: PUB dense lesion, TCIA TBx ROI,
+    and SBx MIL.
+  - TCIA TBx ROI loss follows Config.USE_TBX_POSITIVE_ONLY_LOSS; the current
+    B-series default is sampled positive + sampled negative ROI BCE.
   - Grade/gland outputs, losses, metrics, and best-model criteria are removed.
   - The script accepts the new dictionary model/loss outputs, but is tolerant of
     the old 5-output model during transition.
@@ -55,9 +58,15 @@ def _cfg(name: str, default: Any = None) -> Any:
     return getattr(Config, name, default)
 
 
+def get_dataset_task(is_train: bool) -> str:
+    if is_train:
+        return _cfg("TRAIN_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed")))
+    return _cfg("VAL_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed")))
+
+
 def build_dataset(csv_path: str, is_train: bool):
-    """Create dataset with optional task argument when supported."""
-    task = _cfg("TASK", _cfg("DATASET_TASK", "mixed"))
+    """Create dataset with split-specific task filtering when configured."""
+    task = get_dataset_task(is_train)
     try:
         return ProstateUnifiedDataset(
             csv_path=csv_path,
@@ -101,7 +110,7 @@ def build_model(device: torch.device):
 
 
 def build_criterion(device: torch.device):
-    """Instantiate loss, preferring the new dict-returning segmentation/MIL loss."""
+    """Instantiate the lesion loss with Config-controlled TBx/SBx behaviour."""
     positive_threshold = _cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1))
     kwargs = {
         "positive_threshold": positive_threshold,
@@ -111,6 +120,7 @@ def build_criterion(device: torch.device):
         "sys_focal_alpha": _cfg("SYS_FOCAL_ALPHA", 0.75),
         "sys_focal_gamma": _cfg("SYS_FOCAL_GAMMA", 2.0),
         "use_sys_class_balanced_bce": _cfg("USE_SYS_CLASS_BALANCED_BCE", True),
+        "use_tbx_positive_only_loss": _cfg("USE_TBX_POSITIVE_ONLY_LOSS", False),
         "return_dict": True,
     }
     try:
@@ -168,13 +178,98 @@ def call_loss(criterion, outputs, batch):
     raise TypeError("The current utils.py cannot normalise this loss output.")
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device: torch.device, epoch: int):
+def _safe_filename(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value))
+
+
+def _mask_for_visualisation(batch: Dict[str, Any], key: str, b: int, fallback_like: torch.Tensor):
+    if key not in batch:
+        return fallback_like.detach().cpu().numpy()
+    return batch[key][b, 0].detach().cpu().numpy()
+
+
+def maybe_save_train_visualizations(
+    batch: Dict[str, Any],
+    outputs: Dict[str, torch.Tensor],
+    save_dir: str,
+    epoch: int,
+    saved_patients: set,
+    max_to_save: int,
+) -> int:
+    """Save a few non-repeated training predictions for visual QA."""
+    lesion_logits = outputs.get("lesion_logits")
+    if lesion_logits is None or max_to_save <= 0:
+        return 0
+
+    vis_dir = os.path.join(save_dir, _cfg("VIS_SUBDIR", "visualizations"), "train", f"epoch_{epoch:03d}")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    lesion_probs = torch.sigmoid(lesion_logits.detach())
+    saved_count = 0
+    batch_size = lesion_probs.size(0)
+
+    for b in range(batch_size):
+        if saved_count >= max_to_save:
+            break
+
+        pid = batch["pid"][b] if "pid" in batch else f"case_{epoch}_{b}"
+        pid = str(pid)
+        if pid in saved_patients:
+            continue
+
+        empty_like = torch.zeros_like(lesion_probs[b, 0])
+        gt_dict = {
+            "type": utils.infer_dataset_type(batch, b),
+            "lesion_mask": _mask_for_visualisation(batch, "lesion_mask", b, empty_like),
+            "target_mask": _mask_for_visualisation(batch, "target_mask", b, empty_like),
+            "zones_mask": _mask_for_visualisation(batch, "zones_mask", b, empty_like),
+            "sys_labels": batch["sys_labels"][b].detach().cpu().numpy() if "sys_labels" in batch else None,
+        }
+
+        filename = f"{saved_count + 1:02d}_{gt_dict['type']}_{_safe_filename(pid)}.png"
+        try:
+            utils.visualize_predictions(
+                input_tensor=batch["input"][b],
+                risk_map=lesion_probs[b],
+                gt_dict=gt_dict,
+                save_path=os.path.join(vis_dir, filename),
+                patient_id=pid,
+            )
+        except Exception as exc:
+            print(f"Warning: failed to save training visualization for {pid}: {exc}")
+            continue
+        saved_patients.add(pid)
+        saved_count += 1
+
+    return saved_count
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device: torch.device,
+    epoch: int,
+    save_dir: str = "",
+    saved_train_vis_patients=None,
+):
     model.train()
     if hasattr(criterion, "set_epoch"):
         criterion.set_epoch(epoch)
 
     tracker = utils.MetricTracker()
     pbar = tqdm(loader, desc="Training")
+    should_save_train_vis = (
+        bool(_cfg("SAVE_TRAIN_VIS", False))
+        and bool(save_dir)
+        and int(_cfg("TRAIN_VIS_EVERY_N_EPOCHS", 0)) > 0
+        and epoch % int(_cfg("TRAIN_VIS_EVERY_N_EPOCHS", 0)) == 0
+    )
+    max_train_vis = int(_cfg("TRAIN_VIS_MAX_PER_EPOCH", 0))
+    saved_this_epoch = 0
+    if saved_train_vis_patients is None:
+        saved_train_vis_patients = set()
 
     for batch in pbar:
         batch = move_batch_to_device(batch, device)
@@ -194,6 +289,15 @@ def train_one_epoch(model, loader, optimizer, criterion, device: torch.device, e
             optimizer.step()
 
         tracker.update_losses(loss_dict)
+        if should_save_train_vis and saved_this_epoch < max_train_vis:
+            saved_this_epoch += maybe_save_train_visualizations(
+                batch=batch,
+                outputs=outputs,
+                save_dir=save_dir,
+                epoch=epoch,
+                saved_patients=saved_train_vis_patients,
+                max_to_save=max_train_vis - saved_this_epoch,
+            )
         pbar.set_postfix({"Total Loss": f"{float(total_loss.detach().cpu()):.4f}"})
 
     return tracker
@@ -207,6 +311,16 @@ def select_validation_metric(v_track) -> float:
         return -float(v_track.loss_total.avg)
     if metric_name in {"lesion_dice", "dice", "val_lesion_dice"}:
         return float(v_track.lesion_dice.avg)
+    if metric_name in {"target_cspca_dice", "val_target_cspca_dice", "cspca_dice"}:
+        return float(getattr(v_track, "target_cspca_dice").avg)
+    if metric_name in {"tbx_roi_sens_at_fixed_spec", "val_tbx_roi_sens_at_fixed_spec", "tbx_roi_sens_at_fpr5"}:
+        return float(getattr(v_track, "tbx_roi_sens_at_fixed_spec", 0.0))
+    if metric_name in {"tbx_roi_auc", "val_tbx_roi_auc"}:
+        return float(getattr(v_track, "tbx_roi_auc", 0.0))
+    if metric_name in {"tbx_roi_auprc", "val_tbx_roi_auprc"}:
+        return float(getattr(v_track, "tbx_roi_auprc", 0.0))
+    if metric_name in {"tbx_roi_bacc", "val_tbx_roi_bacc"}:
+        return float(getattr(v_track, "tbx_roi_bacc", 0.0))
     if metric_name == "lesion_f1":
         return float(v_track.lesion_f1.avg)
     if metric_name == "patient_sens_at_fixed_spec":
@@ -286,6 +400,8 @@ def main():
     val_csv = get_csv_path("VAL_CSV", "N4_mixed_PUB_TCIA_internal_val.csv")
     print(f"📄 Train CSV: {train_csv}")
     print(f"📄 Val CSV:   {val_csv}")
+    print(f"📌 Train dataset task: {get_dataset_task(is_train=True)}")
+    print(f"📌 Val dataset task:   {get_dataset_task(is_train=False)}")
 
     train_loader = DataLoader(
         build_dataset(train_csv, is_train=True),
@@ -318,6 +434,7 @@ def main():
     early_stop_counter = 0
     history = []
     metric_name = str(_cfg("BEST_MODEL_METRIC", "lesion_dice"))
+    saved_train_vis_patients = set()
 
     for epoch in range(1, int(_cfg("NUM_EPOCHS", 100)) + 1):
         print(f"\nEpoch {epoch}/{_cfg('NUM_EPOCHS', 100)}")
@@ -328,11 +445,20 @@ def main():
             print(
                 "Curriculum/task status | "
                 f"Dense: {int(criterion.is_enabled('lesion_dense'))} | "
-                f"TBx ROI: {int(criterion.is_enabled('lesion_sparse'))} | "
+                f"TBx ROI BCE: {int(criterion.is_enabled('lesion_sparse'))} | "
                 f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))}"
             )
 
-        train_track = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+        train_track = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            epoch,
+            save_dir=save_path,
+            saved_train_vis_patients=saved_train_vis_patients,
+        )
         if hasattr(criterion, "set_epoch"):
             criterion.set_epoch(epoch)
         val_track = utils.validate(model, val_loader, criterion, device, epoch, save_path)
@@ -344,7 +470,7 @@ def main():
         print("--- Lesion EM / Loss Multipliers ---")
         print(
             f"Dense: {current_weights.get('lesion_dense', 1.0):.3f} | "
-            f"TBx ROI: {current_weights.get('lesion_sparse', 1.0):.3f} | "
+            f"TBx ROI BCE: {current_weights.get('lesion_sparse', 1.0):.3f} | "
             f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f}"
         )
 
