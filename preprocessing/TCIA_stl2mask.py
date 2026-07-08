@@ -421,8 +421,19 @@ def batch_convert_stls(processed_dir_root, target_excel_path, biopsy_excel_path=
 
 
 if __name__ == "__main__":
-    EXTRACTED_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
-    TARGET_EXCEL_PATH = r'F:\RP_dataset\Target biosy\unprocessed_data\Target-Data_2019-12-05-2.xlsx'
-    BIOPSY_EXCEL_PATH = r'F:\RP_dataset\Target biosy\unprocessed_data\TCIA-Biopsy-Data_2020-07-14.xlsx'
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    EXTRACTED_ROOT = os.path.join(DATASET_ROOT, 'Target biosy', 'Extracted_Target_Biopsy')
+    TARGET_EXCEL_PATH = os.path.join(
+        DATASET_ROOT,
+        'Target biosy',
+        'unprocessed_data',
+        'Target-Data_2019-12-05-2.xlsx',
+    )
+    BIOPSY_EXCEL_PATH = os.path.join(
+        DATASET_ROOT,
+        'Target biosy',
+        'unprocessed_data',
+        'TCIA-Biopsy-Data_2020-07-14.xlsx',
+    )
     
     batch_convert_stls(EXTRACTED_ROOT, TARGET_EXCEL_PATH, BIOPSY_EXCEL_PATH)

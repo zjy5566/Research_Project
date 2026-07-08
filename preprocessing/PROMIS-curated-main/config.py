@@ -1,7 +1,8 @@
 import numpy as np
 import os
 
-root_dir = 'F:\\RP_dataset\\derived PROMIS data set'
+DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+root_dir = os.path.join(DATASET_ROOT, 'derived PROMIS data set')
 nii_dir = os.path.join(root_dir,'MRI') # image directory
 mri_report_dir = os.path.join(root_dir , 'PROMIS_OA_MRI_cleaned.xlsx') # MRI report directory
 tpm_report_dir = os.path.join(root_dir, 'Template_biopsy') # TPM report directory

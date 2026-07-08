@@ -196,8 +196,14 @@ def process_patient_folder(folder_name, biopsy_df, extracted_root):
 
 # --- 执行主流程 ---
 if __name__ == "__main__":
-    BIOPSY_EXCEL = r'F:\RP_dataset\Target biosy\unprocessed_data\TCIA-Biopsy-Data_2020-07-14.xlsx'
-    EXTRACTED_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    BIOPSY_EXCEL = os.path.join(
+        DATASET_ROOT,
+        'Target biosy',
+        'unprocessed_data',
+        'TCIA-Biopsy-Data_2020-07-14.xlsx',
+    )
+    EXTRACTED_ROOT = os.path.join(DATASET_ROOT, 'Target biosy', 'Extracted_Target_Biopsy')
 
     if not os.path.exists(BIOPSY_EXCEL):
         print(f"Error: Cannot find Excel file at {BIOPSY_EXCEL}")

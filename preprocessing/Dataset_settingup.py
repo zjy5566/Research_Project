@@ -18,6 +18,7 @@ def first_existing_dir(*paths):
 
 
 def first_existing_file(*paths):
+    """Return the first existing file among current and legacy mask names."""
     for path in paths:
         if path and os.path.isfile(path):
             return path
@@ -81,21 +82,25 @@ def create_unified_dataset(base_dir):
             if not os.path.exists(os.path.join(src_p_dir, 'input_tensor.npy')):
                 continue 
             
-            # 【适配新文件名】：寻找带有 _crop 的新文件名
-            target_path = os.path.join(src_p_dir, 'target_mask_crop.nii.gz')
-            # 兼容可能存在的拼写错误
-            if not os.path.exists(target_path) and os.path.exists(os.path.join(src_p_dir, 'target_mask.nii.gz')):
-                target_path = os.path.join(src_p_dir, 'target_mask.nii.gz')
-
-            sys_mask_path = os.path.join(src_p_dir, 'zones_mask_crop.nii.gz')
-            if not os.path.exists(sys_mask_path) and os.path.exists(os.path.join(src_p_dir, 'zones_mask.nii.gz')):
-                sys_mask_path = os.path.join(src_p_dir, 'zones_mask.nii.gz')
+            # Prefer canonical names, but accept the older *_crop exports so
+            # regenerated datasets and historical preprocessing runs both work.
+            target_path = first_existing_file(
+                os.path.join(src_p_dir, 'target_mask.nii.gz'),
+                os.path.join(src_p_dir, 'target_mask_crop.nii.gz'),
+            )
+            sys_mask_path = first_existing_file(
+                os.path.join(src_p_dir, 'zones_mask.nii.gz'),
+                os.path.join(src_p_dir, 'zones_mask_crop.nii.gz'),
+            )
             sys_label_path = os.path.join(src_p_dir, 'systematic_labels.npy')
-            gland_path = os.path.join(src_p_dir, 'gland_mask_crop.nii.gz')
+            gland_path = first_existing_file(
+                os.path.join(src_p_dir, 'gland_mask.nii.gz'),
+                os.path.join(src_p_dir, 'gland_mask_crop.nii.gz'),
+            )
 
-            has_target = 1 if os.path.exists(target_path) else 0
-            has_sys_12 = 1 if (os.path.exists(sys_mask_path) and os.path.exists(sys_label_path)) else 0
-            has_gland = 1 if os.path.exists(gland_path) else 0
+            has_target = 1 if target_path else 0
+            has_sys_12 = 1 if (sys_mask_path and os.path.exists(sys_label_path)) else 0
+            has_gland = 1 if gland_path else 0
             
             # 如果既没有靶向也没有系统活检，这个病人就是无用数据，跳过
             if has_target == 0 and has_sys_12 == 0:
@@ -213,5 +218,5 @@ def create_unified_dataset(base_dir):
     print(f"Unified dataset successfully created at: {dst_root}")
 
 if __name__ == "__main__":
-    BASE_DIR = r"F:\RP_dataset"
+    BASE_DIR = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
     create_unified_dataset(BASE_DIR)

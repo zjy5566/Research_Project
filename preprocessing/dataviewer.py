@@ -14,7 +14,12 @@ except ImportError:  # Keep npy viewing usable on environments without SimpleITK
 
 
 DEFAULT_TARGET_MASK = (
-    r"F:\RP_dataset\Unified_Dataset\TCIA_0535_43085\target_mask.nii.gz"
+    os.path.join(
+        os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset"),
+        "Unified_Dataset",
+        "TCIA_0535_43085",
+        "target_mask.nii.gz",
+    )
 )
 
 
@@ -280,6 +285,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 

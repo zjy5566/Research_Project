@@ -168,8 +168,18 @@ def batch_convert_csv_to_npy(input_dir, output_root):
 
 
 if __name__ == "__main__":
-    input_folder = r"F:\RP_dataset\derived PROMIS data set\Template_biopsy\Template_biopsy"
-    output_folder = r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS_dwi"
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    input_folder = os.path.join(
+        DATASET_ROOT,
+        "derived PROMIS data set",
+        "Template_biopsy",
+        "Template_biopsy",
+    )
+    output_folder = os.path.join(
+        DATASET_ROOT,
+        "derived PROMIS data set",
+        "Processed_PROMIS_dwi",
+    )
 
     # Run batch conversion.
     batch_convert_csv_to_npy(input_folder, output_folder)

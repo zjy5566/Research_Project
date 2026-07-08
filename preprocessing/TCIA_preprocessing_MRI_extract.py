@@ -170,8 +170,22 @@ def batch_extract_mri(src_root, dst_root, stl_dir):
     print("="*30)
 
 if __name__ == "__main__":
-    SRC_DIR = r'F:\RP_dataset\Target biosy\unprocessed_data\manifest-1694710246744\Prostate-MRI-US-Biopsy'
-    DST_DIR = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
-    STL_DIR = r'F:\RP_dataset\Target biosy\unprocessed_data\Prostate-MRI-US-Biopsy\STLs\STLs'
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    SRC_DIR = os.path.join(
+        DATASET_ROOT,
+        'Target biosy',
+        'unprocessed_data',
+        'manifest-1694710246744',
+        'Prostate-MRI-US-Biopsy',
+    )
+    DST_DIR = os.path.join(DATASET_ROOT, 'Target biosy', 'Extracted_Target_Biopsy')
+    STL_DIR = os.path.join(
+        DATASET_ROOT,
+        'Target biosy',
+        'unprocessed_data',
+        'Prostate-MRI-US-Biopsy',
+        'STLs',
+        'STLs',
+    )
     
     batch_extract_mri(SRC_DIR, DST_DIR, STL_DIR)

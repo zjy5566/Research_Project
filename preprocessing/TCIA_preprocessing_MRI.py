@@ -168,6 +168,11 @@ def process_single_patient(folder_name, src_path, dst_root):
         input_tensor_img.CopyInformation(t2_crop)
         sitk.WriteImage(input_tensor_img, os.path.join(save_dir, 'input_tensor.nii.gz'))
 
+        # Persist the prostate gland crop alongside the image tensor so later
+        # training can apply the optional outside-gland lesion-risk penalty.
+        mask_crop.CopyInformation(t2_crop)
+        sitk.WriteImage(mask_crop, os.path.join(save_dir, 'gland_mask.nii.gz'))
+
         if target_mask_file:
             crop_and_save_label(
                 target_mask_file,
@@ -194,8 +199,9 @@ def process_single_patient(folder_name, src_path, dst_root):
 
 # --- 6. 主程序入口 ---
 if __name__ == "__main__":
-    SRC_ROOT = r'F:\RP_dataset\Target biosy\Extracted_Target_Biopsy'
-    DST_ROOT = r'F:\RP_dataset\Target biosy\Processed_TCIA'
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    SRC_ROOT = os.path.join(DATASET_ROOT, 'Target biosy', 'Extracted_Target_Biopsy')
+    DST_ROOT = os.path.join(DATASET_ROOT, 'Target biosy', 'Processed_TCIA')
 
     # 这里读取真实的文件夹名称 (无论是 Prostate-MRI-US-Biopsy-0159 还是 Prostate-MRI-US-Biopsy-0159_12345 都会被抓取)
     folders = [d for d in os.listdir(SRC_ROOT) if d.startswith('Prostate-MRI-US-Biopsy-') and os.path.isdir(os.path.join(SRC_ROOT, d))]

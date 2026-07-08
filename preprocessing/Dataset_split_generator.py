@@ -387,7 +387,8 @@ def create_split_csvs(
 
 if __name__ == "__main__":
     # Update this path to match the existing Unified_Dataset location.
-    UNIFIED_DATA_DIR = r"F:\RP_dataset\Unified_Dataset"
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    UNIFIED_DATA_DIR = os.path.join(DATASET_ROOT, "Unified_Dataset")
     REGISTRY_CSV = os.path.join(
         UNIFIED_DATA_DIR,
         "splits",

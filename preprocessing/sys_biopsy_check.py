@@ -59,9 +59,9 @@ def map_sys_labels_to_3d_mask(patient_dir):
         return False
 
 if __name__ == "__main__":
-    
-    dataset_root = r"F:\RP_dataset\Target biosy\Processed_TCIA"
-    # dataset_root = r"F:\RP_dataset\derived PROMIS data set\Processed_PROMIS"
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    dataset_root = os.path.join(DATASET_ROOT, "Target biosy", "Processed_TCIA")
+    # dataset_root = os.path.join(DATASET_ROOT, "derived PROMIS data set", "Processed_PROMIS")
     
     # 修改了此处的 startswith 判断逻辑，匹配实际的文件夹命名
     patients = [d for d in os.listdir(dataset_root) 

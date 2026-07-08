@@ -395,8 +395,13 @@ def batch_preprocess(src_root, dst_root, lesion_only=False, overwrite_lesion=Fal
         preprocess_promis_case(case_dir, dst_root)
 
 if __name__ == "__main__":
-    MRI_DATA_ROOT = r'F:/RP_dataset/derived PROMIS data set/MRI'
-    PROCESSED_ROOT = r'F:/RP_dataset/derived PROMIS data set/Processed_PROMIS_dwi'
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    MRI_DATA_ROOT = os.path.join(DATASET_ROOT, 'derived PROMIS data set', 'MRI')
+    PROCESSED_ROOT = os.path.join(
+        DATASET_ROOT,
+        'derived PROMIS data set',
+        'Processed_PROMIS_dwi',
+    )
     PROCESS_LESION_ONLY = True
     OVERWRITE_EXISTING_LESION = True
     

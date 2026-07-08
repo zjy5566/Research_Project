@@ -162,8 +162,13 @@ class ProstateDataPreprocessor:
 
 # --- 使用示例 ---
 if __name__ == "__main__":
-    raw_data_path = r"F:\RP_dataset\Dataset_prostate_MRI" 
-    processed_path = r"F:\RP_dataset\Dataset_prostate_MRI\Dataset_prostate_MRI"
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    raw_data_path = os.path.join(DATASET_ROOT, "Dataset_prostate_MRI")
+    processed_path = os.path.join(
+        DATASET_ROOT,
+        "Dataset_prostate_MRI",
+        "Dataset_prostate_MRI",
+    )
     
     preprocessor = ProstateDataPreprocessor(raw_data_path, processed_path)
     print("Script started...")

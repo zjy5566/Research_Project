@@ -10,8 +10,12 @@ class Config:
     # ==========================================
     # 1. Path configurations
     # ==========================================
-    BASE_DIR = r"/raid/candi/jiayi/RP"
-    UNIFIED_DATA_DIR = os.path.join(BASE_DIR, "data", "Unified_Dataset")
+    PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+    # Keep code and experiment outputs inside the repo, while large MRI data can
+    # live on a local/external volume selected with RP_DATASET_ROOT.
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
+    BASE_DIR = PROJECT_DIR
+    UNIFIED_DATA_DIR = os.path.join(DATASET_ROOT, "Unified_Dataset")
     SPLIT_DIR = os.path.join(UNIFIED_DATA_DIR, "splits")
     EXP_DIR = os.path.join(BASE_DIR, "Experiments")
 

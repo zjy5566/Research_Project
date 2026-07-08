@@ -122,5 +122,5 @@ def calculate_dataset_statistics(base_dir):
     print("\n" + "="*50)
 
 if __name__ == "__main__":
-    BASE_DIR = r"F:\RP_dataset"
+    BASE_DIR = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
     calculate_dataset_statistics(BASE_DIR)
