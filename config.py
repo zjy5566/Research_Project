@@ -10,11 +10,10 @@ class Config:
     # ==========================================
     # 1. Path configurations
     # ==========================================
-    PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Keep code and experiment outputs inside the repo, while large MRI data can
-    # live on a local/external volume selected with RP_DATASET_ROOT.
-    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", "/Volumes/Lenovo/RP_dataset")
-    BASE_DIR = PROJECT_DIR
+    # HPC default: keep experiments under the project checkout, while allowing
+    # local runs to override the dataset mount with RP_DATASET_ROOT.
+    BASE_DIR = r"/raid/candi/jiayi/RP"
+    DATASET_ROOT = os.environ.get("RP_DATASET_ROOT", os.path.join(BASE_DIR, "data"))
     UNIFIED_DATA_DIR = os.path.join(DATASET_ROOT, "Unified_Dataset")
     SPLIT_DIR = os.path.join(UNIFIED_DATA_DIR, "splits")
     EXP_DIR = os.path.join(BASE_DIR, "Experiments")
@@ -433,6 +432,9 @@ class Config:
     SAVE_TRAIN_VIS = True
     TRAIN_VIS_EVERY_N_EPOCHS = 5
     TRAIN_VIS_MAX_PER_EPOCH = 4
+    SAVE_VAL_VIS = True
+    VAL_VIS_EVERY_N_EPOCHS = 5
+    VAL_VIS_MAX_PER_TYPE = 2
 
     @classmethod
     def set_seed(cls):

@@ -25,7 +25,6 @@ Expected loss output from the revised loss:
 from __future__ import annotations
 
 import os
-import random
 from typing import Dict, Mapping, Optional, Tuple, Union
 
 import matplotlib
@@ -237,6 +236,25 @@ def operating_point_metrics(
         "actual_sens_at_fixed_sens": float(tpr[idx_sens]),
         "threshold_at_fixed_sens": float(thresholds[idx_sens]),
     }
+
+
+# -----------------------------------------------------------------------------
+# Visualisation helpers
+# -----------------------------------------------------------------------------
+
+def safe_vis_filename(value: str) -> str:
+    """Sanitise patient identifiers before using them in visualisation names."""
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value))
+
+
+def mask_for_visualisation(batch: Mapping, key: str, b: int, fallback_like: torch.Tensor):
+    """Return a CPU mask array, falling back to zeros when a dataset lacks it."""
+    if key not in batch:
+        return fallback_like.detach().cpu().numpy()
+    value = batch[key][b]
+    if value.dim() == fallback_like.dim() + 1:
+        value = value[0]
+    return value.detach().cpu().numpy()
 
 
 # -----------------------------------------------------------------------------
@@ -1178,12 +1196,19 @@ def validate(model, loader, criterion, device, epoch, save_dir):
         invalid_sys_label=invalid_sys_label,
     )
 
-    vis_dir = os.path.join(save_dir, _cfg("VIS_SUBDIR", "visualizations"), f"epoch_{epoch}")
-    os.makedirs(vis_dir, exist_ok=True)
-
     saved_counts = {"PUB": 0, "TCIA": 0, "PROMIS": 0, "OTHER": 0}
-    max_saves_per_type = int(_cfg("MAX_VAL_VIS_PER_TYPE", 2))
-    plot_prob = float(_cfg("VAL_VIS_PROB", 0.15))
+    max_saves_per_type = int(_cfg("VAL_VIS_MAX_PER_TYPE", 2))
+    # Validation visualisations are deterministic per dataset type and epoch:
+    # save only the first few cases per source instead of random sampling.
+    save_val_vis = (
+        bool(_cfg("SAVE_VAL_VIS", False))
+        and bool(save_dir)
+        and int(_cfg("VAL_VIS_EVERY_N_EPOCHS", 0)) > 0
+        and epoch % int(_cfg("VAL_VIS_EVERY_N_EPOCHS", 0)) == 0
+        and max_saves_per_type > 0
+    )
+    vis_dir = os.path.join(save_dir, _cfg("VIS_SUBDIR", "visualizations"), "val", f"epoch_{epoch:03d}")
+    vis_dir_created = False
 
     for batch in tqdm(loader, desc="Validation"):
         batch = move_batch_to_device(batch, device)
@@ -1240,32 +1265,37 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             region_valid_mask=outputs.get("region_valid_mask"),
         )
 
-        # # Optional visualization.
-        # for b in range(imgs.size(0)):
-        #     d_type = infer_dataset_type(batch, b)
-        #     if saved_counts.get(d_type, 0) >= max_saves_per_type:
-        #         continue
-        #     if random.random() >= plot_prob:
-        #         continue
+        if save_val_vis:
+            for b in range(imgs.size(0)):
+                d_type = infer_dataset_type(batch, b)
+                if saved_counts.get(d_type, 0) >= max_saves_per_type:
+                    continue
 
-        #     gt_dict = {
-        #         "type": d_type,
-        #         "lesion_mask": batch.get("lesion_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-        #         "target_mask": batch.get("target_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-        #         "zones_mask": batch.get("zones_mask", torch.zeros_like(lesion_probs))[b, 0].detach().cpu().numpy(),
-        #         "sys_labels": batch.get("sys_labels", torch.empty(0, device=device))[b].detach().cpu().numpy()
-        #             if "sys_labels" in batch else np.asarray([]),
-        #     }
-        #     pid = batch["pid"][b] if "pid" in batch else f"case_{b}"
-        #     vis_filename = f"{d_type}_{pid}.png"
-        #     visualize_predictions(
-        #         input_tensor=imgs[b],
-        #         risk_map=lesion_probs[b],
-        #         gt_dict=gt_dict,
-        #         save_path=os.path.join(vis_dir, vis_filename),
-        #         patient_id=pid,
-        #     )
-        #     saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
+                empty_like = torch.zeros_like(lesion_probs[b, 0])
+                gt_dict = {
+                    "type": d_type,
+                    "lesion_mask": mask_for_visualisation(batch, "lesion_mask", b, empty_like),
+                    "target_mask": mask_for_visualisation(batch, "target_mask", b, empty_like),
+                    "zones_mask": mask_for_visualisation(batch, "zones_mask", b, empty_like),
+                    "sys_labels": batch["sys_labels"][b].detach().cpu().numpy() if "sys_labels" in batch else np.asarray([]),
+                }
+                pid = batch["pid"][b] if "pid" in batch else f"case_{epoch}_{b}"
+                filename = f"{d_type}_{saved_counts.get(d_type, 0) + 1:02d}_{safe_vis_filename(pid)}.png"
+                try:
+                    if not vis_dir_created:
+                        os.makedirs(vis_dir, exist_ok=True)
+                        vis_dir_created = True
+                    visualize_predictions(
+                        input_tensor=imgs[b],
+                        risk_map=lesion_probs[b],
+                        gt_dict=gt_dict,
+                        save_path=os.path.join(vis_dir, filename),
+                        patient_id=str(pid),
+                    )
+                except Exception as exc:
+                    print(f"Warning: failed to save validation visualization for {pid}: {exc}")
+                    continue
+                saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
 
     mil_metrics = mil_evaluator.compute_metrics()
     tracker.finalize_target_cspca_aux_dice()
