@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, average_precision_score, roc_curve
 from tqdm import tqdm
 
@@ -236,6 +237,39 @@ def operating_point_metrics(
         "actual_sens_at_fixed_sens": float(tpr[idx_sens]),
         "threshold_at_fixed_sens": float(thresholds[idx_sens]),
     }
+
+
+def masked_probability_pool(
+    prob_map: torch.Tensor,
+    mask: torch.Tensor,
+    mode: str = "top_percent",
+    top_percent: float = 1.0,
+    lme_r: float = 8.0,
+) -> Optional[float]:
+    """Pool a risk map inside a mask into one case/region probability score."""
+    values = prob_map[mask]
+    if values.numel() == 0:
+        return None
+
+    mode = str(mode).lower()
+    if mode in {"top_percent", "top-percent", "topk_mean"}:
+        # Top-percent pooling is a smoother alternative to max pooling: it
+        # rewards compact high-risk regions without letting one noisy voxel win.
+        pct = max(float(top_percent), 0.0)
+        k = int(np.ceil(values.numel() * pct / 100.0))
+        k = min(max(k, 1), values.numel())
+        score = torch.topk(values, k=k, largest=True, sorted=False).values.mean()
+    elif mode == "max":
+        score = values.max()
+    elif mode == "mean":
+        score = values.mean()
+    elif mode == "lme":
+        r = float(lme_r)
+        score = torch.logsumexp(values * r, dim=0) / r - np.log(float(values.numel())) / r
+    else:
+        raise ValueError(f"Unsupported segmentation risk-map pooling mode: {mode}")
+
+    return float(score.detach().cpu().item())
 
 
 # -----------------------------------------------------------------------------
@@ -579,6 +613,227 @@ class LesionMILEvaluator:
 
 # Backward-compatible alias for older imports.
 BalancedAccuracyEvaluator = LesionMILEvaluator
+
+
+class SegRiskMapEvaluator:
+    """Patient/region metrics derived from segmentation risk maps and mask GT.
+
+    Patient labels come from available segmentation-style masks rather than
+    biopsy MIL labels. Dense lesion masks are preferred; target masks are used
+    as a fallback for sparse target-ROI segmentation tasks.
+    """
+
+    def __init__(
+        self,
+        prob_threshold: float = 0.5,
+        positive_threshold: int = 1,
+        fixed_specificity: Optional[float] = None,
+        fixed_sensitivity: Optional[float] = None,
+        patient_pooling: Optional[str] = None,
+        region_pooling: Optional[str] = None,
+        top_percent: Optional[float] = None,
+        lme_r: Optional[float] = None,
+        max_zones: Optional[int] = None,
+        region_positive_min_voxels: Optional[int] = None,
+    ):
+        self.prob_threshold = float(prob_threshold)
+        self.positive_threshold = int(positive_threshold)
+        if fixed_specificity is None:
+            fixed_specificity = _cfg("FIXED_SPECIFICITY_TARGET", 0.95)
+        if fixed_sensitivity is None:
+            fixed_sensitivity = _cfg("FIXED_SENSITIVITY_TARGET", 0.90)
+        self.fixed_specificity = float(fixed_specificity)
+        self.fixed_sensitivity = float(fixed_sensitivity)
+        self.patient_pooling = str(patient_pooling or _cfg("SEG_PATIENT_POOLING", "top_percent"))
+        self.region_pooling = str(region_pooling or _cfg("SEG_REGION_POOLING", "top_percent"))
+        self.top_percent = float(top_percent if top_percent is not None else _cfg("SEG_RISK_TOP_PERCENT", 1.0))
+        self.lme_r = float(lme_r if lme_r is not None else _cfg("SEG_RISK_LME_R", _cfg("LME_R", 8.0)))
+        self.max_zones = int(max_zones if max_zones is not None else _cfg("MAX_ZONES", 20))
+        self.region_positive_min_voxels = int(
+            region_positive_min_voxels
+            if region_positive_min_voxels is not None
+            else _cfg("SEG_REGION_POSITIVE_MIN_VOXELS", 1)
+        )
+
+        self.patient_true = []
+        self.patient_score = []
+        self.region_true = []
+        self.region_score = []
+
+    def update_from_batch(self, lesion_probs: torch.Tensor, batch: Mapping):
+        B = lesion_probs.size(0)
+        device = lesion_probs.device
+
+        for b in range(B):
+            seg_target = self._segmentation_target(batch, b, device)
+            if seg_target is None:
+                continue
+
+            prob_3d = lesion_probs[b, 0]
+            if seg_target.shape != prob_3d.shape:
+                seg_target = F.interpolate(
+                    seg_target[None, None].float(),
+                    size=prob_3d.shape,
+                    mode="nearest",
+                )[0, 0] > 0
+            patient_mask = self._patient_score_mask(batch, b, device, prob_3d)
+            patient_score = masked_probability_pool(
+                prob_3d,
+                patient_mask,
+                mode=self.patient_pooling,
+                top_percent=self.top_percent,
+                lme_r=self.lme_r,
+            )
+            if patient_score is not None:
+                self.patient_true.append(int(bool(seg_target.any().item())))
+                self.patient_score.append(patient_score)
+
+            if "zones_mask" not in batch:
+                continue
+            zones = batch["zones_mask"][b, 0].to(device)
+            if zones.shape != prob_3d.shape:
+                zones = F.interpolate(
+                    zones[None, None].float(),
+                    size=prob_3d.shape,
+                    mode="nearest",
+                )[0, 0]
+            zones = zones.round().long()
+
+            # Region-level labels are derived from overlap with the segmentation
+            # target, so these metrics evaluate localisation quality rather than
+            # the biopsy-label MIL pathway used during training.
+            for zone_id in range(1, self.max_zones + 1):
+                zone_mask = zones == zone_id
+                if not zone_mask.any():
+                    continue
+                region_score = masked_probability_pool(
+                    prob_3d,
+                    zone_mask,
+                    mode=self.region_pooling,
+                    top_percent=self.top_percent,
+                    lme_r=self.lme_r,
+                )
+                if region_score is None:
+                    continue
+                positive_voxels = int((seg_target & zone_mask).sum().detach().cpu().item())
+                self.region_true.append(int(positive_voxels >= self.region_positive_min_voxels))
+                self.region_score.append(region_score)
+
+    def _segmentation_target(
+        self,
+        batch: Mapping,
+        b: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if "lesion_mask" in batch and self._case_flag(batch, "has_lesion", b):
+            target = batch["lesion_mask"][b, 0].to(device)
+            return target > 0
+        if "target_mask" in batch and self._case_flag(batch, "has_target", b):
+            target = batch["target_mask"][b, 0].to(device)
+            return target >= self.positive_threshold
+        return None
+
+    def _patient_score_mask(
+        self,
+        batch: Mapping,
+        b: int,
+        device: torch.device,
+        prob_3d: torch.Tensor,
+    ) -> torch.Tensor:
+        if "gland_mask" in batch and batch["gland_mask"][b].numel() > 0:
+            gland = batch["gland_mask"][b, 0].to(device)
+            if gland.shape != prob_3d.shape:
+                gland = F.interpolate(
+                    gland[None, None].float(),
+                    size=prob_3d.shape,
+                    mode="nearest",
+                )[0, 0]
+            gland = gland > 0
+            if gland.any():
+                return gland
+        return torch.ones_like(prob_3d, dtype=torch.bool)
+
+    @staticmethod
+    def _case_flag(batch: Mapping, key: str, b: int) -> bool:
+        if key not in batch:
+            return True
+        value = batch[key][b]
+        if torch.is_tensor(value):
+            return bool(value.item() > 0)
+        return bool(value)
+
+    def _binary_metrics(self, y_true, y_score, threshold: float) -> Dict[str, float]:
+        y_true = np.asarray(y_true).astype(np.int64)
+        y_score = np.asarray(y_score).astype(np.float32)
+        if len(y_true) == 0:
+            return {
+                "sens": 0.0,
+                "spec": 0.0,
+                "bacc": 0.0,
+                "auc": 0.0,
+                "auprc": 0.0,
+                "n": 0,
+                **operating_point_metrics(
+                    y_true,
+                    y_score,
+                    fixed_specificity=self.fixed_specificity,
+                    fixed_sensitivity=self.fixed_sensitivity,
+                ),
+            }
+        y_pred = (y_score >= threshold).astype(np.int64)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        sens = tp / (tp + fn + 1e-8)
+        spec = tn / (tn + fp + 1e-8)
+        return {
+            "sens": float(sens),
+            "spec": float(spec),
+            "bacc": float((sens + spec) / 2.0),
+            "auc": safe_auc(y_true, y_score),
+            "auprc": safe_auprc(y_true, y_score),
+            "n": int(len(y_true)),
+            **operating_point_metrics(
+                y_true,
+                y_score,
+                fixed_specificity=self.fixed_specificity,
+                fixed_sensitivity=self.fixed_sensitivity,
+            ),
+        }
+
+    def compute_metrics(self) -> Dict[str, float]:
+        patient = self._binary_metrics(self.patient_true, self.patient_score, self.prob_threshold)
+        region = self._binary_metrics(self.region_true, self.region_score, self.prob_threshold)
+        return {
+            "patient_sens": patient["sens"],
+            "patient_spec": patient["spec"],
+            "patient_bacc": patient["bacc"],
+            "patient_auc": patient["auc"],
+            "patient_auprc": patient["auprc"],
+            "patient_n": patient["n"],
+            "patient_fixed_spec_target": patient["fixed_spec_target"],
+            "patient_sens_at_fixed_spec": patient["sens_at_fixed_spec"],
+            "patient_actual_spec_at_fixed_spec": patient["actual_spec_at_fixed_spec"],
+            "patient_actual_fpr_at_fixed_spec": patient["actual_fpr_at_fixed_spec"],
+            "patient_threshold_at_fixed_spec": patient["threshold_at_fixed_spec"],
+            "patient_fixed_sens_target": patient["fixed_sens_target"],
+            "patient_spec_at_fixed_sens": patient["spec_at_fixed_sens"],
+            "patient_actual_sens_at_fixed_sens": patient["actual_sens_at_fixed_sens"],
+            "patient_threshold_at_fixed_sens": patient["threshold_at_fixed_sens"],
+            "region_sens": region["sens"],
+            "region_spec": region["spec"],
+            "region_bacc": region["bacc"],
+            "region_auc": region["auc"],
+            "region_auprc": region["auprc"],
+            "region_n": region["n"],
+            "region_fixed_spec_target": region["fixed_spec_target"],
+            "region_sens_at_fixed_spec": region["sens_at_fixed_spec"],
+            "region_actual_spec_at_fixed_spec": region["actual_spec_at_fixed_spec"],
+            "region_actual_fpr_at_fixed_spec": region["actual_fpr_at_fixed_spec"],
+            "region_threshold_at_fixed_spec": region["threshold_at_fixed_spec"],
+            "region_fixed_sens_target": region["fixed_sens_target"],
+            "region_spec_at_fixed_sens": region["spec_at_fixed_sens"],
+            "region_actual_sens_at_fixed_sens": region["actual_sens_at_fixed_sens"],
+            "region_threshold_at_fixed_sens": region["threshold_at_fixed_sens"],
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -1186,14 +1441,12 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     model.eval()
     tracker = MetricTracker()
 
-    invalid_sys_label = int(_cfg("INVALID_SYS_LABEL", -1))
     positive_threshold = int(_cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1)))
     prob_threshold = float(_cfg("PRED_PROB_THRESHOLD", 0.5))
 
-    mil_evaluator = LesionMILEvaluator(
+    seg_evaluator = SegRiskMapEvaluator(
         prob_threshold=prob_threshold,
         positive_threshold=positive_threshold,
-        invalid_sys_label=invalid_sys_label,
     )
 
     saved_counts = {"PUB": 0, "TCIA": 0, "PROMIS": 0, "OTHER": 0}
@@ -1257,13 +1510,8 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                     lesion_probs[sampled_tbx_roi].detach().cpu().numpy(),
                 )
 
-        # Patient-level and region-level MIL metrics.
-        mil_evaluator.update_from_batch(
-            lesion_probs=lesion_probs,
-            batch=batch,
-            region_logits=outputs.get("region_logits"),
-            region_valid_mask=outputs.get("region_valid_mask"),
-        )
+        # Patient/region metrics derived from segmentation risk maps and mask GT.
+        seg_evaluator.update_from_batch(lesion_probs=lesion_probs, batch=batch)
 
         if save_val_vis:
             for b in range(imgs.size(0)):
@@ -1297,41 +1545,41 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                     continue
                 saved_counts[d_type] = saved_counts.get(d_type, 0) + 1
 
-    mil_metrics = mil_evaluator.compute_metrics()
+    seg_metrics = seg_evaluator.compute_metrics()
     tracker.finalize_target_cspca_aux_dice()
     tracker.finalize_tbx_roi_metrics(prob_threshold)
 
-    tracker.patient_sens = mil_metrics["patient_sens"]
-    tracker.patient_spec = mil_metrics["patient_spec"]
-    tracker.patient_bacc = mil_metrics["patient_bacc"]
-    tracker.patient_auc = mil_metrics["patient_auc"]
-    tracker.patient_auprc = mil_metrics["patient_auprc"]
-    tracker.patient_n = mil_metrics["patient_n"]
-    tracker.patient_fixed_spec_target = mil_metrics["patient_fixed_spec_target"]
-    tracker.patient_sens_at_fixed_spec = mil_metrics["patient_sens_at_fixed_spec"]
-    tracker.patient_actual_spec_at_fixed_spec = mil_metrics["patient_actual_spec_at_fixed_spec"]
-    tracker.patient_actual_fpr_at_fixed_spec = mil_metrics["patient_actual_fpr_at_fixed_spec"]
-    tracker.patient_threshold_at_fixed_spec = mil_metrics["patient_threshold_at_fixed_spec"]
-    tracker.patient_fixed_sens_target = mil_metrics["patient_fixed_sens_target"]
-    tracker.patient_spec_at_fixed_sens = mil_metrics["patient_spec_at_fixed_sens"]
-    tracker.patient_actual_sens_at_fixed_sens = mil_metrics["patient_actual_sens_at_fixed_sens"]
-    tracker.patient_threshold_at_fixed_sens = mil_metrics["patient_threshold_at_fixed_sens"]
+    tracker.patient_sens = seg_metrics["patient_sens"]
+    tracker.patient_spec = seg_metrics["patient_spec"]
+    tracker.patient_bacc = seg_metrics["patient_bacc"]
+    tracker.patient_auc = seg_metrics["patient_auc"]
+    tracker.patient_auprc = seg_metrics["patient_auprc"]
+    tracker.patient_n = seg_metrics["patient_n"]
+    tracker.patient_fixed_spec_target = seg_metrics["patient_fixed_spec_target"]
+    tracker.patient_sens_at_fixed_spec = seg_metrics["patient_sens_at_fixed_spec"]
+    tracker.patient_actual_spec_at_fixed_spec = seg_metrics["patient_actual_spec_at_fixed_spec"]
+    tracker.patient_actual_fpr_at_fixed_spec = seg_metrics["patient_actual_fpr_at_fixed_spec"]
+    tracker.patient_threshold_at_fixed_spec = seg_metrics["patient_threshold_at_fixed_spec"]
+    tracker.patient_fixed_sens_target = seg_metrics["patient_fixed_sens_target"]
+    tracker.patient_spec_at_fixed_sens = seg_metrics["patient_spec_at_fixed_sens"]
+    tracker.patient_actual_sens_at_fixed_sens = seg_metrics["patient_actual_sens_at_fixed_sens"]
+    tracker.patient_threshold_at_fixed_sens = seg_metrics["patient_threshold_at_fixed_sens"]
 
-    tracker.region_sens = mil_metrics["region_sens"]
-    tracker.region_spec = mil_metrics["region_spec"]
-    tracker.region_bacc = mil_metrics["region_bacc"]
-    tracker.region_auc = mil_metrics["region_auc"]
-    tracker.region_auprc = mil_metrics["region_auprc"]
-    tracker.region_n = mil_metrics["region_n"]
-    tracker.region_fixed_spec_target = mil_metrics["region_fixed_spec_target"]
-    tracker.region_sens_at_fixed_spec = mil_metrics["region_sens_at_fixed_spec"]
-    tracker.region_actual_spec_at_fixed_spec = mil_metrics["region_actual_spec_at_fixed_spec"]
-    tracker.region_actual_fpr_at_fixed_spec = mil_metrics["region_actual_fpr_at_fixed_spec"]
-    tracker.region_threshold_at_fixed_spec = mil_metrics["region_threshold_at_fixed_spec"]
-    tracker.region_fixed_sens_target = mil_metrics["region_fixed_sens_target"]
-    tracker.region_spec_at_fixed_sens = mil_metrics["region_spec_at_fixed_sens"]
-    tracker.region_actual_sens_at_fixed_sens = mil_metrics["region_actual_sens_at_fixed_sens"]
-    tracker.region_threshold_at_fixed_sens = mil_metrics["region_threshold_at_fixed_sens"]
+    tracker.region_sens = seg_metrics["region_sens"]
+    tracker.region_spec = seg_metrics["region_spec"]
+    tracker.region_bacc = seg_metrics["region_bacc"]
+    tracker.region_auc = seg_metrics["region_auc"]
+    tracker.region_auprc = seg_metrics["region_auprc"]
+    tracker.region_n = seg_metrics["region_n"]
+    tracker.region_fixed_spec_target = seg_metrics["region_fixed_spec_target"]
+    tracker.region_sens_at_fixed_spec = seg_metrics["region_sens_at_fixed_spec"]
+    tracker.region_actual_spec_at_fixed_spec = seg_metrics["region_actual_spec_at_fixed_spec"]
+    tracker.region_actual_fpr_at_fixed_spec = seg_metrics["region_actual_fpr_at_fixed_spec"]
+    tracker.region_threshold_at_fixed_spec = seg_metrics["region_threshold_at_fixed_spec"]
+    tracker.region_fixed_sens_target = seg_metrics["region_fixed_sens_target"]
+    tracker.region_spec_at_fixed_sens = seg_metrics["region_spec_at_fixed_sens"]
+    tracker.region_actual_sens_at_fixed_sens = seg_metrics["region_actual_sens_at_fixed_sens"]
+    tracker.region_threshold_at_fixed_sens = seg_metrics["region_threshold_at_fixed_sens"]
 
     return tracker
 

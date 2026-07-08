@@ -9,6 +9,7 @@ from Loss_function import MixedSupervisionLoss
 from utils import (
     LesionMILEvaluator,
     MetricTracker,
+    SegRiskMapEvaluator,
     compute_dice_per_case,
     compute_topk_dice_per_case,
 )
@@ -117,6 +118,52 @@ def test_pub_dense_cases_do_not_enter_patient_metrics():
     assert metrics["patient_n"] == 1
     assert evaluator.patient_true == [1]
     assert abs(evaluator.patient_score[0] - 0.8) < 1e-6
+
+
+def test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling():
+    evaluator = SegRiskMapEvaluator(
+        prob_threshold=0.5,
+        positive_threshold=1,
+        top_percent=50.0,
+        max_zones=2,
+    )
+
+    lesion_probs = torch.tensor(
+        [
+            [[[[0.9, 0.8, 0.1, 0.1]]]],
+            [[[[0.7, 0.1, 0.1, 0.1]]]],
+        ],
+        dtype=torch.float32,
+    )
+    batch = {
+        "has_lesion": torch.tensor([1.0, 1.0]),
+        "lesion_mask": torch.tensor(
+            [
+                [[[[1.0, 0.0, 0.0, 0.0]]]],
+                [[[[0.0, 0.0, 0.0, 0.0]]]],
+            ],
+            dtype=torch.float32,
+        ),
+        "gland_mask": torch.ones_like(lesion_probs),
+        "zones_mask": torch.tensor(
+            [
+                [[[[1.0, 1.0, 2.0, 2.0]]]],
+                [[[[1.0, 1.0, 2.0, 2.0]]]],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+
+    evaluator.update_from_batch(lesion_probs, batch)
+    metrics = evaluator.compute_metrics()
+
+    assert evaluator.patient_true == [1, 0]
+    assert abs(evaluator.patient_score[0] - 0.85) < 1e-6
+    assert metrics["patient_n"] == 2
+    assert metrics["patient_sens"] > 0.99
+    assert metrics["patient_spec"] > 0.99
+    assert metrics["region_n"] == 4
+    assert evaluator.region_true == [1, 0, 0, 0]
 
 
 def test_outside_gland_penalty_uses_only_outside_gland_voxels():
@@ -229,6 +276,7 @@ def test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound():
 if __name__ == "__main__":
     test_tbx_pos_neg_bce_uses_sampled_roi_and_ignores_unsampled()
     test_pub_dense_cases_do_not_enter_patient_metrics()
+    test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling()
     test_outside_gland_penalty_uses_only_outside_gland_voxels()
     test_target_cspca_dice_uses_only_positive_target_cases()
     test_tbx_roi_metrics_report_sensitivity_at_fixed_fpr()

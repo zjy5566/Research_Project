@@ -38,8 +38,8 @@ class Config:
     # B1 and all N1-N4 experiments use the same unmasked PUB + TCIA internal
     # evaluation cohort. This allows these experiments to report:
     #   - lesion Dice on valid PUB dense-mask cases;
-    #   - patient-level BACC on valid TCIA biopsy-labelled cases;
-    #   - region-level BACC on valid TCIA SBx-labelled regions.
+    #   - patient-level risk-map metrics from available segmentation masks;
+    #   - region-level risk-map metrics from available masks and zone maps.
     #
     # Change only this value to switch experiments.
     EXPERIMENT_MODE = "B1_TCIA_TBX_BASELINE"
@@ -342,6 +342,14 @@ class Config:
     MIL_POOLING = "lme"
     LME_R = 8.0
     DROPOUT_RATE = 0.2
+    # Segmentation-derived patient/region metrics pool voxel risk maps into
+    # case/zone scores. top_percent is less sensitive to isolated noisy voxels
+    # than pure max pooling.
+    SEG_PATIENT_POOLING = "top_percent"
+    SEG_REGION_POOLING = "top_percent"
+    SEG_RISK_TOP_PERCENT = 1.0
+    SEG_RISK_LME_R = 8.0
+    SEG_REGION_POSITIVE_MIN_VOXELS = 1
 
     # Label convention:
     # 0: negative/background, 1: benign, 2: ISUP1,
