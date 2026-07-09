@@ -89,7 +89,7 @@ class Config:
         LESION_SYS_START_EPOCH = 1
 
         BEST_MODEL_METRIC = "tbx_roi_auprc"
-        EXPERIMENT_TAG = "B1_TCIA_TBxROI_PosNeg_OutsideGland"
+        EXPERIMENT_TAG = "B1_TCIA_TBxROI_PosNeg_OutsideGland_PatientRisk"
 
     elif EXPERIMENT_MODE == "B2_TCIA_SBX_ONLY":
         TRAIN_CSV = os.path.join(
@@ -342,14 +342,13 @@ class Config:
     MIL_POOLING = "lme"
     LME_R = 8.0
     DROPOUT_RATE = 0.2
-    # Segmentation-derived patient/region metrics pool voxel risk maps into
+    # Risk-map-derived patient/region metrics pool voxel risk maps into
     # case/zone scores. top_percent is less sensitive to isolated noisy voxels
     # than pure max pooling.
     SEG_PATIENT_POOLING = "top_percent"
     SEG_REGION_POOLING = "top_percent"
     SEG_RISK_TOP_PERCENT = 1.0
     SEG_RISK_LME_R = 8.0
-    SEG_REGION_POSITIVE_MIN_VOXELS = 1
 
     # Label convention:
     # 0: negative/background, 1: benign, 2: ISUP1,
@@ -371,7 +370,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 42
 
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = 150
     BATCH_SIZE = 4
     NUM_WORKERS = 2
 
@@ -403,6 +402,15 @@ class Config:
     OUTSIDE_GLAND_LOSS_WEIGHT = 0.05 if USE_OUTSIDE_GLAND_PENALTY else 0.0
     OUTSIDE_GLAND_START_EPOCH = 1
 
+    # Auxiliary patient-level diagnosis loss derived from the lesion risk map.
+    # No independent classification head is added: patient logits are pooled
+    # from voxel lesion logits, preferably inside the prostate gland.
+    USE_PATIENT_RISK_LOSS = EXPERIMENT_MODE == "B1_TCIA_TBX_BASELINE"
+    PATIENT_RISK_LOSS_WEIGHT = 0.05 if USE_PATIENT_RISK_LOSS else 0.0
+    PATIENT_RISK_START_EPOCH = 1
+    PATIENT_RISK_POOLING = "lme"
+    PATIENT_RISK_LME_R = 8.0
+
     FIXED_LOSS_WEIGHTS = {
         "grade_tbx": 0.0,
         "grade_sbx": 0.0,
@@ -410,6 +418,7 @@ class Config:
         "lesion_sparse": LESION_SPARSE_LOSS_WEIGHT,
         "lesion_sys": LESION_SYS_LOSS_WEIGHT,
         "lesion_outside_gland": OUTSIDE_GLAND_LOSS_WEIGHT,
+        "lesion_patient": PATIENT_RISK_LOSS_WEIGHT,
         "gland": 0.0,
     }
 

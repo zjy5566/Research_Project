@@ -120,12 +120,13 @@ def test_pub_dense_cases_do_not_enter_patient_metrics():
     assert abs(evaluator.patient_score[0] - 0.8) < 1e-6
 
 
-def test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling():
+def test_seg_risk_map_metrics_use_seg_patient_gt_and_sbx_region_gt():
     evaluator = SegRiskMapEvaluator(
         prob_threshold=0.5,
         positive_threshold=1,
         top_percent=50.0,
         max_zones=2,
+        invalid_sys_label=-1,
     )
 
     lesion_probs = torch.tensor(
@@ -152,6 +153,13 @@ def test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling():
             ],
             dtype=torch.float32,
         ),
+        "sys_labels": torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        ),
     }
 
     evaluator.update_from_batch(lesion_probs, batch)
@@ -164,6 +172,23 @@ def test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling():
     assert metrics["patient_spec"] > 0.99
     assert metrics["region_n"] == 4
     assert evaluator.region_true == [1, 0, 0, 0]
+
+    sbx_only_evaluator = SegRiskMapEvaluator(
+        prob_threshold=0.5,
+        positive_threshold=1,
+        top_percent=50.0,
+        max_zones=2,
+        invalid_sys_label=-1,
+    )
+    sbx_only_batch = {
+        "has_lesion": torch.tensor([0.0, 0.0]),
+        "has_target": torch.tensor([0.0, 0.0]),
+        "zones_mask": batch["zones_mask"],
+        "sys_labels": batch["sys_labels"],
+    }
+    sbx_only_evaluator.update_from_batch(lesion_probs, sbx_only_batch)
+    assert sbx_only_evaluator.patient_true == [1, 0]
+    assert sbx_only_evaluator.region_true == [1, 0, 0, 0]
 
 
 def test_outside_gland_penalty_uses_only_outside_gland_voxels():
@@ -205,6 +230,61 @@ def test_outside_gland_penalty_uses_only_outside_gland_voxels():
     torch.testing.assert_close(
         torch.tensor(counts["outside_gland_prob_mean"]),
         torch.sigmoid(torch.tensor([0.0, -1.0])).mean(),
+    )
+
+
+def test_patient_risk_loss_pools_risk_map_inside_gland():
+    criterion = MixedSupervisionLoss(
+        use_em_weighting=False,
+        fixed_loss_weights={
+            "lesion_dense": 0.0,
+            "lesion_sparse": 0.0,
+            "lesion_sys": 0.0,
+            "lesion_outside_gland": 0.0,
+            "lesion_patient": 0.5,
+        },
+        task_switches={
+            "lesion_dense": False,
+            "lesion_sparse": False,
+            "lesion_sys": False,
+            "lesion_outside_gland": False,
+            "lesion_patient": True,
+        },
+        return_dict=True,
+    )
+
+    lesion_logits = torch.tensor([[[[[0.0, 2.0, -1.0, 1.0]]]]])
+    gland_mask = torch.tensor([[[[[0.0, 1.0, 0.0, 1.0]]]]])
+    batch = {
+        "gland_mask": gland_mask,
+        "has_gland": torch.tensor([1.0]),
+        "has_cls": torch.tensor([1.0]),
+        "cls_cspc_label": torch.tensor([1]),
+        "has_target": torch.tensor([0.0]),
+        "has_lesion": torch.tensor([0.0]),
+        "has_sys": torch.tensor([0.0]),
+    }
+
+    loss_dict = criterion({"lesion_logits": lesion_logits}, batch)
+    inside_logits = torch.tensor([2.0, 1.0])
+    r = torch.tensor(8.0)
+    pooled_logit = torch.logsumexp(inside_logits * r, dim=0) / r - torch.log(
+        torch.tensor(float(inside_logits.numel()))
+    ) / r
+    expected_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+        pooled_logit.reshape(1),
+        torch.tensor([1.0]),
+    )
+
+    torch.testing.assert_close(loss_dict["loss_lesion_patient"], expected_raw)
+    torch.testing.assert_close(loss_dict["total_loss"], expected_raw * 0.5)
+    counts = loss_dict["loss_counts"]
+    assert counts["lesion_patient_cases"] == 1
+    assert counts["lesion_patient_positive_cases"] == 1
+    assert counts["lesion_patient_negative_cases"] == 0
+    torch.testing.assert_close(
+        torch.tensor(counts["patient_risk_prob_mean"]),
+        torch.sigmoid(pooled_logit),
     )
 
 
@@ -276,8 +356,9 @@ def test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound():
 if __name__ == "__main__":
     test_tbx_pos_neg_bce_uses_sampled_roi_and_ignores_unsampled()
     test_pub_dense_cases_do_not_enter_patient_metrics()
-    test_seg_risk_map_metrics_use_mask_gt_and_top_percent_pooling()
+    test_seg_risk_map_metrics_use_seg_patient_gt_and_sbx_region_gt()
     test_outside_gland_penalty_uses_only_outside_gland_voxels()
+    test_patient_risk_loss_pools_risk_map_inside_gland()
     test_target_cspca_dice_uses_only_positive_target_cases()
     test_tbx_roi_metrics_report_sensitivity_at_fixed_fpr()
     test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound()

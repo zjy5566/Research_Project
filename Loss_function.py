@@ -7,6 +7,7 @@ supervision:
   2) lesion_sparse : TCIA TBx-confirmed target ROI positive/negative BCE
   3) lesion_sys    : region-level MIL supervision from SBx zones, e.g. TCIA/PROMIS
   4) lesion_outside_gland : optional outside-prostate risk suppression
+  5) lesion_patient       : optional patient-level diagnosis pooled from risk map
 
 The optional EM/uncertainty weighting, log-var clamp, and curriculum gates are
 kept because they may still be useful for balancing dense and weak supervision.
@@ -31,6 +32,7 @@ TASK_KEYS: Tuple[str, ...] = (
     "lesion_sparse",
     "lesion_sys",
     "lesion_outside_gland",
+    "lesion_patient",
 )
 
 
@@ -50,6 +52,7 @@ def _default_task_switches_from_config() -> Dict[str, bool]:
         "lesion_sparse": bool(_cfg("USE_LESION_SPARSE_TASK", True)),
         "lesion_sys": bool(_cfg("USE_LESION_SYS_TASK", True)),
         "lesion_outside_gland": bool(_cfg("USE_OUTSIDE_GLAND_PENALTY", False)),
+        "lesion_patient": bool(_cfg("USE_PATIENT_RISK_LOSS", False)),
     }
 
 
@@ -60,6 +63,7 @@ def _default_branch_start_epochs_from_config() -> Dict[str, int]:
         "lesion_sparse": int(_cfg("LESION_SPARSE_START_EPOCH", 1)),
         "lesion_sys": int(_cfg("LESION_SYS_START_EPOCH", 1)),
         "lesion_outside_gland": int(_cfg("OUTSIDE_GLAND_START_EPOCH", 1)),
+        "lesion_patient": int(_cfg("PATIENT_RISK_START_EPOCH", 1)),
     }
 
 
@@ -221,12 +225,15 @@ class MixedSupervisionLoss(nn.Module):
         self.tbx_negative_soft_label = float(tbx_negative_soft_label)
         self.use_tbx_positive_only_loss = bool(use_tbx_positive_only_loss)
         self.use_sys_class_balanced_bce = bool(use_sys_class_balanced_bce)
+        self.patient_risk_pooling = str(_cfg("PATIENT_RISK_POOLING", "lme")).lower()
+        self.patient_risk_lme_r = float(_cfg("PATIENT_RISK_LME_R", _cfg("LME_R", 8.0)))
 
         default_fixed_loss_weights = {
             "lesion_dense": 1.0,
             "lesion_sparse": 1.0,
             "lesion_sys": 1.0,
             "lesion_outside_gland": 1.0,
+            "lesion_patient": 1.0,
         }
         cfg_fixed_loss_weights = _cfg("FIXED_LOSS_WEIGHTS", None)
         if fixed_loss_weights is None and cfg_fixed_loss_weights is not None:
@@ -463,6 +470,78 @@ class MixedSupervisionLoss(nn.Module):
         loss = F.softplus(pred[outside_gland]).mean()
         return loss, True
 
+    def _pool_patient_logits(
+        self,
+        lesion_logits: torch.Tensor,
+        gland_mask: Optional[torch.Tensor],
+        has_gland: torch.Tensor,
+        valid_batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool voxel lesion logits into one patient-level logit per valid case."""
+        pooled_logits = []
+        pooled_indices = []
+        valid_indices = torch.where(valid_batch)[0]
+
+        for idx in valid_indices:
+            logits_3d = lesion_logits[idx, 0]
+            mask = None
+            if gland_mask is not None and bool(has_gland[idx].item()):
+                mask = gland_mask[idx, 0] > 0
+                if not mask.any():
+                    mask = None
+
+            # Patient diagnosis should be driven by prostate risk when a gland
+            # mask exists; fall back to the full crop only for cases without it.
+            values = logits_3d[mask] if mask is not None else logits_3d.reshape(-1)
+            if values.numel() == 0:
+                continue
+
+            if self.patient_risk_pooling == "max":
+                pooled = values.max()
+            elif self.patient_risk_pooling == "mean":
+                pooled = values.mean()
+            else:
+                r = self.patient_risk_lme_r
+                n_values = values.new_tensor(float(values.numel()))
+                pooled = torch.logsumexp(values * r, dim=0) / r - torch.log(n_values) / r
+
+            pooled_logits.append(pooled)
+            pooled_indices.append(idx)
+
+        if not pooled_logits:
+            return lesion_logits.new_empty((0,)), torch.empty(0, dtype=torch.long, device=lesion_logits.device)
+        return torch.stack(pooled_logits), torch.stack(pooled_indices).long()
+
+    def _patient_risk_loss(
+        self,
+        lesion_logits: torch.Tensor,
+        gland_mask: Optional[torch.Tensor],
+        has_gland: torch.Tensor,
+        cls_cspc_label: torch.Tensor,
+        has_cls: torch.Tensor,
+    ) -> Tuple[torch.Tensor, bool, torch.Tensor, torch.Tensor]:
+        """Patient-level csPCa BCE from pooled lesion risk-map logits."""
+        valid_batch = (has_cls > 0) & (cls_cspc_label != self.invalid_sys_label)
+        if not (self.is_enabled("lesion_patient") and valid_batch.any()):
+            empty = lesion_logits.new_empty((0,))
+            return self._zero(lesion_logits.device), False, empty, empty
+
+        patient_logits, pooled_indices = self._pool_patient_logits(
+            lesion_logits=lesion_logits,
+            gland_mask=gland_mask,
+            has_gland=has_gland,
+            valid_batch=valid_batch,
+        )
+        if patient_logits.numel() == 0:
+            empty = lesion_logits.new_empty((0,))
+            return self._zero(lesion_logits.device), False, empty, empty
+
+        # This branch adds a diagnosis-level constraint to the same lesion map,
+        # avoiding a separate classification head that could ignore localisation.
+        patient_targets = cls_cspc_label[pooled_indices].float()
+        loss = F.binary_cross_entropy_with_logits(patient_logits, patient_targets)
+        return loss, True, patient_logits, patient_targets
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -479,10 +558,12 @@ class MixedSupervisionLoss(nn.Module):
         sys_labels: Optional[torch.Tensor] = None,
         lesion_mask: Optional[torch.Tensor] = None,
         gland_mask: Optional[torch.Tensor] = None,
+        cls_cspc_label: Optional[torch.Tensor] = None,
         has_target: Optional[torch.Tensor] = None,
         has_sys: Optional[torch.Tensor] = None,
         has_lesion: Optional[torch.Tensor] = None,
         has_gland: Optional[torch.Tensor] = None,
+        has_cls: Optional[torch.Tensor] = None,
     ) -> Union[Dict[str, object], Tuple[torch.Tensor, ...]]:
         """
         Preferred usage:
@@ -501,12 +582,14 @@ class MixedSupervisionLoss(nn.Module):
             sys_labels = batch.get("sys_labels", sys_labels)
             lesion_mask = batch.get("lesion_mask", lesion_mask)
             gland_mask = batch.get("gland_mask", gland_mask)
+            cls_cspc_label = batch.get("cls_cspc_label", cls_cspc_label)
             has_target = batch.get("has_target", has_target)
             has_sys = batch.get("has_sys", has_sys)
             has_lesion = batch.get("has_lesion", has_lesion)
             has_gland = batch.get("has_gland", has_gland)
+            has_cls = batch.get("has_cls", has_cls)
 
-        device = self._infer_device(lesion_logits, region_logits, lesion_mask, target_mask, gland_mask, sys_labels)
+        device = self._infer_device(lesion_logits, region_logits, lesion_mask, target_mask, gland_mask, sys_labels, cls_cspc_label)
 
         if lesion_logits is None:
             raise ValueError("lesion_logits is required. Pass outputs['lesion_logits'] or lesion_logits=...")
@@ -520,17 +603,29 @@ class MixedSupervisionLoss(nn.Module):
             has_sys = torch.zeros(batch_size, device=device)
         if has_gland is None:
             has_gland = torch.zeros(batch_size, device=device)
+        if has_cls is None:
+            has_cls = torch.zeros(batch_size, device=device)
+        if cls_cspc_label is None:
+            cls_cspc_label = torch.full(
+                (batch_size,),
+                fill_value=self.invalid_sys_label,
+                dtype=torch.long,
+                device=device,
+            )
 
         has_lesion = has_lesion.to(device).bool()
         has_target = has_target.to(device).bool()
         has_sys = has_sys.to(device).bool()
         has_gland = has_gland.to(device).bool()
+        has_cls = has_cls.to(device).bool()
+        cls_cspc_label = cls_cspc_label.to(device)
 
         raw_losses: Dict[str, torch.Tensor] = {
             "lesion_dense": self._zero(device),
             "lesion_sparse": self._zero(device),
             "lesion_sys": self._zero(device),
             "lesion_outside_gland": self._zero(device),
+            "lesion_patient": self._zero(device),
         }
         active_tasks: Dict[str, float] = {key: 0.0 for key in TASK_KEYS}
         loss_counts: Dict[str, Union[int, float]] = {
@@ -549,6 +644,12 @@ class MixedSupervisionLoss(nn.Module):
             "lesion_outside_gland_cases": 0,
             "lesion_outside_gland_voxels": 0,
             "outside_gland_prob_mean": 0.0,
+            "lesion_patient_cases": 0,
+            "lesion_patient_positive_cases": 0,
+            "lesion_patient_negative_cases": 0,
+            "patient_risk_prob_mean": 0.0,
+            "patient_risk_positive_prob_mean": 0.0,
+            "patient_risk_negative_prob_mean": 0.0,
             "tbx_pos_prob_mean": 0.0,
             "tbx_neg_prob_mean": 0.0,
             "tbx_neg_1mp_mean": 0.0,
@@ -664,6 +765,31 @@ class MixedSupervisionLoss(nn.Module):
             if active:
                 loss_counts["lesion_outside_gland_cases"] = int(has_gland.sum().detach().cpu().item())
 
+        raw_losses["lesion_patient"], active, patient_logits, patient_targets = self._patient_risk_loss(
+            lesion_logits=lesion_logits,
+            gland_mask=gland_mask.to(device) if gland_mask is not None else None,
+            has_gland=has_gland,
+            cls_cspc_label=cls_cspc_label,
+            has_cls=has_cls,
+        )
+        active_tasks["lesion_patient"] = float(active)
+        if patient_logits.numel() > 0:
+            patient_probs = torch.sigmoid(patient_logits)
+            positive_patients = patient_targets > 0.5
+            negative_patients = ~positive_patients
+            loss_counts["lesion_patient_cases"] = int(patient_logits.numel())
+            loss_counts["lesion_patient_positive_cases"] = int(positive_patients.sum().detach().cpu().item())
+            loss_counts["lesion_patient_negative_cases"] = int(negative_patients.sum().detach().cpu().item())
+            loss_counts["patient_risk_prob_mean"] = float(patient_probs.mean().detach().cpu().item())
+            if positive_patients.any():
+                loss_counts["patient_risk_positive_prob_mean"] = float(
+                    patient_probs[positive_patients].mean().detach().cpu().item()
+                )
+            if negative_patients.any():
+                loss_counts["patient_risk_negative_prob_mean"] = float(
+                    patient_probs[negative_patients].mean().detach().cpu().item()
+                )
+
         weighted_terms = []
         for key in TASK_KEYS:
             if active_tasks[key] > 0 and self.is_enabled(key):
@@ -679,6 +805,7 @@ class MixedSupervisionLoss(nn.Module):
             + raw_losses["lesion_sparse"]
             + raw_losses["lesion_sys"]
             + raw_losses["lesion_outside_gland"]
+            + raw_losses["lesion_patient"]
         )
 
         result = {
@@ -688,6 +815,7 @@ class MixedSupervisionLoss(nn.Module):
             "loss_lesion_sparse": raw_losses["lesion_sparse"],
             "loss_lesion_sys": raw_losses["lesion_sys"],
             "loss_lesion_outside_gland": raw_losses["lesion_outside_gland"],
+            "loss_lesion_patient": raw_losses["lesion_patient"],
             "em_weights": self.get_current_weights(),
             "active_tasks": active_tasks,
             "curriculum_status": self.get_curriculum_status(),

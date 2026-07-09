@@ -58,15 +58,20 @@ def _cfg(name: str, default: Any = None) -> Any:
     return getattr(Config, name, default)
 
 
-def get_dataset_task(is_train: bool) -> str:
+def get_dataset_task(is_train: bool, split: str = "val") -> str:
     if is_train:
         return _cfg("TRAIN_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed")))
+    if split == "test":
+        return _cfg(
+            "TEST_DATASET_TASK",
+            _cfg("VAL_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed"))),
+        )
     return _cfg("VAL_DATASET_TASK", _cfg("TASK", _cfg("DATASET_TASK", "mixed")))
 
 
-def build_dataset(csv_path: str, is_train: bool):
+def build_dataset(csv_path: str, is_train: bool, split: str = "val"):
     """Create dataset with split-specific task filtering when configured."""
-    task = get_dataset_task(is_train)
+    task = get_dataset_task(is_train, split=split)
     try:
         return ProstateUnifiedDataset(
             csv_path=csv_path,
@@ -367,6 +372,85 @@ def save_checkpoint(path, model, criterion, optimizer, scheduler, epoch: int, be
     )
 
 
+def get_best_model_path(save_path: str) -> str:
+    """Prefer the rich checkpoint, but allow old runs with only best_model.pth."""
+    for name in ["best_checkpoint.pth", "best_model.pth"]:
+        candidate = os.path.join(save_path, name)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"No best model found in {save_path}")
+
+
+def load_best_weights(model, criterion, model_path: str, device: torch.device) -> Dict[str, Any]:
+    """Load a best checkpoint or plain state_dict into the current model."""
+    checkpoint = torch.load(model_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key[7:] if key.startswith("module.") else key
+        cleaned[new_key] = value
+
+    model.load_state_dict(cleaned, strict=True)
+
+    if isinstance(checkpoint, dict) and checkpoint.get("criterion_state_dict") is not None:
+        try:
+            criterion.load_state_dict(checkpoint["criterion_state_dict"], strict=False)
+        except TypeError:
+            criterion.load_state_dict(checkpoint["criterion_state_dict"])
+
+    return checkpoint if isinstance(checkpoint, dict) else {"model_state_dict": cleaned}
+
+
+def run_final_test(model, criterion, device: torch.device, save_path: str, metric_name: str):
+    """Evaluate the saved best model on TEST_CSV after training has finished."""
+    test_csv = get_csv_path("TEST_CSV", "N4_mixed_PROMIS_external_val.csv")
+    best_model_path = get_best_model_path(save_path)
+
+    # Keep test evaluation post-hoc: validation still selects the checkpoint,
+    # then the frozen best model is loaded once for external reporting.
+    print("\n" + "=" * 60)
+    print("Final test using best model")
+    print("=" * 60)
+    print(f"Best model: {best_model_path}")
+    print(f"Test CSV:   {test_csv}")
+    print(f"Test dataset task: {get_dataset_task(is_train=False, split='test')}")
+
+    checkpoint = load_best_weights(model, criterion, best_model_path, device)
+    best_epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
+    if hasattr(criterion, "set_epoch") and best_epoch > 0:
+        criterion.set_epoch(best_epoch)
+
+    test_loader = DataLoader(
+        build_dataset(test_csv, is_train=False, split="test"),
+        batch_size=_cfg("BATCH_SIZE", 1),
+        shuffle=False,
+        num_workers=_cfg("NUM_WORKERS", 0),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    test_track = utils.validate(model, test_loader, criterion, device, best_epoch, save_dir="")
+    print(f"Test  | {test_track.print_val_summary()}")
+
+    test_log = {
+        "best_epoch": best_epoch,
+        "best_model_metric_name": metric_name,
+        "best_model_metric_value": float(checkpoint.get("best_metric", float("nan")))
+        if isinstance(checkpoint, dict)
+        else float("nan"),
+        "best_model_path": best_model_path,
+        "test_csv": test_csv,
+    }
+    for key, value in test_track.get_val_dict().items():
+        test_key = key.replace("val_", "test_", 1) if key.startswith("val_") else f"test_{key}"
+        test_log[test_key] = value
+
+    test_log_csv = os.path.join(save_path, "test_log.csv")
+    pd.DataFrame([test_log]).to_csv(test_log_csv, index=False)
+    print(f"Test log saved to: {test_log_csv}")
+    return test_track
+
+
 def get_experiment_name() -> str:
     if hasattr(Config, "get_experiment_name"):
         return Config.get_experiment_name()
@@ -398,10 +482,13 @@ def main():
 
     train_csv = get_csv_path("TRAIN_CSV", "N4_mixed_PUB_TCIA_train.csv")
     val_csv = get_csv_path("VAL_CSV", "N4_mixed_PUB_TCIA_internal_val.csv")
+    test_csv = get_csv_path("TEST_CSV", "N4_mixed_PROMIS_external_val.csv")
     print(f"📄 Train CSV: {train_csv}")
     print(f"📄 Val CSV:   {val_csv}")
+    print(f"📄 Test CSV:  {test_csv}")
     print(f"📌 Train dataset task: {get_dataset_task(is_train=True)}")
     print(f"📌 Val dataset task:   {get_dataset_task(is_train=False)}")
+    print(f"📌 Test dataset task:  {get_dataset_task(is_train=False, split='test')}")
 
     train_loader = DataLoader(
         build_dataset(train_csv, is_train=True),
@@ -447,7 +534,8 @@ def main():
                 f"Dense: {int(criterion.is_enabled('lesion_dense'))} | "
                 f"TBx ROI BCE: {int(criterion.is_enabled('lesion_sparse'))} | "
                 f"Sys MIL: {int(criterion.is_enabled('lesion_sys'))} | "
-                f"Outside gland: {int(criterion.is_enabled('lesion_outside_gland'))}"
+                f"Outside gland: {int(criterion.is_enabled('lesion_outside_gland'))} | "
+                f"Patient risk: {int(criterion.is_enabled('lesion_patient'))}"
             )
 
         train_track = train_one_epoch(
@@ -473,7 +561,8 @@ def main():
             f"Dense: {current_weights.get('lesion_dense', 1.0):.3f} | "
             f"TBx ROI BCE: {current_weights.get('lesion_sparse', 1.0):.3f} | "
             f"Sys MIL: {current_weights.get('lesion_sys', 1.0):.3f} | "
-            f"Outside gland: {current_weights.get('lesion_outside_gland', 0.0):.3f}"
+            f"Outside gland: {current_weights.get('lesion_outside_gland', 0.0):.3f} | "
+            f"Patient risk: {current_weights.get('lesion_patient', 0.0):.3f}"
         )
 
         epoch_log = {"epoch": epoch}
@@ -490,6 +579,7 @@ def main():
                 "lesion_sparse_enabled_this_epoch": int(criterion.is_enabled("lesion_sparse")) if hasattr(criterion, "is_enabled") else 1,
                 "lesion_sys_enabled_this_epoch": int(criterion.is_enabled("lesion_sys")) if hasattr(criterion, "is_enabled") else 1,
                 "lesion_outside_gland_enabled_this_epoch": int(criterion.is_enabled("lesion_outside_gland")) if hasattr(criterion, "is_enabled") else 0,
+                "lesion_patient_enabled_this_epoch": int(criterion.is_enabled("lesion_patient")) if hasattr(criterion, "is_enabled") else 0,
             }
         )
         history.append(epoch_log)
@@ -523,6 +613,11 @@ def main():
                 break
 
         scheduler.step()
+
+    try:
+        run_final_test(model, criterion, device, save_path, metric_name)
+    except FileNotFoundError as exc:
+        print(f"Warning: final test skipped because the best model was not found: {exc}")
 
 
 if __name__ == "__main__":

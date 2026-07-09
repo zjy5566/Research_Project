@@ -272,6 +272,46 @@ def masked_probability_pool(
     return float(score.detach().cpu().item())
 
 
+def binary_confusion_counts(y_true, y_score, threshold: float) -> Dict[str, int]:
+    y_true = np.asarray(y_true).astype(np.int64)
+    y_score = np.asarray(y_score).astype(np.float32)
+    if len(y_true) == 0:
+        return {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
+    y_pred = (y_score >= float(threshold)).astype(np.int64)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+
+
+def lesion_zone_iou_labels(
+    lesion_label_map: torch.Tensor,
+    zones: torch.Tensor,
+    max_zones: int,
+    iou_threshold: float,
+) -> Dict[int, int]:
+    """Map RA/MRI lesion instances to zones using PROMIS-style IoU threshold."""
+    lesion_label_map = lesion_label_map.detach()
+    zones = zones.detach().round().long()
+    labels = torch.unique(lesion_label_map[lesion_label_map > 0])
+    zone_labels = {zone_id: 0 for zone_id in range(1, int(max_zones) + 1)}
+    if labels.numel() == 0:
+        return zone_labels
+
+    for lesion_id in labels.tolist():
+        lesion_mask = lesion_label_map == lesion_id
+        for zone_id in zone_labels:
+            zone_mask = zones == zone_id
+            if not bool(zone_mask.any().item()):
+                continue
+            intersection = torch.logical_and(lesion_mask, zone_mask).sum().item()
+            if intersection <= 0:
+                continue
+            union = torch.logical_or(lesion_mask, zone_mask).sum().item()
+            iou = float(intersection) / float(union) if union else 0.0
+            if iou > float(iou_threshold):
+                zone_labels[zone_id] = 1
+    return zone_labels
+
+
 # -----------------------------------------------------------------------------
 # Visualisation helpers
 # -----------------------------------------------------------------------------
@@ -355,6 +395,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
             "loss_lesion_sparse": loss_output.get("loss_lesion_sparse", 0.0),
             "loss_lesion_sys": loss_output.get("loss_lesion_sys", 0.0),
             "loss_lesion_outside_gland": loss_output.get("loss_lesion_outside_gland", 0.0),
+            "loss_lesion_patient": loss_output.get("loss_lesion_patient", 0.0),
             "em_weights": loss_output.get("em_weights", {}),
             "active_tasks": loss_output.get("active_tasks", {}),
             "curriculum_status": loss_output.get("curriculum_status", {}),
@@ -372,6 +413,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "loss_lesion_sparse": sparse,
                 "loss_lesion_sys": sys,
                 "loss_lesion_outside_gland": 0.0,
+                "loss_lesion_patient": 0.0,
                 "em_weights": em_weights,
                 "active_tasks": active_tasks,
                 "curriculum_status": curriculum_status,
@@ -387,6 +429,7 @@ def normalise_loss_output(loss_output) -> Dict[str, object]:
                 "loss_lesion_sparse": loss_output[6],
                 "loss_lesion_sys": loss_output[7],
                 "loss_lesion_outside_gland": 0.0,
+                "loss_lesion_patient": 0.0,
                 "em_weights": loss_output[9],
                 "active_tasks": loss_output[10],
                 "curriculum_status": loss_output[11],
@@ -548,6 +591,10 @@ class LesionMILEvaluator:
                 "auc": 0.0,
                 "auprc": 0.0,
                 "n": 0,
+                "tn": 0,
+                "fp": 0,
+                "fn": 0,
+                "tp": 0,
                 **operating_point_metrics(
                     y_true,
                     y_score,
@@ -566,6 +613,10 @@ class LesionMILEvaluator:
             "auc": safe_auc(y_true, y_score),
             "auprc": safe_auprc(y_true, y_score),
             "n": int(len(y_true)),
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
             **operating_point_metrics(
                 y_true,
                 y_score,
@@ -584,6 +635,10 @@ class LesionMILEvaluator:
             "patient_auc": patient["auc"],
             "patient_auprc": patient["auprc"],
             "patient_n": patient["n"],
+            "patient_tn": patient["tn"],
+            "patient_fp": patient["fp"],
+            "patient_fn": patient["fn"],
+            "patient_tp": patient["tp"],
             "patient_fixed_spec_target": patient["fixed_spec_target"],
             "patient_sens_at_fixed_spec": patient["sens_at_fixed_spec"],
             "patient_actual_spec_at_fixed_spec": patient["actual_spec_at_fixed_spec"],
@@ -599,6 +654,10 @@ class LesionMILEvaluator:
             "region_auc": region["auc"],
             "region_auprc": region["auprc"],
             "region_n": region["n"],
+            "region_tn": region["tn"],
+            "region_fp": region["fp"],
+            "region_fn": region["fn"],
+            "region_tp": region["tp"],
             "region_fixed_spec_target": region["fixed_spec_target"],
             "region_sens_at_fixed_spec": region["sens_at_fixed_spec"],
             "region_actual_spec_at_fixed_spec": region["actual_spec_at_fixed_spec"],
@@ -616,11 +675,11 @@ BalancedAccuracyEvaluator = LesionMILEvaluator
 
 
 class SegRiskMapEvaluator:
-    """Patient/region metrics derived from segmentation risk maps and mask GT.
+    """Patient/region metrics derived from segmentation risk maps.
 
-    Patient labels come from available segmentation-style masks rather than
-    biopsy MIL labels. Dense lesion masks are preferred; target masks are used
-    as a fallback for sparse target-ROI segmentation tasks.
+    Patient labels prefer segmentation-style masks and fall back to systematic
+    biopsy labels, so PROMIS SBx-only cases can contribute to patient-level
+    metrics. Region labels come from systematic biopsy labels.
     """
 
     def __init__(
@@ -634,7 +693,7 @@ class SegRiskMapEvaluator:
         top_percent: Optional[float] = None,
         lme_r: Optional[float] = None,
         max_zones: Optional[int] = None,
-        region_positive_min_voxels: Optional[int] = None,
+        invalid_sys_label: Optional[int] = None,
     ):
         self.prob_threshold = float(prob_threshold)
         self.positive_threshold = int(positive_threshold)
@@ -649,10 +708,10 @@ class SegRiskMapEvaluator:
         self.top_percent = float(top_percent if top_percent is not None else _cfg("SEG_RISK_TOP_PERCENT", 1.0))
         self.lme_r = float(lme_r if lme_r is not None else _cfg("SEG_RISK_LME_R", _cfg("LME_R", 8.0)))
         self.max_zones = int(max_zones if max_zones is not None else _cfg("MAX_ZONES", 20))
-        self.region_positive_min_voxels = int(
-            region_positive_min_voxels
-            if region_positive_min_voxels is not None
-            else _cfg("SEG_REGION_POSITIVE_MIN_VOXELS", 1)
+        self.invalid_sys_label = int(
+            invalid_sys_label
+            if invalid_sys_label is not None
+            else _cfg("INVALID_SYS_LABEL", -1)
         )
 
         self.patient_true = []
@@ -665,59 +724,109 @@ class SegRiskMapEvaluator:
         device = lesion_probs.device
 
         for b in range(B):
-            seg_target = self._segmentation_target(batch, b, device)
-            if seg_target is None:
-                continue
-
             prob_3d = lesion_probs[b, 0]
-            if seg_target.shape != prob_3d.shape:
-                seg_target = F.interpolate(
-                    seg_target[None, None].float(),
-                    size=prob_3d.shape,
-                    mode="nearest",
-                )[0, 0] > 0
-            patient_mask = self._patient_score_mask(batch, b, device, prob_3d)
-            patient_score = masked_probability_pool(
-                prob_3d,
-                patient_mask,
-                mode=self.patient_pooling,
-                top_percent=self.top_percent,
-                lme_r=self.lme_r,
-            )
-            if patient_score is not None:
-                self.patient_true.append(int(bool(seg_target.any().item())))
-                self.patient_score.append(patient_score)
 
-            if "zones_mask" not in batch:
-                continue
-            zones = batch["zones_mask"][b, 0].to(device)
-            if zones.shape != prob_3d.shape:
-                zones = F.interpolate(
-                    zones[None, None].float(),
-                    size=prob_3d.shape,
-                    mode="nearest",
-                )[0, 0]
-            zones = zones.round().long()
-
-            # Region-level labels are derived from overlap with the segmentation
-            # target, so these metrics evaluate localisation quality rather than
-            # the biopsy-label MIL pathway used during training.
-            for zone_id in range(1, self.max_zones + 1):
-                zone_mask = zones == zone_id
-                if not zone_mask.any():
-                    continue
-                region_score = masked_probability_pool(
+            patient_label = self._patient_label(batch, b, device)
+            if patient_label is not None:
+                patient_mask = self._patient_score_mask(batch, b, device, prob_3d)
+                patient_score = masked_probability_pool(
                     prob_3d,
-                    zone_mask,
-                    mode=self.region_pooling,
+                    patient_mask,
+                    mode=self.patient_pooling,
                     top_percent=self.top_percent,
                     lme_r=self.lme_r,
                 )
-                if region_score is None:
+                if patient_score is not None:
+                    self.patient_true.append(int(patient_label))
+                    self.patient_score.append(patient_score)
+
+            region_info = self.case_region_info(prob_3d, batch, b, device)
+            if region_info is None:
+                continue
+            for zone_id, y_true in region_info["zone_true"].items():
+                if zone_id not in region_info["zone_score"]:
                     continue
-                positive_voxels = int((seg_target & zone_mask).sum().detach().cpu().item())
-                self.region_true.append(int(positive_voxels >= self.region_positive_min_voxels))
-                self.region_score.append(region_score)
+                self.region_true.append(int(y_true))
+                self.region_score.append(float(region_info["zone_score"][zone_id]))
+
+    def case_region_info(
+        self,
+        prob_3d: torch.Tensor,
+        batch: Mapping,
+        b: int,
+        device: torch.device,
+    ) -> Optional[Dict[str, object]]:
+        if "zones_mask" not in batch or "sys_labels" not in batch:
+            return None
+        zones = batch["zones_mask"][b, 0].to(device)
+        if zones.shape != prob_3d.shape:
+            zones = F.interpolate(
+                zones[None, None].float(),
+                size=prob_3d.shape,
+                mode="nearest",
+            )[0, 0]
+        zones = zones.round().long()
+        labels = batch["sys_labels"][b].to(device)
+        zone_score = {}
+        zone_true = {}
+        zone_pred = {}
+        label_map = torch.zeros_like(prob_3d, dtype=torch.float32)
+        pred_map = torch.zeros_like(prob_3d, dtype=torch.float32)
+
+        # SBx labels are zone-indexed vectors; rebuild voxel maps here so the
+        # scalar region metrics and saved overlays use exactly the same labels.
+        for zone_id in range(1, self.max_zones + 1):
+            label_idx = zone_id - 1
+            if label_idx >= labels.numel():
+                continue
+            z_label = int(labels[label_idx].item())
+            if z_label == self.invalid_sys_label:
+                continue
+            zone_mask = zones == zone_id
+            if not zone_mask.any():
+                continue
+            region_score = masked_probability_pool(
+                prob_3d,
+                zone_mask,
+                mode=self.region_pooling,
+                top_percent=self.top_percent,
+                lme_r=self.lme_r,
+            )
+            if region_score is None:
+                continue
+            y_true = int(z_label >= self.positive_threshold)
+            y_pred = int(region_score >= self.prob_threshold)
+            zone_true[zone_id] = y_true
+            zone_score[zone_id] = float(region_score)
+            zone_pred[zone_id] = y_pred
+            if y_true:
+                label_map[zone_mask] = 1.0
+            if y_pred:
+                pred_map[zone_mask] = 1.0
+
+        return {
+            "zones": zones,
+            "zone_true": zone_true,
+            "zone_score": zone_score,
+            "zone_pred": zone_pred,
+            "label_map": label_map,
+            "pred_map": pred_map,
+        }
+
+    def build_case_region_maps(
+        self,
+        lesion_probs: torch.Tensor,
+        batch: Mapping,
+        b: int,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        device = lesion_probs.device
+        prob_3d = lesion_probs[b, 0]
+        region_info = self.case_region_info(prob_3d, batch, b, device)
+        if region_info is None:
+            return None, None
+        label_map = region_info["label_map"].detach().cpu().numpy()
+        pred_map = region_info["pred_map"].detach().cpu().numpy()
+        return label_map, pred_map
 
     def _segmentation_target(
         self,
@@ -727,11 +836,28 @@ class SegRiskMapEvaluator:
     ) -> Optional[torch.Tensor]:
         if "lesion_mask" in batch and self._case_flag(batch, "has_lesion", b):
             target = batch["lesion_mask"][b, 0].to(device)
-            return target > 0
+            return target
         if "target_mask" in batch and self._case_flag(batch, "has_target", b):
             target = batch["target_mask"][b, 0].to(device)
-            return target >= self.positive_threshold
+            return (target >= self.positive_threshold).to(target.dtype)
         return None
+
+    def _patient_label(
+        self,
+        batch: Mapping,
+        b: int,
+        device: torch.device,
+    ) -> Optional[int]:
+        seg_target = self._segmentation_target(batch, b, device)
+        if seg_target is not None:
+            return int(bool(seg_target.any().item()))
+        if "sys_labels" not in batch:
+            return None
+        labels = batch["sys_labels"][b].to(device)
+        valid = labels != self.invalid_sys_label
+        if not bool(valid.any().item()):
+            return None
+        return int(bool((labels[valid] >= self.positive_threshold).any().item()))
 
     def _patient_score_mask(
         self,
@@ -773,6 +899,10 @@ class SegRiskMapEvaluator:
                 "auc": 0.0,
                 "auprc": 0.0,
                 "n": 0,
+                "tn": 0,
+                "fp": 0,
+                "fn": 0,
+                "tp": 0,
                 **operating_point_metrics(
                     y_true,
                     y_score,
@@ -791,6 +921,10 @@ class SegRiskMapEvaluator:
             "auc": safe_auc(y_true, y_score),
             "auprc": safe_auprc(y_true, y_score),
             "n": int(len(y_true)),
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
             **operating_point_metrics(
                 y_true,
                 y_score,
@@ -809,6 +943,10 @@ class SegRiskMapEvaluator:
             "patient_auc": patient["auc"],
             "patient_auprc": patient["auprc"],
             "patient_n": patient["n"],
+            "patient_tn": patient["tn"],
+            "patient_fp": patient["fp"],
+            "patient_fn": patient["fn"],
+            "patient_tp": patient["tp"],
             "patient_fixed_spec_target": patient["fixed_spec_target"],
             "patient_sens_at_fixed_spec": patient["sens_at_fixed_spec"],
             "patient_actual_spec_at_fixed_spec": patient["actual_spec_at_fixed_spec"],
@@ -824,6 +962,10 @@ class SegRiskMapEvaluator:
             "region_auc": region["auc"],
             "region_auprc": region["auprc"],
             "region_n": region["n"],
+            "region_tn": region["tn"],
+            "region_fp": region["fp"],
+            "region_fn": region["fn"],
+            "region_tp": region["tp"],
             "region_fixed_spec_target": region["fixed_spec_target"],
             "region_sens_at_fixed_spec": region["sens_at_fixed_spec"],
             "region_actual_spec_at_fixed_spec": region["actual_spec_at_fixed_spec"],
@@ -871,6 +1013,7 @@ class MetricTracker:
         self.loss_lesion_sparse = AverageMeter()
         self.loss_lesion_sys = AverageMeter()
         self.loss_lesion_outside_gland = AverageMeter()
+        self.loss_lesion_patient = AverageMeter()
 
         self.lesion_dice = AverageMeter()
         self.lesion_dice_values = []
@@ -920,6 +1063,10 @@ class MetricTracker:
         self.patient_auc = 0.0
         self.patient_auprc = 0.0
         self.patient_n = 0
+        self.patient_tn = 0
+        self.patient_fp = 0
+        self.patient_fn = 0
+        self.patient_tp = 0
         self.patient_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
         self.patient_sens_at_fixed_spec = 0.0
         self.patient_actual_spec_at_fixed_spec = 0.0
@@ -936,6 +1083,10 @@ class MetricTracker:
         self.region_auc = 0.0
         self.region_auprc = 0.0
         self.region_n = 0
+        self.region_tn = 0
+        self.region_fp = 0
+        self.region_fn = 0
+        self.region_tp = 0
         self.region_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
         self.region_sens_at_fixed_spec = 0.0
         self.region_actual_spec_at_fixed_spec = 0.0
@@ -950,11 +1101,13 @@ class MetricTracker:
         self.em_w_lesion_sparse = AverageMeter()
         self.em_w_lesion_sys = AverageMeter()
         self.em_w_lesion_outside_gland = AverageMeter()
+        self.em_w_lesion_patient = AverageMeter()
 
         self.active_lesion_dense = AverageMeter()
         self.active_lesion_sparse = AverageMeter()
         self.active_lesion_sys = AverageMeter()
         self.active_lesion_outside_gland = AverageMeter()
+        self.active_lesion_patient = AverageMeter()
 
         self.loss_num_batches = 0
         self.loss_num_cases = 0
@@ -972,6 +1125,12 @@ class MetricTracker:
         self.loss_outside_gland_cases = 0
         self.loss_outside_gland_voxels = 0
         self.outside_gland_prob_mean = AverageMeter()
+        self.loss_patient_cases = 0
+        self.loss_patient_positive_cases = 0
+        self.loss_patient_negative_cases = 0
+        self.patient_risk_prob_mean = AverageMeter()
+        self.patient_risk_positive_prob_mean = AverageMeter()
+        self.patient_risk_negative_prob_mean = AverageMeter()
         self.tbx_pos_prob_mean = AverageMeter()
         self.tbx_neg_prob_mean = AverageMeter()
         self.tbx_neg_1mp_mean = AverageMeter()
@@ -996,6 +1155,7 @@ class MetricTracker:
             l_sparse = loss_dict["loss_lesion_sparse"]
             l_sys = loss_dict["loss_lesion_sys"]
             l_outside_gland = loss_dict.get("loss_lesion_outside_gland", 0.0)
+            l_patient = loss_dict.get("loss_lesion_patient", 0.0)
             em_weights = loss_dict.get("em_weights", em_weights)
             active_tasks = loss_dict.get("active_tasks", active_tasks)
             loss_counts = loss_dict.get("loss_counts", {})
@@ -1007,11 +1167,13 @@ class MetricTracker:
             l_sparse = args[6]
             l_sys = args[7]
             l_outside_gland = 0.0
+            l_patient = 0.0
             loss_counts = {}
         elif len(args) >= 5:
             # Compact new order.
             total, l_tot, l_dense, l_sparse, l_sys = args[:5]
             l_outside_gland = 0.0
+            l_patient = 0.0
             loss_counts = {}
         else:
             total = kwargs.get("total", kwargs.get("total_loss", 0.0))
@@ -1020,6 +1182,7 @@ class MetricTracker:
             l_sparse = kwargs.get("loss_lesion_sparse", 0.0)
             l_sys = kwargs.get("loss_lesion_sys", 0.0)
             l_outside_gland = kwargs.get("loss_lesion_outside_gland", 0.0)
+            l_patient = kwargs.get("loss_lesion_patient", 0.0)
             loss_counts = kwargs.get("loss_counts", {})
         loss_counts = loss_counts or {}
 
@@ -1028,8 +1191,9 @@ class MetricTracker:
             sparse_active = float(active_tasks.get("lesion_sparse", 0.0)) > 0
             sys_active = float(active_tasks.get("lesion_sys", 0.0)) > 0
             outside_gland_active = float(active_tasks.get("lesion_outside_gland", 0.0)) > 0
+            patient_active = float(active_tasks.get("lesion_patient", 0.0)) > 0
         else:
-            dense_active = sparse_active = sys_active = outside_gland_active = True
+            dense_active = sparse_active = sys_active = outside_gland_active = patient_active = True
 
         batch_n = int(loss_counts.get("batch_size", 1) or 1)
         dense_n = int(loss_counts.get("lesion_dense_cases", 0) or 0)
@@ -1046,6 +1210,12 @@ class MetricTracker:
         outside_gland_case_n = int(loss_counts.get("lesion_outside_gland_cases", 0) or 0)
         outside_gland_voxel_n = int(loss_counts.get("lesion_outside_gland_voxels", 0) or 0)
         outside_gland_prob_mean = loss_counts.get("outside_gland_prob_mean", None)
+        patient_case_n = int(loss_counts.get("lesion_patient_cases", 0) or 0)
+        patient_positive_n = int(loss_counts.get("lesion_patient_positive_cases", 0) or 0)
+        patient_negative_n = int(loss_counts.get("lesion_patient_negative_cases", 0) or 0)
+        patient_risk_prob_mean = loss_counts.get("patient_risk_prob_mean", None)
+        patient_risk_positive_prob_mean = loss_counts.get("patient_risk_positive_prob_mean", None)
+        patient_risk_negative_prob_mean = loss_counts.get("patient_risk_negative_prob_mean", None)
         tbx_pos_prob_mean = loss_counts.get("tbx_pos_prob_mean", None)
         tbx_neg_prob_mean = loss_counts.get("tbx_neg_prob_mean", None)
         tbx_neg_1mp_mean = loss_counts.get("tbx_neg_1mp_mean", None)
@@ -1069,6 +1239,9 @@ class MetricTracker:
         # conflating it with the biopsy-supervised TBx ROI BCE.
         self.loss_outside_gland_cases += outside_gland_case_n
         self.loss_outside_gland_voxels += outside_gland_voxel_n
+        self.loss_patient_cases += patient_case_n
+        self.loss_patient_positive_cases += patient_positive_n
+        self.loss_patient_negative_cases += patient_negative_n
 
         self.loss_total.update(total, n=batch_n)
         self.loss_lesion.update(l_tot, n=batch_n)
@@ -1083,8 +1256,16 @@ class MetricTracker:
                 l_outside_gland,
                 n=max(outside_gland_voxel_n, outside_gland_case_n, 1),
             )
+        if patient_active:
+            self.loss_lesion_patient.update(l_patient, n=max(patient_case_n, 1))
         if outside_gland_voxel_n > 0:
             self.outside_gland_prob_mean.update(outside_gland_prob_mean, n=outside_gland_voxel_n)
+        if patient_case_n > 0:
+            self.patient_risk_prob_mean.update(patient_risk_prob_mean, n=patient_case_n)
+        if patient_positive_n > 0:
+            self.patient_risk_positive_prob_mean.update(patient_risk_positive_prob_mean, n=patient_positive_n)
+        if patient_negative_n > 0:
+            self.patient_risk_negative_prob_mean.update(patient_risk_negative_prob_mean, n=patient_negative_n)
 
         if sparse_positive_voxel_n > 0:
             self.tbx_pos_prob_mean.update(tbx_pos_prob_mean, n=sparse_positive_voxel_n)
@@ -1099,12 +1280,14 @@ class MetricTracker:
             self.em_w_lesion_sparse.update(em_weights.get("lesion_sparse", 1.0))
             self.em_w_lesion_sys.update(em_weights.get("lesion_sys", 1.0))
             self.em_w_lesion_outside_gland.update(em_weights.get("lesion_outside_gland", 1.0))
+            self.em_w_lesion_patient.update(em_weights.get("lesion_patient", 1.0))
 
         if active_tasks is not None:
             self.active_lesion_dense.update(active_tasks.get("lesion_dense", 0.0))
             self.active_lesion_sparse.update(active_tasks.get("lesion_sparse", 0.0))
             self.active_lesion_sys.update(active_tasks.get("lesion_sys", 0.0))
             self.active_lesion_outside_gland.update(active_tasks.get("lesion_outside_gland", 0.0))
+            self.active_lesion_patient.update(active_tasks.get("lesion_patient", 0.0))
 
     def update_lesion_dice_values(self, values):
         values = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -1246,11 +1429,13 @@ class MetricTracker:
             f"(Dense {self.loss_lesion_dense.avg:.4f}, "
             f"Sparse {self.loss_lesion_sparse.avg:.4f}, "
             f"Sys {self.loss_lesion_sys.avg:.4f}, "
-            f"OutGland {self.loss_lesion_outside_gland.avg:.4f}) | "
+            f"OutGland {self.loss_lesion_outside_gland.avg:.4f}, "
+            f"Patient {self.loss_lesion_patient.avg:.4f}) | "
             f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
             f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
             f"1-p-: {self.tbx_neg_1mp_mean.avg:.4f}, "
-            f"p(out): {self.outside_gland_prob_mean.avg:.4f}"
+            f"p(out): {self.outside_gland_prob_mean.avg:.4f}, "
+            f"p(patient): {self.patient_risk_prob_mean.avg:.4f}"
         )
 
     def print_val_summary(self) -> str:
@@ -1264,12 +1449,15 @@ class MetricTracker:
             f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
             f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
             f"p(out): {self.outside_gland_prob_mean.avg:.4f}, "
+            f"p(patient): {self.patient_risk_prob_mean.avg:.4f}, "
             f"TBx ROI AUC/AUPRC: {self.tbx_roi_auc:.4f}/{self.tbx_roi_auprc:.4f} | "
             f"TBx ROI Sens@FPR{1.0 - self.tbx_roi_fixed_spec_target:.2f}: "
             f"{self.tbx_roi_sens_at_fixed_spec:.4f} | "
             f"Pat Sens@Spec{self.patient_fixed_spec_target:.2f}: {self.patient_sens_at_fixed_spec:.4f} | "
             f"Pat Spec@Sens{self.patient_fixed_sens_target:.2f}: {self.patient_spec_at_fixed_sens:.4f} | "
-            f"Region Sens@Spec{self.region_fixed_spec_target:.2f}: {self.region_sens_at_fixed_spec:.4f}"
+            f"Pat TP/FP/FN/TN: {self.patient_tp}/{self.patient_fp}/{self.patient_fn}/{self.patient_tn} | "
+            f"Region Sens@Spec{self.region_fixed_spec_target:.2f}: {self.region_sens_at_fixed_spec:.4f} | "
+            f"Region TP/FP/FN/TN: {self.region_tp}/{self.region_fp}/{self.region_fn}/{self.region_tn}"
         )
 
     def get_train_dict(self) -> Dict[str, float]:
@@ -1280,18 +1468,22 @@ class MetricTracker:
             "train_loss_lesion_sparse": self.loss_lesion_sparse.avg,
             "train_loss_lesion_sys": self.loss_lesion_sys.avg,
             "train_loss_lesion_outside_gland": self.loss_lesion_outside_gland.avg,
+            "train_loss_lesion_patient": self.loss_lesion_patient.avg,
             "em_w_lesion_dense": self.em_w_lesion_dense.avg,
             "em_w_lesion_sparse": self.em_w_lesion_sparse.avg,
             "em_w_lesion_sys": self.em_w_lesion_sys.avg,
             "em_w_lesion_outside_gland": self.em_w_lesion_outside_gland.avg,
+            "em_w_lesion_patient": self.em_w_lesion_patient.avg,
             "active_lesion_dense": self.active_lesion_dense.avg,
             "active_lesion_sparse": self.active_lesion_sparse.avg,
             "active_lesion_sys": self.active_lesion_sys.avg,
             "active_lesion_outside_gland": self.active_lesion_outside_gland.avg,
+            "active_lesion_patient": self.active_lesion_patient.avg,
             "active_lesion_dense_batch_rate": self.active_lesion_dense.avg,
             "active_lesion_sparse_batch_rate": self.active_lesion_sparse.avg,
             "active_lesion_sys_batch_rate": self.active_lesion_sys.avg,
             "active_lesion_outside_gland_batch_rate": self.active_lesion_outside_gland.avg,
+            "active_lesion_patient_batch_rate": self.active_lesion_patient.avg,
             "train_loss_num_batches": self.loss_num_batches,
             "train_loss_num_cases": self.loss_num_cases,
             "train_loss_dense_cases": self.loss_dense_cases,
@@ -1317,6 +1509,12 @@ class MetricTracker:
             "train_loss_outside_gland_cases": self.loss_outside_gland_cases,
             "train_loss_outside_gland_voxels": self.loss_outside_gland_voxels,
             "train_outside_gland_prob_mean": self.outside_gland_prob_mean.avg,
+            "train_loss_patient_cases": self.loss_patient_cases,
+            "train_loss_patient_positive_cases": self.loss_patient_positive_cases,
+            "train_loss_patient_negative_cases": self.loss_patient_negative_cases,
+            "train_patient_risk_prob_mean": self.patient_risk_prob_mean.avg,
+            "train_patient_risk_positive_prob_mean": self.patient_risk_positive_prob_mean.avg,
+            "train_patient_risk_negative_prob_mean": self.patient_risk_negative_prob_mean.avg,
             "train_loss_sys_cases": self.loss_sys_cases,
             "train_loss_sys_regions": self.loss_sys_regions,
         }
@@ -1329,6 +1527,7 @@ class MetricTracker:
             "val_loss_lesion_sparse": self.loss_lesion_sparse.avg,
             "val_loss_lesion_sys": self.loss_lesion_sys.avg,
             "val_loss_lesion_outside_gland": self.loss_lesion_outside_gland.avg,
+            "val_loss_lesion_patient": self.loss_lesion_patient.avg,
             "val_lesion_dice": self.lesion_dice.avg,
             "val_lesion_dice_mean": self.lesion_dice.avg,
             "val_lesion_dice_std": self.lesion_dice_std,
@@ -1372,6 +1571,10 @@ class MetricTracker:
             "val_patient_auc": self.patient_auc,
             "val_patient_auprc": self.patient_auprc,
             "val_patient_n": self.patient_n,
+            "val_patient_tn": self.patient_tn,
+            "val_patient_fp": self.patient_fp,
+            "val_patient_fn": self.patient_fn,
+            "val_patient_tp": self.patient_tp,
             "val_patient_fixed_spec_target": self.patient_fixed_spec_target,
             "val_patient_sens_at_fixed_spec": self.patient_sens_at_fixed_spec,
             "val_patient_actual_spec_at_fixed_spec": self.patient_actual_spec_at_fixed_spec,
@@ -1387,6 +1590,10 @@ class MetricTracker:
             "val_region_auc": self.region_auc,
             "val_region_auprc": self.region_auprc,
             "val_region_n": self.region_n,
+            "val_region_tn": self.region_tn,
+            "val_region_fp": self.region_fp,
+            "val_region_fn": self.region_fn,
+            "val_region_tp": self.region_tp,
             "val_region_fixed_spec_target": self.region_fixed_spec_target,
             "val_region_sens_at_fixed_spec": self.region_sens_at_fixed_spec,
             "val_region_actual_spec_at_fixed_spec": self.region_actual_spec_at_fixed_spec,
@@ -1421,6 +1628,12 @@ class MetricTracker:
             "val_loss_outside_gland_cases": self.loss_outside_gland_cases,
             "val_loss_outside_gland_voxels": self.loss_outside_gland_voxels,
             "val_outside_gland_prob_mean": self.outside_gland_prob_mean.avg,
+            "val_loss_patient_cases": self.loss_patient_cases,
+            "val_loss_patient_positive_cases": self.loss_patient_positive_cases,
+            "val_loss_patient_negative_cases": self.loss_patient_negative_cases,
+            "val_patient_risk_prob_mean": self.patient_risk_prob_mean.avg,
+            "val_patient_risk_positive_prob_mean": self.patient_risk_positive_prob_mean.avg,
+            "val_patient_risk_negative_prob_mean": self.patient_risk_negative_prob_mean.avg,
             "val_loss_sys_cases": self.loss_sys_cases,
             "val_loss_sys_regions": self.loss_sys_regions,
         }
@@ -1443,10 +1656,12 @@ def validate(model, loader, criterion, device, epoch, save_dir):
 
     positive_threshold = int(_cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1)))
     prob_threshold = float(_cfg("PRED_PROB_THRESHOLD", 0.5))
+    invalid_sys_label = int(_cfg("INVALID_SYS_LABEL", -1))
 
     seg_evaluator = SegRiskMapEvaluator(
         prob_threshold=prob_threshold,
         positive_threshold=positive_threshold,
+        invalid_sys_label=invalid_sys_label,
     )
 
     saved_counts = {"PUB": 0, "TCIA": 0, "PROMIS": 0, "OTHER": 0}
@@ -1520,12 +1735,21 @@ def validate(model, loader, criterion, device, epoch, save_dir):
                     continue
 
                 empty_like = torch.zeros_like(lesion_probs[b, 0])
+                # Reuse evaluator logic for visual overlays so QA images mirror
+                # the reported region-level confusion counts.
+                region_label_map, region_pred_map = seg_evaluator.build_case_region_maps(
+                    lesion_probs=lesion_probs,
+                    batch=batch,
+                    b=b,
+                )
                 gt_dict = {
                     "type": d_type,
                     "lesion_mask": mask_for_visualisation(batch, "lesion_mask", b, empty_like),
                     "target_mask": mask_for_visualisation(batch, "target_mask", b, empty_like),
                     "zones_mask": mask_for_visualisation(batch, "zones_mask", b, empty_like),
                     "sys_labels": batch["sys_labels"][b].detach().cpu().numpy() if "sys_labels" in batch else np.asarray([]),
+                    "region_label_map": region_label_map,
+                    "region_pred_map": region_pred_map,
                 }
                 pid = batch["pid"][b] if "pid" in batch else f"case_{epoch}_{b}"
                 filename = f"{d_type}_{saved_counts.get(d_type, 0) + 1:02d}_{safe_vis_filename(pid)}.png"
@@ -1555,6 +1779,10 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.patient_auc = seg_metrics["patient_auc"]
     tracker.patient_auprc = seg_metrics["patient_auprc"]
     tracker.patient_n = seg_metrics["patient_n"]
+    tracker.patient_tn = seg_metrics["patient_tn"]
+    tracker.patient_fp = seg_metrics["patient_fp"]
+    tracker.patient_fn = seg_metrics["patient_fn"]
+    tracker.patient_tp = seg_metrics["patient_tp"]
     tracker.patient_fixed_spec_target = seg_metrics["patient_fixed_spec_target"]
     tracker.patient_sens_at_fixed_spec = seg_metrics["patient_sens_at_fixed_spec"]
     tracker.patient_actual_spec_at_fixed_spec = seg_metrics["patient_actual_spec_at_fixed_spec"]
@@ -1571,6 +1799,10 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.region_auc = seg_metrics["region_auc"]
     tracker.region_auprc = seg_metrics["region_auprc"]
     tracker.region_n = seg_metrics["region_n"]
+    tracker.region_tn = seg_metrics["region_tn"]
+    tracker.region_fp = seg_metrics["region_fp"]
+    tracker.region_fn = seg_metrics["region_fn"]
+    tracker.region_tp = seg_metrics["region_tp"]
     tracker.region_fixed_spec_target = seg_metrics["region_fixed_spec_target"]
     tracker.region_sens_at_fixed_spec = seg_metrics["region_sens_at_fixed_spec"]
     tracker.region_actual_spec_at_fixed_spec = seg_metrics["region_actual_spec_at_fixed_spec"]
@@ -1700,14 +1932,26 @@ def visualize_predictions(input_tensor, risk_map, gt_dict, save_path: str, patie
         axes[1, i].set_title(title)
         axes[1, i].axis("off")
 
-        # Row 3: systematic zones, useful for SBx/PROMIS interpretation.
+        # Row 3: region-level label/prediction, useful for localisation QA.
         axes[2, i].imshow(t2[s_idx], cmap="gray")
         z_slice = gt_dict.get("zones_mask", None)
         if z_slice is not None and np.max(z_slice) > 0:
             zone_overlay = np.ma.masked_where(z_slice[s_idx] == 0, z_slice[s_idx])
-            im3 = axes[2, i].imshow(zone_overlay, cmap="tab20", alpha=0.35)
-            if i == 2:
-                fig.colorbar(im3, ax=axes[2, i], fraction=0.046, pad=0.04)
+            axes[2, i].imshow(zone_overlay, cmap="tab20", alpha=0.18)
+        region_label = gt_dict.get("region_label_map", None)
+        region_pred = gt_dict.get("region_pred_map", None)
+        has_region_overlay = False
+        if region_label is not None and np.max(region_label) > 0:
+            label_overlay = np.ma.masked_where(region_label[s_idx] == 0, region_label[s_idx])
+            axes[2, i].imshow(label_overlay, cmap="Greens", alpha=0.42, vmin=0, vmax=1)
+            has_region_overlay = True
+        if region_pred is not None and np.max(region_pred) > 0:
+            pred_overlay = np.ma.masked_where(region_pred[s_idx] == 0, region_pred[s_idx])
+            axes[2, i].imshow(pred_overlay, cmap="Reds", alpha=0.42, vmin=0, vmax=1)
+            has_region_overlay = True
+        if has_region_overlay:
+            axes[2, i].set_title(f"Regions: label green / pred red (Slice {s_idx})")
+        elif z_slice is not None and np.max(z_slice) > 0:
             axes[2, i].set_title(f"Systematic Zones (Slice {s_idx})")
         else:
             axes[2, i].set_title(f"No systematic zones (Slice {s_idx})")

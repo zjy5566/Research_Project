@@ -3,8 +3,8 @@ Test/inference script for the revised lesion-segmentation + MIL setting.
 
 This version removes grade/gland evaluation and reports:
   - voxel-level lesion metrics when dense lesion masks are available, e.g. PUB
-  - patient-level cancer/csPCa metrics from lesion probability maps
-  - region-level MIL metrics for SBx zones, e.g. TCIA/PROMIS
+  - patient-level metrics derived from segmentation risk maps
+  - region-level metrics from risk maps and RA-lesion-to-zone IoU labels
 """
 
 from __future__ import annotations
@@ -209,6 +209,8 @@ def save_seg_mil_vis(
     zones_mask: np.ndarray,
     sys_labels: np.ndarray,
     lesion_prob: np.ndarray,
+    region_label_map: np.ndarray | None,
+    region_pred_map: np.ndarray | None,
     pid: str,
     save_path: str,
 ):
@@ -224,6 +226,8 @@ def save_seg_mil_vis(
     s_target = target_gt[z]
     s_zones = zones_mask[z]
     s_sys_pos = sys_pos[z]
+    s_region_label = region_label_map[z] if region_label_map is not None else None
+    s_region_pred = region_pred_map[z] if region_pred_map is not None else None
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 10))
     fig.suptitle(f"Patient: {pid} | Slice: {z}/{img_vol.shape[0]}", fontsize=16, fontweight="bold")
@@ -254,10 +258,14 @@ def save_seg_mil_vis(
 
     axes[1, 1].imshow(s_img, cmap="gray")
     if s_zones.max() > 0:
-        axes[1, 1].imshow(np.ma.masked_where(s_zones == 0, s_zones), cmap="tab20", alpha=0.35)
-    if s_sys_pos.sum() > 0:
+        axes[1, 1].imshow(np.ma.masked_where(s_zones == 0, s_zones), cmap="tab20", alpha=0.18)
+    if s_region_label is not None and np.max(s_region_label) > 0:
+        axes[1, 1].imshow(np.ma.masked_where(s_region_label == 0, s_region_label), cmap="Greens", alpha=0.42)
+    if s_region_pred is not None and np.max(s_region_pred) > 0:
+        axes[1, 1].imshow(np.ma.masked_where(s_region_pred == 0, s_region_pred), cmap="Reds", alpha=0.42)
+    elif s_sys_pos.sum() > 0:
         axes[1, 1].contour(s_sys_pos, levels=[0.5], linewidths=1.5)
-    axes[1, 1].set_title("SBx zones / positive regions")
+    axes[1, 1].set_title("Regions: label green / pred red")
     axes[1, 1].axis("off")
 
     axes[1, 2].imshow(s_img, cmap="gray")
@@ -336,7 +344,7 @@ def main():
     positive_threshold = int(_cfg("LESION_POSITIVE_THRESHOLD", _cfg("CSPC_THRESHOLD", 1)))
     prob_threshold = float(_cfg("PRED_PROB_THRESHOLD", 0.5))
 
-    mil_evaluator = utils.LesionMILEvaluator(
+    seg_evaluator = utils.SegRiskMapEvaluator(
         prob_threshold=prob_threshold,
         positive_threshold=positive_threshold,
         invalid_sys_label=invalid_sys_label,
@@ -360,12 +368,7 @@ def main():
             lesion_probs = torch.sigmoid(lesion_logits)
             lesion_prob_3d = lesion_probs[0, 0]
 
-            mil_evaluator.update_from_batch(
-                lesion_probs=lesion_probs,
-                batch=batch,
-                region_logits=outputs.get("region_logits"),
-                region_valid_mask=outputs.get("region_valid_mask"),
-            )
+            seg_evaluator.update_from_batch(lesion_probs=lesion_probs, batch=batch)
 
             has_lesion = bool(batch.get("has_lesion", torch.zeros(1, device=device))[0].item() > 0)
             has_target = bool(batch.get("has_target", torch.zeros(1, device=device))[0].item() > 0)
@@ -381,27 +384,40 @@ def main():
                 lesion_sens = utils.compute_sens(pred_binary, gt_lesion_tensor)
                 lesion_spec = utils.compute_spec(pred_binary, gt_lesion_tensor) if hasattr(utils, "compute_spec") else np.nan
 
-            gland_tensor = batch["gland_mask"][0, 0] if has_gland and "gland_mask" in batch else None
-            patient_score = compute_patient_score(lesion_prob_3d, gland_tensor)
-            patient_label = compute_patient_label(batch, 0, positive_threshold, invalid_sys_label)
-            patient_pred = int(patient_score >= prob_threshold) if patient_label != invalid_sys_label else np.nan
-
-            # Summarise model-pooled region scores for this patient when available.
+            patient_label_value = seg_evaluator._patient_label(batch, 0, device)
+            patient_label = invalid_sys_label
+            patient_score = np.nan
+            patient_pred = np.nan
             region_positive_gt = np.nan
             region_positive_pred = np.nan
-            if has_sys and "sys_labels" in batch:
-                labels = batch["sys_labels"][0]
-                valid = labels != invalid_sys_label
-                if valid.any():
-                    region_positive_gt = int((labels[valid] >= positive_threshold).sum().item())
+            region_tp = region_fp = region_fn = region_tn = np.nan
+            region_label_map = None
+            region_pred_map = None
+            if patient_label_value is not None:
+                patient_label = int(patient_label_value)
+                patient_mask = seg_evaluator._patient_score_mask(batch, 0, device, lesion_prob_3d)
+                patient_score = utils.masked_probability_pool(
+                    lesion_prob_3d,
+                    patient_mask,
+                    mode=seg_evaluator.patient_pooling,
+                    top_percent=seg_evaluator.top_percent,
+                    lme_r=seg_evaluator.lme_r,
+                )
+                patient_pred = int(patient_score >= prob_threshold) if patient_score is not None else np.nan
 
-                    region_logits = outputs.get("region_logits")
-                    if region_logits is not None:
-                        region_scores = torch.sigmoid(region_logits[0])
-                        if region_scores.dim() == 2 and region_scores.size(-1) == 1:
-                            region_scores = region_scores.squeeze(-1)
-                        region_scores = region_scores[: labels.numel()]
-                        region_positive_pred = int((region_scores[valid] >= prob_threshold).sum().item())
+            region_info = seg_evaluator.case_region_info(lesion_prob_3d, batch, 0, device)
+            if region_info is not None:
+                region_label_map = region_info["label_map"].detach().cpu().numpy()
+                region_pred_map = region_info["pred_map"].detach().cpu().numpy()
+                zone_ids = sorted(set(region_info["zone_score"].keys()))
+                y_true = np.asarray([region_info["zone_true"][z] for z in zone_ids], dtype=np.int64)
+                y_pred = np.asarray([region_info["zone_pred"][z] for z in zone_ids], dtype=np.int64)
+                region_positive_gt = int(y_true.sum())
+                region_positive_pred = int(y_pred.sum())
+                region_tp = int(((y_true == 1) & (y_pred == 1)).sum())
+                region_fp = int(((y_true == 0) & (y_pred == 1)).sum())
+                region_fn = int(((y_true == 1) & (y_pred == 0)).sum())
+                region_tn = int(((y_true == 0) & (y_pred == 0)).sum())
 
             results.append(
                 {
@@ -419,6 +435,10 @@ def main():
                     "Patient_Pred": patient_pred,
                     "Region_Positive_GT_Count": region_positive_gt,
                     "Region_Positive_Pred_Count": region_positive_pred,
+                    "Region_TP": region_tp,
+                    "Region_FP": region_fp,
+                    "Region_FN": region_fn,
+                    "Region_TN": region_tn,
                 }
             )
 
@@ -436,6 +456,8 @@ def main():
                 zones_mask=gt_zones,
                 sys_labels=gt_sys_labels,
                 lesion_prob=pred_prob_np,
+                region_label_map=region_label_map,
+                region_pred_map=region_pred_map,
                 pid=pid,
                 save_path=os.path.join(vis_dir, f"{pid}.png"),
             )
@@ -444,7 +466,7 @@ def main():
     csv_path = os.path.join(test_dir, "test_metrics_per_patient.csv")
     df_results.to_csv(csv_path, index=False)
 
-    mil_metrics = mil_evaluator.compute_metrics()
+    seg_metrics = seg_evaluator.compute_metrics()
 
     print("\n" + "=" * 60)
     print("TEST METRICS SUMMARY: Lesion Segmentation + MIL")
@@ -461,39 +483,49 @@ def main():
         print(f"   - Mean F1:   {dense_df['Lesion_F1'].mean():.4f}")
         print()
 
-    print("Patient-level MIL metrics:")
-    print(f"   - N:     {mil_metrics['patient_n']}")
+    print("Patient-level segmentation-derived risk-map metrics:")
+    print(f"   - N:     {seg_metrics['patient_n']}")
     print(
-        f"   - Sens @ Spec>={mil_metrics['patient_fixed_spec_target']:.2f}: "
-        f"{mil_metrics['patient_sens_at_fixed_spec']:.4f} "
-        f"(actual spec={mil_metrics['patient_actual_spec_at_fixed_spec']:.4f}, "
-        f"thr={mil_metrics['patient_threshold_at_fixed_spec']:.4f})"
+        f"   - TP/FP/FN/TN: "
+        f"{seg_metrics['patient_tp']}/{seg_metrics['patient_fp']}/"
+        f"{seg_metrics['patient_fn']}/{seg_metrics['patient_tn']}"
     )
     print(
-        f"   - Spec @ Sens>={mil_metrics['patient_fixed_sens_target']:.2f}: "
-        f"{mil_metrics['patient_spec_at_fixed_sens']:.4f} "
-        f"(actual sens={mil_metrics['patient_actual_sens_at_fixed_sens']:.4f}, "
-        f"thr={mil_metrics['patient_threshold_at_fixed_sens']:.4f})"
+        f"   - Sens @ Spec>={seg_metrics['patient_fixed_spec_target']:.2f}: "
+        f"{seg_metrics['patient_sens_at_fixed_spec']:.4f} "
+        f"(actual spec={seg_metrics['patient_actual_spec_at_fixed_spec']:.4f}, "
+        f"thr={seg_metrics['patient_threshold_at_fixed_spec']:.4f})"
     )
-    print(f"   - AUC:   {mil_metrics['patient_auc']:.4f}")
-    print(f"   - AUPRC: {mil_metrics['patient_auprc']:.4f}\n")
+    print(
+        f"   - Spec @ Sens>={seg_metrics['patient_fixed_sens_target']:.2f}: "
+        f"{seg_metrics['patient_spec_at_fixed_sens']:.4f} "
+        f"(actual sens={seg_metrics['patient_actual_sens_at_fixed_sens']:.4f}, "
+        f"thr={seg_metrics['patient_threshold_at_fixed_sens']:.4f})"
+    )
+    print(f"   - AUC:   {seg_metrics['patient_auc']:.4f}")
+    print(f"   - AUPRC: {seg_metrics['patient_auprc']:.4f}\n")
 
-    print("Region-level SBx MIL metrics:")
-    print(f"   - N:     {mil_metrics['region_n']}")
+    print("Region-level segmentation-derived risk-map metrics:")
+    print(f"   - N:     {seg_metrics['region_n']}")
     print(
-        f"   - Sens @ Spec>={mil_metrics['region_fixed_spec_target']:.2f}: "
-        f"{mil_metrics['region_sens_at_fixed_spec']:.4f} "
-        f"(actual spec={mil_metrics['region_actual_spec_at_fixed_spec']:.4f}, "
-        f"thr={mil_metrics['region_threshold_at_fixed_spec']:.4f})"
+        f"   - TP/FP/FN/TN: "
+        f"{seg_metrics['region_tp']}/{seg_metrics['region_fp']}/"
+        f"{seg_metrics['region_fn']}/{seg_metrics['region_tn']}"
     )
     print(
-        f"   - Spec @ Sens>={mil_metrics['region_fixed_sens_target']:.2f}: "
-        f"{mil_metrics['region_spec_at_fixed_sens']:.4f} "
-        f"(actual sens={mil_metrics['region_actual_sens_at_fixed_sens']:.4f}, "
-        f"thr={mil_metrics['region_threshold_at_fixed_sens']:.4f})"
+        f"   - Sens @ Spec>={seg_metrics['region_fixed_spec_target']:.2f}: "
+        f"{seg_metrics['region_sens_at_fixed_spec']:.4f} "
+        f"(actual spec={seg_metrics['region_actual_spec_at_fixed_spec']:.4f}, "
+        f"thr={seg_metrics['region_threshold_at_fixed_spec']:.4f})"
     )
-    print(f"   - AUC:   {mil_metrics['region_auc']:.4f}")
-    print(f"   - AUPRC: {mil_metrics['region_auprc']:.4f}")
+    print(
+        f"   - Spec @ Sens>={seg_metrics['region_fixed_sens_target']:.2f}: "
+        f"{seg_metrics['region_spec_at_fixed_sens']:.4f} "
+        f"(actual sens={seg_metrics['region_actual_sens_at_fixed_sens']:.4f}, "
+        f"thr={seg_metrics['region_threshold_at_fixed_sens']:.4f})"
+    )
+    print(f"   - AUC:   {seg_metrics['region_auc']:.4f}")
+    print(f"   - AUPRC: {seg_metrics['region_auprc']:.4f}")
     print("=" * 60)
 
 
