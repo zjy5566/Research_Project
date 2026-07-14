@@ -194,7 +194,7 @@ def create_unified_dataset(base_dir):
             })
 
     # --- 5. Generate registry and latest internal/external split CSVs ---
-    print("\nGenerating registry and PROMIS external-validation splits...")
+    print("\nGenerating registry, internal validation/test, and PROMIS external-validation splits...")
     if len(registry_data) == 0:
         print("Error: No valid data found! Please check your source directories.")
         return
@@ -210,6 +210,7 @@ def create_unified_dataset(base_dir):
         splits_dir=splits_dir,
         external_source="PROMIS",
         val_size=0.2,
+        internal_test_size=0.1,
         random_state=RANDOM_STATE,
     )
 

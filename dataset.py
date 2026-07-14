@@ -380,6 +380,20 @@ class ProstateUnifiedDataset(Dataset):
         target_grade, target_cancer, target_cspc = self._derive_target_case_labels(target_mask, has_target)
         cls_grade, cls_cancer, cls_cspc, has_cls = self._combine_case_labels(target_grade, sys_grade)
 
+        # A PUB dense mask describes radiological lesion presence; it is not a
+        # biopsy-confirmed csPCa label. The legacy fallback is available only
+        # behind an explicit compatibility flag and is disabled for redesigned
+        # B/N experiments.
+        if (
+            not has_cls
+            and has_lesion
+            and bool(getattr(Config, "USE_RA_LESION_PRESENCE_AS_PATIENT_LABEL", False))
+        ):
+            cls_cspc = int(bool(np.any(lesion_mask > 0)))
+            cls_cancer = cls_cspc
+            cls_grade = self.cspc_threshold if cls_cspc else 0
+            has_cls = True
+
         # If later your split CSV contains explicit case-level labels, they override derived labels.
         # This makes the loader compatible with a future supervisor-provided split table.
         if "case_grade" in row and not pd.isna(row["case_grade"]):

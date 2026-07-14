@@ -227,6 +227,7 @@ class MixedSupervisionLoss(nn.Module):
         self.use_sys_class_balanced_bce = bool(use_sys_class_balanced_bce)
         self.patient_risk_pooling = str(_cfg("PATIENT_RISK_POOLING", "lme")).lower()
         self.patient_risk_lme_r = float(_cfg("PATIENT_RISK_LME_R", _cfg("LME_R", 8.0)))
+        self.patient_risk_use_gland_mask = bool(_cfg("PATIENT_RISK_USE_GLAND_MASK", False))
 
         default_fixed_loss_weights = {
             "lesion_dense": 1.0,
@@ -485,7 +486,7 @@ class MixedSupervisionLoss(nn.Module):
         for idx in valid_indices:
             logits_3d = lesion_logits[idx, 0]
             mask = None
-            if gland_mask is not None and bool(has_gland[idx].item()):
+            if self.patient_risk_use_gland_mask and gland_mask is not None and bool(has_gland[idx].item()):
                 mask = gland_mask[idx, 0] > 0
                 if not mask.any():
                     mask = None

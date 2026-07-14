@@ -6,7 +6,9 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from Loss_function import MixedSupervisionLoss
+from config import Config
 from utils import (
+    FROCEvaluator,
     LesionMILEvaluator,
     MetricTracker,
     SegRiskMapEvaluator,
@@ -191,6 +193,53 @@ def test_seg_risk_map_metrics_use_seg_patient_gt_and_sbx_region_gt():
     assert sbx_only_evaluator.region_true == [1, 0, 0, 0]
 
 
+def test_seg_risk_map_patient_pooling_can_ignore_gland_mask_for_deployment():
+    evaluator = SegRiskMapEvaluator(
+        prob_threshold=0.5,
+        positive_threshold=1,
+        top_percent=25.0,
+        max_zones=1,
+        invalid_sys_label=-1,
+        use_gland_mask_for_patient_pooling=False,
+    )
+    lesion_probs = torch.tensor([[[[[0.9, 0.2, 0.1, 0.1]]]]], dtype=torch.float32)
+    batch = {
+        "has_lesion": torch.tensor([1.0]),
+        "has_cls": torch.tensor([1.0]),
+        "cls_cspc_label": torch.tensor([1]),
+        "lesion_mask": torch.tensor([[[[[1.0, 0.0, 0.0, 0.0]]]]], dtype=torch.float32),
+        "gland_mask": torch.tensor([[[[[0.0, 1.0, 0.0, 0.0]]]]], dtype=torch.float32),
+    }
+
+    evaluator.update_from_batch(lesion_probs, batch)
+
+    assert evaluator.patient_true == [1]
+    assert abs(evaluator.patient_score[0] - 0.9) < 1e-6
+
+
+def test_seg_risk_map_excludes_dense_ra_without_patient_pathology_label():
+    evaluator = SegRiskMapEvaluator(
+        prob_threshold=0.5,
+        positive_threshold=3,
+        patient_pooling="max",
+        invalid_sys_label=-1,
+    )
+    lesion_probs = torch.tensor([[[[[0.95]]]]], dtype=torch.float32)
+    batch = {
+        "has_lesion": torch.tensor([1.0]),
+        "has_target": torch.tensor([0.0]),
+        "has_sys": torch.tensor([0.0]),
+        "has_cls": torch.tensor([0.0]),
+        "cls_cspc_label": torch.tensor([-1]),
+        "lesion_mask": torch.tensor([[[[[1.0]]]]], dtype=torch.float32),
+    }
+
+    evaluator.update_from_batch(lesion_probs, batch)
+
+    assert evaluator.patient_true == []
+    assert evaluator.patient_score == []
+
+
 def test_outside_gland_penalty_uses_only_outside_gland_voxels():
     criterion = MixedSupervisionLoss(
         use_em_weighting=False,
@@ -233,7 +282,9 @@ def test_outside_gland_penalty_uses_only_outside_gland_voxels():
     )
 
 
-def test_patient_risk_loss_pools_risk_map_inside_gland():
+def test_patient_risk_loss_uses_full_crop_by_default_for_test_time_consistency():
+    old_use_gland = Config.PATIENT_RISK_USE_GLAND_MASK
+    Config.PATIENT_RISK_USE_GLAND_MASK = False
     criterion = MixedSupervisionLoss(
         use_em_weighting=False,
         fixed_loss_weights={
@@ -266,7 +317,7 @@ def test_patient_risk_loss_pools_risk_map_inside_gland():
     }
 
     loss_dict = criterion({"lesion_logits": lesion_logits}, batch)
-    inside_logits = torch.tensor([2.0, 1.0])
+    inside_logits = torch.tensor([0.0, 2.0, -1.0, 1.0])
     r = torch.tensor(8.0)
     pooled_logit = torch.logsumexp(inside_logits * r, dim=0) / r - torch.log(
         torch.tensor(float(inside_logits.numel()))
@@ -286,6 +337,7 @@ def test_patient_risk_loss_pools_risk_map_inside_gland():
         torch.tensor(counts["patient_risk_prob_mean"]),
         torch.sigmoid(pooled_logit),
     )
+    Config.PATIENT_RISK_USE_GLAND_MASK = old_use_gland
 
 
 def test_target_cspca_dice_uses_only_positive_target_cases():
@@ -323,20 +375,132 @@ def test_target_cspca_dice_uses_only_positive_target_cases():
     assert abs(tracker.target_cspca_dice.avg - expected) < 1e-6
 
 
-def test_tbx_roi_metrics_report_sensitivity_at_fixed_fpr():
+def test_tbx_roi_metrics_report_sensitivity_at_fixed_roc_specificity():
     tracker = MetricTracker()
 
     tracker.update_tbx_roi_samples(
         y_true=[0, 0, 1, 1],
         y_score=[0.1, 0.2, 0.8, 0.9],
     )
-    tracker.finalize_tbx_roi_metrics(threshold=0.5)
+    tracker.finalize_tbx_roi_metrics(threshold=0.5, compute_operating_metrics=True)
 
     assert tracker.tbx_roi_n == 4
     assert tracker.tbx_roi_fixed_spec_target == 0.95
     assert tracker.tbx_roi_actual_fpr_at_fixed_spec <= 0.05 + 1e-8
     assert tracker.tbx_roi_sens_at_fixed_spec == 1.0
+    assert tracker.tbx_roi_spec_at_fixed_sens == 1.0
     assert tracker.tbx_roi_auc == 1.0
+
+
+def test_voxel_operating_metrics_report_fixed_specificity_and_sensitivity():
+    tracker = MetricTracker()
+
+    tracker.update_voxel_operating_samples(
+        "lesion",
+        y_true=[0, 0, 1, 1],
+        y_score=[0.1, 0.2, 0.8, 0.9],
+    )
+    tracker.update_voxel_operating_samples(
+        "target_cspca",
+        y_true=[0, 0, 1, 1],
+        y_score=[0.1, 0.2, 0.8, 0.9],
+    )
+    tracker.finalize_voxel_operating_metrics("lesion")
+    tracker.finalize_voxel_operating_metrics("target_cspca")
+
+    assert tracker.lesion_voxel_n == 4
+    assert tracker.lesion_voxel_sens_at_fixed_spec == 1.0
+    assert tracker.lesion_voxel_actual_fpr_at_fixed_spec <= 0.05 + 1e-8
+    assert tracker.lesion_voxel_spec_at_fixed_sens == 1.0
+    assert tracker.target_cspca_voxel_n == 4
+    assert tracker.target_cspca_voxel_sens_at_fixed_spec == 1.0
+    assert tracker.target_cspca_voxel_spec_at_fixed_sens == 1.0
+
+
+def test_dense_lesion_metrics_ignore_predictions_outside_gland():
+    tracker = MetricTracker()
+    probs = torch.tensor(
+        [
+            [[[[0.9, 0.9, 0.1, 0.9]]]],
+            [[[[0.9, 0.9, 0.1, 0.9]]]],
+        ],
+        dtype=torch.float32,
+    )
+    target = torch.tensor(
+        [
+            [[[[1.0, 0.0, 0.0, 0.0]]]],
+            [[[[1.0, 0.0, 0.0, 0.0]]]],
+        ],
+        dtype=torch.float32,
+    )
+    gland = torch.tensor(
+        [
+            [[[[1.0, 0.0, 1.0, 0.0]]]],
+            [[[[0.0, 0.0, 0.0, 0.0]]]],
+        ],
+        dtype=torch.float32,
+    )
+
+    tracker.update_lesion_dice_values(
+        compute_dice_per_case((probs >= 0.5).float(), target)
+    )
+    tracker.update_lesion_gland_metrics(
+        probs,
+        target,
+        gland,
+        has_gland=torch.tensor([1.0, 0.0]),
+        threshold=0.5,
+        compute_operating_metrics=True,
+        compute_froc_metrics=True,
+    )
+    tracker.finalize_voxel_operating_metrics("lesion")
+    tracker.finalize_froc_metrics()
+
+    assert tracker.lesion_dice.avg < 1.0
+    assert tracker.lesion_gland_dice.avg == 1.0
+    assert tracker.lesion_gland_cases == 1
+    assert tracker.lesion_gland_missing_cases == 1
+    assert tracker.lesion_gland_voxels == 2
+    assert tracker.lesion_voxel_n == 2
+    assert tracker.lesion_sens.avg == 1.0
+    assert tracker.lesion_spec.avg == 1.0
+    assert tracker.lesion_froc.counts[0.5]["num_fp"] == 0
+    metrics = tracker.get_val_dict()
+    assert metrics["val_lesion_full_crop_dice"] < 1.0
+    assert metrics["val_lesion_gland_dice"] == 1.0
+    assert metrics["val_lesion_gland_voxel_n"] == 2
+    assert metrics["val_lesion_gland_froc_n"] == 1
+
+
+def test_froc_metrics_report_sensitivity_at_fixed_fp_per_patient():
+    evaluator = FROCEvaluator(
+        thresholds=(0.5, 0.85),
+        fp_per_patient_targets=(0.5,),
+        min_component_voxels=1,
+    )
+    probs = torch.tensor(
+        [
+            [[[[0.90, 0.10, 0.80, 0.10]]]],
+            [[[[0.10, 0.70, 0.10, 0.10]]]],
+        ],
+        dtype=torch.float32,
+    )
+    target = torch.tensor(
+        [
+            [[[[1.0, 0.0, 0.0, 0.0]]]],
+            [[[[0.0, 0.0, 0.0, 0.0]]]],
+        ],
+        dtype=torch.float32,
+    )
+
+    evaluator.update_from_maps(probs, target)
+    metrics = evaluator.compute_metrics(prefix="lesion_")
+
+    assert metrics["lesion_froc_n"] == 2
+    assert metrics["lesion_froc_num_gt"] == 1
+    assert metrics["lesion_sens_at_fp_per_patient_0p5"] == 1.0
+    assert metrics["lesion_actual_fp_per_patient_0p5"] == 0.0
+    assert metrics["lesion_threshold_at_fp_per_patient_0p5"] == 0.85
 
 
 def test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound():
@@ -357,8 +521,12 @@ if __name__ == "__main__":
     test_tbx_pos_neg_bce_uses_sampled_roi_and_ignores_unsampled()
     test_pub_dense_cases_do_not_enter_patient_metrics()
     test_seg_risk_map_metrics_use_seg_patient_gt_and_sbx_region_gt()
+    test_seg_risk_map_patient_pooling_can_ignore_gland_mask_for_deployment()
     test_outside_gland_penalty_uses_only_outside_gland_voxels()
-    test_patient_risk_loss_pools_risk_map_inside_gland()
+    test_patient_risk_loss_uses_full_crop_by_default_for_test_time_consistency()
     test_target_cspca_dice_uses_only_positive_target_cases()
-    test_tbx_roi_metrics_report_sensitivity_at_fixed_fpr()
+    test_tbx_roi_metrics_report_sensitivity_at_fixed_roc_specificity()
+    test_voxel_operating_metrics_report_fixed_specificity_and_sensitivity()
+    test_dense_lesion_metrics_ignore_predictions_outside_gland()
+    test_froc_metrics_report_sensitivity_at_fixed_fp_per_patient()
     test_target_cspca_aux_dice_reports_swept_threshold_and_topk_upper_bound()

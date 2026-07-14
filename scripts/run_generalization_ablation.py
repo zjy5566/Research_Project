@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from typing import Any, Dict, Optional
+
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
 
 
 ABLATIONS: Dict[str, Dict[str, Any]] = {
@@ -112,11 +118,23 @@ def _refresh_paths(
         Config.COMMON_INTERNAL_VAL_CSV = os.path.join(
             Config.SPLIT_DIR, "common_internal_evaluation.csv"
         )
+        Config.COMMON_INTERNAL_TEST_CSV = os.path.join(
+            Config.SPLIT_DIR, "common_internal_test.csv"
+        )
+        Config.COMMON_EXTERNAL_TEST_CSV = os.path.join(
+            Config.SPLIT_DIR, "N4_mixed_PROMIS_external_val.csv"
+        )
 
-        if getattr(Config, "EXPERIMENT_MODE", "") == "B1_TCIA_TBX_BASELINE":
-            Config.TRAIN_CSV = os.path.join(Config.SPLIT_DIR, "B1_TCIA_TBx_baseline_train.csv")
-            Config.VAL_CSV = Config.COMMON_INTERNAL_VAL_CSV
-            Config.TEST_CSV = os.path.join(Config.SPLIT_DIR, "B1_PROMIS_external_val.csv")
+    if getattr(Config, "EXPERIMENT_MODE", "") == "B1_TCIA_TBX_BASELINE":
+        Config.TRAIN_CSV = os.path.join(Config.SPLIT_DIR, "B1_TCIA_TBx_baseline_train.csv")
+    Config.VAL_CSV = Config.COMMON_INTERNAL_VAL_CSV
+    Config.INTERNAL_TEST_CSV = Config.COMMON_INTERNAL_TEST_CSV
+    Config.TEST_CSV = Config.COMMON_EXTERNAL_TEST_CSV
+    Config.COMMON_FINAL_TEST_DATASETS = (
+        ("internal", Config.INTERNAL_TEST_CSV),
+        ("external", Config.TEST_CSV),
+    )
+    Config.FINAL_TEST_DATASETS = Config.COMMON_FINAL_TEST_DATASETS
 
     if exp_dir:
         Config.EXP_DIR = exp_dir
@@ -161,7 +179,9 @@ def _print_resolved_config(Config: Any, experiment: str) -> None:
         "EXPERIMENT_TAG",
         "TRAIN_CSV",
         "VAL_CSV",
+        "INTERNAL_TEST_CSV",
         "TEST_CSV",
+        "FINAL_TEST_DATASETS",
         "EXP_DIR",
         "NUM_EPOCHS",
         "LR",

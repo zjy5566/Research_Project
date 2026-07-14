@@ -2,8 +2,8 @@
 Generate experiment split CSV files from an existing dataset registry.
 
 This script does not copy, rename, or preprocess image files. It only reads an
-existing registry CSV and creates reproducible train/internal-validation/external-
-validation CSV files.
+existing registry CSV and creates reproducible train/internal-validation/internal-
+test/external-validation CSV files.
 
 Default experiment design after 2026-06-23:
     B1: TCIA TBx-confirmed radiologist target lesion ROIs only.
@@ -34,6 +34,7 @@ from sklearn.model_selection import train_test_split
 
 RANDOM_STATE = 42
 DEFAULT_VAL_SIZE = 0.2
+DEFAULT_INTERNAL_TEST_SIZE = 0.1
 
 
 def _safe_train_val_split(
@@ -63,6 +64,80 @@ def _safe_train_val_split(
         shuffle=True,
     )
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
+
+
+def _safe_train_val_test_split(
+    df: pd.DataFrame,
+    val_size: float = DEFAULT_VAL_SIZE,
+    internal_test_size: float = DEFAULT_INTERNAL_TEST_SIZE,
+    random_state: int = RANDOM_STATE,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split one source into train, internal validation, and internal test sets.
+
+    val_size and internal_test_size are fractions of the original source-level
+    dataframe. The validation fraction is therefore preserved after carving out
+    the internal test set.
+    """
+    if val_size < 0.0 or internal_test_size < 0.0 or val_size + internal_test_size >= 1.0:
+        raise ValueError(
+            "val_size and internal_test_size must be non-negative and sum to < 1; "
+            f"got val_size={val_size}, internal_test_size={internal_test_size}"
+        )
+
+    df = df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+    if len(df) == 0:
+        return df.copy(), df.copy(), df.copy()
+
+    if len(df) < 5:
+        n_test = 1 if len(df) >= 3 and internal_test_size > 0 else 0
+        n_val = 1 if len(df) - n_test >= 2 and val_size > 0 else 0
+        test_df = df.iloc[:n_test].copy()
+        val_df = df.iloc[n_test:n_test + n_val].copy()
+        train_df = df.iloc[n_test + n_val:].copy()
+        return (
+            train_df.reset_index(drop=True),
+            val_df.reset_index(drop=True),
+            test_df.reset_index(drop=True),
+        )
+
+    if internal_test_size == 0.0:
+        train_df, val_df = _safe_train_val_split(
+            df,
+            val_size=val_size,
+            random_state=random_state,
+        )
+        return (
+            train_df.reset_index(drop=True),
+            val_df.reset_index(drop=True),
+            df.iloc[0:0].copy(),
+        )
+
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=internal_test_size,
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    if val_size == 0.0:
+        return (
+            train_val_df.reset_index(drop=True),
+            df.iloc[0:0].copy(),
+            test_df.reset_index(drop=True),
+        )
+
+    adjusted_val_size = val_size / (1.0 - internal_test_size)
+    train_df, val_df = _safe_train_val_split(
+        train_val_df,
+        val_size=adjusted_val_size,
+        random_state=random_state,
+    )
+    return (
+        train_df.reset_index(drop=True),
+        val_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+    )
 
 
 def _write_split(df: pd.DataFrame, path: str) -> None:
@@ -182,6 +257,7 @@ def create_split_csvs(
     splits_dir: str,
     external_source: str = "PROMIS",
     val_size: float = DEFAULT_VAL_SIZE,
+    internal_test_size: float = DEFAULT_INTERNAL_TEST_SIZE,
     random_state: int = RANDOM_STATE,
 ) -> Dict[str, pd.DataFrame]:
     """Create experiment CSV files from an existing registry CSV.
@@ -189,13 +265,23 @@ def create_split_csvs(
     PUB and TCIA are split once, and the same patient partitions are reused.
     B-series training CSVs are TCIA-only. Legacy N-series CSVs keep the older
     PUB + TCIA setup for backwards comparison. PROMIS is never included in
-    training or internal validation.
+    training, internal validation, or internal test.
     """
     if not os.path.exists(registry_csv):
         raise FileNotFoundError(f"Registry CSV not found: {registry_csv}")
 
-    if not 0.0 < val_size < 1.0:
+    if not 0.0 <= val_size < 1.0:
         raise ValueError(f"val_size must be between 0 and 1, got {val_size}")
+    if not 0.0 <= internal_test_size < 1.0:
+        raise ValueError(
+            "internal_test_size must be between 0 and 1, "
+            f"got {internal_test_size}"
+        )
+    if val_size + internal_test_size >= 1.0:
+        raise ValueError(
+            "val_size + internal_test_size must be < 1, "
+            f"got {val_size + internal_test_size}"
+        )
 
     os.makedirs(splits_dir, exist_ok=True)
 
@@ -208,14 +294,16 @@ def create_split_csvs(
         registry["source"] == external_source.upper()
     ].copy()
 
-    pub_train, pub_internal_val = _safe_train_val_split(
+    pub_train, pub_internal_val, pub_internal_test = _safe_train_val_test_split(
         pub_df,
         val_size=val_size,
+        internal_test_size=internal_test_size,
         random_state=random_state,
     )
-    tcia_train, tcia_internal_val = _safe_train_val_split(
+    tcia_train, tcia_internal_val, tcia_internal_test = _safe_train_val_test_split(
         tcia_df,
         val_size=val_size,
+        internal_test_size=internal_test_size,
         random_state=random_state,
     )
 
@@ -223,10 +311,10 @@ def create_split_csvs(
     promis_external = external_df[external_df["can_sbx"] == 1].copy()
 
     # ------------------------------------------------------------------
-    # Common internal evaluation cohort for N1-N4
+    # Common internal validation/test cohorts for every experiment
     # ------------------------------------------------------------------
-    # Keep the original TCIA supervision flags in validation. Training views
-    # may hide TBx or SBx labels, but validation must retain all available
+    # Keep the original TCIA supervision flags in validation/test. Training views
+    # may hide TBx or SBx labels, but evaluation must retain all available
     # biopsy labels so that every experiment can calculate:
     #   1) patient-level BACC on TCIA cases with can_cls == 1;
     #   2) region-level BACC on the subset with can_sbx == 1.
@@ -237,9 +325,16 @@ def create_split_csvs(
     tcia_common_internal_eval = tcia_internal_val[
         tcia_internal_val["can_cls"] == 1
     ].copy()
+    tcia_common_internal_test = tcia_internal_test[
+        tcia_internal_test["can_cls"] == 1
+    ].copy()
     common_internal_val = _concat_pub_tcia(
         pub_internal_val,
         tcia_common_internal_eval,
+    )
+    common_internal_test = _concat_pub_tcia(
+        pub_internal_test,
+        tcia_common_internal_test,
     )
 
     # ------------------------------------------------------------------
@@ -250,14 +345,17 @@ def create_split_csvs(
     # supervision changes localisation/clinical performance.
     b1_train = _make_tbx_only_view(tcia_train)
     b1_internal_val = common_internal_val.copy()
+    b1_internal_test = common_internal_test.copy()
     b1_external_val = promis_external.copy()
 
     b2_train = _make_sbx_only_view(tcia_train)
-    b2_internal_val = tcia_common_internal_eval.copy()
+    b2_internal_val = common_internal_val.copy()
+    b2_internal_test = common_internal_test.copy()
     b2_external_val = promis_external.copy()
 
     b3_train = tcia_train[tcia_train["can_cls"] == 1].copy()
-    b3_internal_val = tcia_common_internal_eval.copy()
+    b3_internal_val = common_internal_val.copy()
+    b3_internal_test = common_internal_test.copy()
     b3_external_val = promis_external.copy()
 
     # ------------------------------------------------------------------
@@ -266,6 +364,7 @@ def create_split_csvs(
     # N1: train with PUB radiologist annotations only.
     n1_train = pub_train[pub_train["can_seg"] == 1].copy()
     n1_internal_val = common_internal_val.copy()
+    n1_internal_test = common_internal_test.copy()
     # Supports patient/region evaluation, not external lesion Dice.
     n1_external_val = promis_external.copy()
 
@@ -274,6 +373,7 @@ def create_split_csvs(
     tcia_tbx_train = _make_tbx_only_view(tcia_train)
     n2_train = _concat_pub_tcia(pub_train, tcia_tbx_train)
     n2_internal_val = common_internal_val.copy()
+    n2_internal_test = common_internal_test.copy()
     n2_external_val = promis_external.copy()
 
     # N3: train with PUB + TCIA SBx supervision only.
@@ -281,18 +381,22 @@ def create_split_csvs(
     tcia_sbx_train = _make_sbx_only_view(tcia_train)
     n3_train = _concat_pub_tcia(pub_train, tcia_sbx_train)
     n3_internal_val = common_internal_val.copy()
+    n3_internal_test = common_internal_test.copy()
     n3_external_val = promis_external.copy()
 
     # N4: train with PUB + all eligible TCIA biopsy supervision.
     tcia_mixed_train = tcia_train[tcia_train["can_cls"] == 1].copy()
     n4_train = _concat_pub_tcia(pub_train, tcia_mixed_train)
     n4_internal_val = common_internal_val.copy()
+    n4_internal_test = common_internal_test.copy()
     n4_external_val = promis_external.copy()
 
     # Task-specific validation views remain available for diagnostic use, but
     # they are not the recommended model-selection CSVs for N1-N4.
     tcia_tbx_internal_val = _make_tbx_only_view(tcia_internal_val)
+    tcia_tbx_internal_test = _make_tbx_only_view(tcia_internal_test)
     tcia_sbx_internal_val = _make_sbx_only_view(tcia_internal_val)
+    tcia_sbx_internal_test = _make_sbx_only_view(tcia_internal_test)
 
     splits: Dict[str, pd.DataFrame] = {
         # Source-level reference files.
@@ -301,48 +405,61 @@ def create_split_csvs(
         ].copy(),
         "external_val.csv": external_df.copy(),
         "common_internal_evaluation.csv": common_internal_val.copy(),
+        "common_internal_test.csv": common_internal_test.copy(),
         "TCIA_common_internal_evaluation.csv": (
             tcia_common_internal_eval.copy()
+        ),
+        "TCIA_common_internal_test.csv": (
+            tcia_common_internal_test.copy()
         ),
 
         # B-series: TCIA-centred baseline and ablations.
         "B1_TCIA_TBx_baseline_train.csv": b1_train,
         "B1_TCIA_TBx_baseline_internal_val.csv": b1_internal_val,
+        "B1_TCIA_TBx_baseline_internal_test.csv": b1_internal_test,
         "B1_PROMIS_external_val.csv": b1_external_val,
 
         "B2_TCIA_SBx_only_train.csv": b2_train,
         "B2_TCIA_SBx_only_internal_val.csv": b2_internal_val,
+        "B2_TCIA_SBx_only_internal_test.csv": b2_internal_test,
         "B2_PROMIS_external_val.csv": b2_external_val,
 
         "B3_TCIA_TBx_SBx_train.csv": b3_train,
         "B3_TCIA_TBx_SBx_internal_val.csv": b3_internal_val,
+        "B3_TCIA_TBx_SBx_internal_test.csv": b3_internal_test,
         "B3_PROMIS_external_val.csv": b3_external_val,
 
         # N1.
         "N1_radiologist_only_train.csv": n1_train,
         "N1_radiologist_only_internal_val.csv": n1_internal_val,
+        "N1_radiologist_only_internal_test.csv": n1_internal_test,
         "N1_PROMIS_external_val.csv": n1_external_val,
 
         # N2: PUB + TCIA TBx only.
         "N2_PUB_TCIA_TBx_only_train.csv": n2_train,
         "N2_PUB_TCIA_TBx_only_internal_val.csv": n2_internal_val,
+        "N2_PUB_TCIA_TBx_only_internal_test.csv": n2_internal_test,
         "N2_PROMIS_external_val.csv": n2_external_val,
 
         # N3: PUB + TCIA SBx only.
         "N3_PUB_TCIA_SBx_only_train.csv": n3_train,
         "N3_PUB_TCIA_SBx_only_internal_val.csv": n3_internal_val,
+        "N3_PUB_TCIA_SBx_only_internal_test.csv": n3_internal_test,
         "N3_PROMIS_external_val.csv": n3_external_val,
 
         # N4: PUB + all eligible TCIA biopsy supervision.
         "N4_mixed_PUB_TCIA_train.csv": n4_train,
         "N4_mixed_PUB_TCIA_internal_val.csv": n4_internal_val,
+        "N4_mixed_PUB_TCIA_internal_test.csv": n4_internal_test,
         "N4_mixed_PROMIS_external_val.csv": n4_external_val,
 
         # Optional TCIA-only task files.
         "task_tbx_train.csv": tcia_tbx_train,
         "task_tbx_internal_val.csv": tcia_tbx_internal_val,
+        "task_tbx_internal_test.csv": tcia_tbx_internal_test,
         "task_sbx_train.csv": tcia_sbx_train,
         "task_sbx_internal_val.csv": tcia_sbx_internal_val,
+        "task_sbx_internal_test.csv": tcia_sbx_internal_test,
         "task_sbx_external_val.csv": promis_external.copy(),
     }
 
@@ -401,5 +518,6 @@ if __name__ == "__main__":
         splits_dir=SPLITS_DIR,
         external_source="PROMIS",
         val_size=0.2,
+        internal_test_size=DEFAULT_INTERNAL_TEST_SIZE,
         random_state=RANDOM_STATE,
     )

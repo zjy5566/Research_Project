@@ -24,6 +24,7 @@ Expected loss output from the revised loss:
 
 from __future__ import annotations
 
+from collections import deque
 import os
 from typing import Dict, Mapping, Optional, Tuple, Union
 
@@ -239,6 +240,211 @@ def operating_point_metrics(
     }
 
 
+def configured_froc_thresholds() -> Tuple[float, ...]:
+    thresholds = _cfg("FROC_SWEEP_THRESHOLDS", configured_target_dice_thresholds())
+    if isinstance(thresholds, str):
+        thresholds = [float(item.strip()) for item in thresholds.split(",") if item.strip()]
+    thresholds = tuple(
+        sorted({round(float(th), 6) for th in thresholds if 0.0 <= float(th) <= 1.0})
+    )
+    return thresholds or (0.5,)
+
+
+def configured_fp_per_patient_targets() -> Tuple[float, ...]:
+    targets = _cfg("FROC_FP_PER_PATIENT_TARGETS", (0.5, 1.0, 2.0))
+    if isinstance(targets, str):
+        targets = [float(item.strip()) for item in targets.split(",") if item.strip()]
+    targets = tuple(sorted({float(target) for target in targets if float(target) >= 0.0}))
+    return targets or (0.5,)
+
+
+def metric_key_float(value: float) -> str:
+    return str(float(value)).replace(".", "p").replace("-", "m")
+
+
+def _connected_components_3d(mask: np.ndarray, min_voxels: int = 1):
+    """Return 6-connected component coordinates for a 3D boolean mask."""
+    mask = np.asarray(mask).astype(bool)
+    if mask.ndim != 3 or not mask.any():
+        return []
+
+    visited = np.zeros(mask.shape, dtype=bool)
+    components = []
+    starts = np.argwhere(mask)
+    neighbours = (
+        (1, 0, 0), (-1, 0, 0),
+        (0, 1, 0), (0, -1, 0),
+        (0, 0, 1), (0, 0, -1),
+    )
+    shape = mask.shape
+    min_voxels = max(int(min_voxels), 1)
+
+    for start in starts:
+        z, y, x = (int(v) for v in start)
+        if visited[z, y, x]:
+            continue
+        queue = deque([(z, y, x)])
+        visited[z, y, x] = True
+        coords = []
+        while queue:
+            cz, cy, cx = queue.popleft()
+            coords.append((cz, cy, cx))
+            for dz, dy, dx in neighbours:
+                nz, ny, nx = cz + dz, cy + dy, cx + dx
+                if (
+                    0 <= nz < shape[0]
+                    and 0 <= ny < shape[1]
+                    and 0 <= nx < shape[2]
+                    and mask[nz, ny, nx]
+                    and not visited[nz, ny, nx]
+                ):
+                    visited[nz, ny, nx] = True
+                    queue.append((nz, ny, nx))
+        if len(coords) >= min_voxels:
+            components.append(np.asarray(coords, dtype=np.int64))
+    return components
+
+
+def detection_counts_at_threshold(
+    prob_map,
+    target_mask,
+    threshold: float,
+    scoring_mask=None,
+    min_component_voxels: int = 1,
+) -> Dict[str, int]:
+    """Count lesion detections and false-positive findings for one case.
+
+    A predicted connected component is a candidate finding. A ground-truth
+    connected component is detected when at least one predicted finding overlaps
+    it. Predicted findings that do not overlap any GT component count as false
+    positives. This is an FROC-style localisation metric, not specificity.
+    """
+    prob = np.asarray(prob_map, dtype=np.float32)
+    target = np.asarray(target_mask).astype(bool)
+    if prob.ndim == 4 and prob.shape[0] == 1:
+        prob = prob[0]
+    if target.ndim == 4 and target.shape[0] == 1:
+        target = target[0]
+    if prob.ndim != 3 or target.ndim != 3:
+        raise ValueError("FROC maps must be 3D or single-channel 4D arrays.")
+
+    if scoring_mask is None:
+        valid = np.ones_like(target, dtype=bool)
+    else:
+        valid = np.asarray(scoring_mask).astype(bool)
+        if valid.ndim == 4 and valid.shape[0] == 1:
+            valid = valid[0]
+        if valid.shape != target.shape:
+            raise ValueError("scoring_mask must match target_mask shape.")
+
+    target = target & valid
+    pred = (prob >= float(threshold)) & valid
+
+    gt_components = _connected_components_3d(target, min_voxels=1)
+    pred_components = _connected_components_3d(pred, min_voxels=min_component_voxels)
+    if not gt_components:
+        return {
+            "num_gt": 0,
+            "num_detected": 0,
+            "num_pred": int(len(pred_components)),
+            "num_fp": int(len(pred_components)),
+        }
+
+    gt_label = np.zeros(target.shape, dtype=np.int32)
+    for label, coords in enumerate(gt_components, start=1):
+        gt_label[coords[:, 0], coords[:, 1], coords[:, 2]] = label
+
+    detected = set()
+    fp = 0
+    for coords in pred_components:
+        overlaps = gt_label[coords[:, 0], coords[:, 1], coords[:, 2]]
+        overlaps = overlaps[overlaps > 0]
+        if overlaps.size == 0:
+            fp += 1
+        else:
+            detected.update(int(label) for label in np.unique(overlaps))
+
+    return {
+        "num_gt": int(len(gt_components)),
+        "num_detected": int(len(detected)),
+        "num_pred": int(len(pred_components)),
+        "num_fp": int(fp),
+    }
+
+
+class FROCEvaluator:
+    """Threshold-swept sensitivity at fixed false-positive findings per case."""
+
+    def __init__(
+        self,
+        thresholds: Optional[Tuple[float, ...]] = None,
+        fp_per_patient_targets: Optional[Tuple[float, ...]] = None,
+        min_component_voxels: Optional[int] = None,
+    ):
+        self.thresholds = thresholds or configured_froc_thresholds()
+        self.fp_per_patient_targets = fp_per_patient_targets or configured_fp_per_patient_targets()
+        self.min_component_voxels = int(
+            min_component_voxels
+            if min_component_voxels is not None
+            else _cfg("FROC_MIN_COMPONENT_VOXELS", 1)
+        )
+        self.counts = {
+            threshold: {"cases": 0, "num_gt": 0, "num_detected": 0, "num_fp": 0}
+            for threshold in self.thresholds
+        }
+
+    def update_from_maps(self, probs: torch.Tensor, targets: torch.Tensor, scoring_masks: Optional[torch.Tensor] = None):
+        probs_np = probs.detach().cpu().numpy()
+        targets_np = targets.detach().cpu().numpy()
+        masks_np = scoring_masks.detach().cpu().numpy() if scoring_masks is not None else None
+        for case_idx in range(probs_np.shape[0]):
+            prob = probs_np[case_idx, 0] if probs_np.ndim == 5 else probs_np[case_idx]
+            target = targets_np[case_idx, 0] if targets_np.ndim == 5 else targets_np[case_idx]
+            mask = None
+            if masks_np is not None:
+                mask = masks_np[case_idx, 0] if masks_np.ndim == 5 else masks_np[case_idx]
+            for threshold in self.thresholds:
+                cur = detection_counts_at_threshold(
+                    prob,
+                    target,
+                    threshold=threshold,
+                    scoring_mask=mask,
+                    min_component_voxels=self.min_component_voxels,
+                )
+                store = self.counts[threshold]
+                store["cases"] += 1
+                store["num_gt"] += cur["num_gt"]
+                store["num_detected"] += cur["num_detected"]
+                store["num_fp"] += cur["num_fp"]
+
+    def compute_metrics(self, prefix: str = "") -> Dict[str, float]:
+        rows = []
+        for threshold, counts in self.counts.items():
+            cases = counts["cases"]
+            num_gt = counts["num_gt"]
+            sensitivity = counts["num_detected"] / num_gt if num_gt else 0.0
+            fp_per_patient = counts["num_fp"] / cases if cases else 0.0
+            rows.append((float(threshold), float(sensitivity), float(fp_per_patient), counts))
+
+        metrics = {
+            f"{prefix}froc_n": int(max((row[3]["cases"] for row in rows), default=0)),
+            f"{prefix}froc_num_gt": int(max((row[3]["num_gt"] for row in rows), default=0)),
+        }
+        for target in self.fp_per_patient_targets:
+            candidates = [row for row in rows if row[2] <= float(target) + 1e-8]
+            if candidates:
+                threshold, sensitivity, fp_per_patient, _ = max(candidates, key=lambda row: (row[1], -row[2]))
+            elif rows:
+                threshold, sensitivity, fp_per_patient, _ = min(rows, key=lambda row: row[2])
+            else:
+                threshold, sensitivity, fp_per_patient = float("nan"), 0.0, 0.0
+            key = metric_key_float(target)
+            metrics[f"{prefix}sens_at_fp_per_patient_{key}"] = float(sensitivity)
+            metrics[f"{prefix}actual_fp_per_patient_{key}"] = float(fp_per_patient)
+            metrics[f"{prefix}threshold_at_fp_per_patient_{key}"] = float(threshold)
+        return metrics
+
+
 def masked_probability_pool(
     prob_map: torch.Tensor,
     mask: torch.Tensor,
@@ -246,7 +452,12 @@ def masked_probability_pool(
     top_percent: float = 1.0,
     lme_r: float = 8.0,
 ) -> Optional[float]:
-    """Pool a risk map inside a mask into one case/region probability score."""
+    """Pool a risk map inside a mask into one case/region probability score.
+
+    ``logit_lme`` is the evaluation equivalent of the training patient loss:
+    probabilities are mapped back to logits, normalised LME is applied in logit
+    space, and the pooled logit is converted back to a probability.
+    """
     values = prob_map[mask]
     if values.numel() == 0:
         return None
@@ -266,6 +477,15 @@ def masked_probability_pool(
     elif mode == "lme":
         r = float(lme_r)
         score = torch.logsumexp(values * r, dim=0) / r - np.log(float(values.numel())) / r
+    elif mode in {"logit_lme", "logit-lme"}:
+        r = float(lme_r)
+        eps = torch.finfo(values.dtype).eps
+        logits = torch.logit(values.clamp(min=eps, max=1.0 - eps))
+        pooled_logit = (
+            torch.logsumexp(logits * r, dim=0) / r
+            - np.log(float(logits.numel())) / r
+        )
+        score = torch.sigmoid(pooled_logit)
     else:
         raise ValueError(f"Unsupported segmentation risk-map pooling mode: {mode}")
 
@@ -677,8 +897,8 @@ BalancedAccuracyEvaluator = LesionMILEvaluator
 class SegRiskMapEvaluator:
     """Patient/region metrics derived from segmentation risk maps.
 
-    Patient labels prefer segmentation-style masks and fall back to systematic
-    biopsy labels, so PROMIS SBx-only cases can contribute to patient-level
+    Patient labels use explicit or biopsy-derived csPCa targets. Dense RA masks
+    without a matching patient pathology label are excluded from patient-level
     metrics. Region labels come from systematic biopsy labels.
     """
 
@@ -694,6 +914,7 @@ class SegRiskMapEvaluator:
         lme_r: Optional[float] = None,
         max_zones: Optional[int] = None,
         invalid_sys_label: Optional[int] = None,
+        use_gland_mask_for_patient_pooling: Optional[bool] = None,
     ):
         self.prob_threshold = float(prob_threshold)
         self.positive_threshold = int(positive_threshold)
@@ -707,6 +928,11 @@ class SegRiskMapEvaluator:
         self.region_pooling = str(region_pooling or _cfg("SEG_REGION_POOLING", "top_percent"))
         self.top_percent = float(top_percent if top_percent is not None else _cfg("SEG_RISK_TOP_PERCENT", 1.0))
         self.lme_r = float(lme_r if lme_r is not None else _cfg("SEG_RISK_LME_R", _cfg("LME_R", 8.0)))
+        self.use_gland_mask_for_patient_pooling = bool(
+            use_gland_mask_for_patient_pooling
+            if use_gland_mask_for_patient_pooling is not None
+            else _cfg("SEG_EVAL_USE_GLAND_MASK", False)
+        )
         self.max_zones = int(max_zones if max_zones is not None else _cfg("MAX_ZONES", 20))
         self.invalid_sys_label = int(
             invalid_sys_label
@@ -848,16 +1074,35 @@ class SegRiskMapEvaluator:
         b: int,
         device: torch.device,
     ) -> Optional[int]:
-        seg_target = self._segmentation_target(batch, b, device)
-        if seg_target is not None:
-            return int(bool(seg_target.any().item()))
-        if "sys_labels" not in batch:
-            return None
-        labels = batch["sys_labels"][b].to(device)
-        valid = labels != self.invalid_sys_label
-        if not bool(valid.any().item()):
-            return None
-        return int(bool((labels[valid] >= self.positive_threshold).any().item()))
+        # Explicit/loader-derived case labels take precedence. The loader sets
+        # has_cls only when biopsy or an explicit case label is available in the
+        # redesigned protocol.
+        if "has_cls" in batch and "cls_cspc_label" in batch:
+            has_cls = self._case_flag(batch, "has_cls", b)
+            label = int(batch["cls_cspc_label"][b].item())
+            if has_cls and label != self.invalid_sys_label:
+                return int(label > 0)
+
+        # Backward-compatible derivation for evaluation batches that predate
+        # cls_cspc_label. Crucially, lesion_mask is never used here.
+        has_biopsy_label = False
+        patient_label = 0
+
+        if self._case_flag(batch, "has_target", b) and "target_mask" in batch:
+            has_biopsy_label = True
+            target = batch["target_mask"][b].to(device)
+            if bool((target >= self.positive_threshold).any().item()):
+                patient_label = 1
+
+        if self._case_flag(batch, "has_sys", b) and "sys_labels" in batch:
+            labels = batch["sys_labels"][b].to(device)
+            valid = labels != self.invalid_sys_label
+            if bool(valid.any().item()):
+                has_biopsy_label = True
+                if bool((labels[valid] >= self.positive_threshold).any().item()):
+                    patient_label = 1
+
+        return patient_label if has_biopsy_label else None
 
     def _patient_score_mask(
         self,
@@ -866,6 +1111,8 @@ class SegRiskMapEvaluator:
         device: torch.device,
         prob_3d: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.use_gland_mask_for_patient_pooling:
+            return torch.ones_like(prob_3d, dtype=torch.bool)
         if "gland_mask" in batch and batch["gland_mask"][b].numel() > 0:
             gland = batch["gland_mask"][b, 0].to(device)
             if gland.shape != prob_3d.shape:
@@ -1019,9 +1266,29 @@ class MetricTracker:
         self.lesion_dice_values = []
         self.lesion_dice_std = 0.0
         self.lesion_dice_n = 0
+        self.lesion_gland_dice = AverageMeter()
+        self.lesion_gland_dice_values = []
+        self.lesion_gland_dice_std = 0.0
+        self.lesion_gland_dice_n = 0
+        self.lesion_gland_cases = 0
+        self.lesion_gland_missing_cases = 0
+        self.lesion_gland_voxels = 0
+        self.lesion_target_outside_gland_voxels = 0
         self.lesion_f1 = AverageMeter()
         self.lesion_sens = AverageMeter()
         self.lesion_spec = AverageMeter()
+        self.lesion_voxel_true = []
+        self.lesion_voxel_score = []
+        self.lesion_voxel_n = 0
+        self.lesion_voxel_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
+        self.lesion_voxel_sens_at_fixed_spec = 0.0
+        self.lesion_voxel_actual_spec_at_fixed_spec = 0.0
+        self.lesion_voxel_actual_fpr_at_fixed_spec = 0.0
+        self.lesion_voxel_threshold_at_fixed_spec = float("nan")
+        self.lesion_voxel_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
+        self.lesion_voxel_spec_at_fixed_sens = 0.0
+        self.lesion_voxel_actual_sens_at_fixed_sens = 0.0
+        self.lesion_voxel_threshold_at_fixed_sens = float("nan")
         self.target_cspca_dice = AverageMeter()
         self.target_cspca_dice_values = []
         self.target_cspca_dice_std = 0.0
@@ -1043,6 +1310,22 @@ class MetricTracker:
         self.target_cspca_top_percent_dice_values = []
         self.target_cspca_top_percent_dice_std = 0.0
         self.target_cspca_top_percent_dice_n = 0
+        self.lesion_froc = FROCEvaluator()
+        self.target_cspca_froc = FROCEvaluator()
+        self.lesion_froc_metrics = self.lesion_froc.compute_metrics(prefix="lesion_")
+        self.target_cspca_froc_metrics = self.target_cspca_froc.compute_metrics(prefix="target_cspca_")
+        self.target_cspca_voxel_true = []
+        self.target_cspca_voxel_score = []
+        self.target_cspca_voxel_n = 0
+        self.target_cspca_voxel_fixed_spec_target = float(_cfg("FIXED_SPECIFICITY_TARGET", 0.95))
+        self.target_cspca_voxel_sens_at_fixed_spec = 0.0
+        self.target_cspca_voxel_actual_spec_at_fixed_spec = 0.0
+        self.target_cspca_voxel_actual_fpr_at_fixed_spec = 0.0
+        self.target_cspca_voxel_threshold_at_fixed_spec = float("nan")
+        self.target_cspca_voxel_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
+        self.target_cspca_voxel_spec_at_fixed_sens = 0.0
+        self.target_cspca_voxel_actual_sens_at_fixed_sens = 0.0
+        self.target_cspca_voxel_threshold_at_fixed_sens = float("nan")
         self.tbx_roi_true = []
         self.tbx_roi_score = []
         self.tbx_roi_bacc = 0.0
@@ -1056,6 +1339,10 @@ class MetricTracker:
         self.tbx_roi_actual_spec_at_fixed_spec = 0.0
         self.tbx_roi_actual_fpr_at_fixed_spec = 0.0
         self.tbx_roi_threshold_at_fixed_spec = float("nan")
+        self.tbx_roi_fixed_sens_target = float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90))
+        self.tbx_roi_spec_at_fixed_sens = 0.0
+        self.tbx_roi_actual_sens_at_fixed_sens = 0.0
+        self.tbx_roi_threshold_at_fixed_sens = float("nan")
 
         self.patient_bacc = 0.0
         self.patient_sens = 0.0
@@ -1303,6 +1590,89 @@ class MetricTracker:
         self.lesion_dice_std = summary["std"]
         self.lesion_dice_n = summary["n"]
 
+    def update_lesion_gland_metrics(
+        self,
+        probs: torch.Tensor,
+        target: torch.Tensor,
+        gland_mask: torch.Tensor,
+        has_gland: torch.Tensor,
+        threshold: float,
+        compute_operating_metrics: bool = False,
+        compute_froc_metrics: bool = False,
+    ) -> None:
+        """Update dense-lesion metrics strictly inside valid prostate masks."""
+        if probs.numel() == 0 or target.numel() == 0:
+            return
+        if probs.shape != target.shape or probs.shape != gland_mask.shape:
+            raise ValueError(
+                "probs, target, and gland_mask must have identical shapes for "
+                "within-prostate evaluation."
+            )
+
+        gland = gland_mask > 0
+        has_gland = has_gland.reshape(-1).to(device=probs.device).bool()
+        nonempty_gland = gland.reshape(gland.size(0), -1).any(dim=1)
+        valid_cases = has_gland & nonempty_gland
+        self.lesion_gland_missing_cases += int((~valid_cases).sum().item())
+        if not bool(valid_cases.any().item()):
+            return
+
+        probs = probs[valid_cases]
+        target = (target[valid_cases] > 0).float()
+        gland = gland[valid_cases]
+        pred_bin = probs >= float(threshold)
+
+        case_count = int(valid_cases.sum().item())
+        gland_voxel_count = int(gland.sum().item())
+        self.lesion_gland_cases += case_count
+        self.lesion_gland_voxels += gland_voxel_count
+        self.lesion_target_outside_gland_voxels += int(
+            ((target > 0) & (~gland)).sum().item()
+        )
+
+        gland_float = gland.to(dtype=target.dtype)
+        gland_dice_values = compute_dice_per_case(
+            pred_bin.to(dtype=target.dtype) * gland_float,
+            target * gland_float,
+        )
+        gland_dice_values = np.asarray(gland_dice_values, dtype=np.float64).reshape(-1)
+        gland_dice_values = gland_dice_values[np.isfinite(gland_dice_values)]
+        if gland_dice_values.size > 0:
+            self.lesion_gland_dice_values.extend(gland_dice_values.tolist())
+            summary = summarise_values(self.lesion_gland_dice_values)
+            self.lesion_gland_dice.avg = summary["mean"]
+            self.lesion_gland_dice.sum = summary["mean"] * summary["n"]
+            self.lesion_gland_dice.count = summary["n"]
+            self.lesion_gland_dice.val = float(gland_dice_values[-1])
+            self.lesion_gland_dice_std = summary["std"]
+            self.lesion_gland_dice_n = summary["n"]
+
+        true_roi = (target[gland] > 0)
+        pred_roi = pred_bin[gland]
+        tp = int((pred_roi & true_roi).sum().item())
+        fn = int(((~pred_roi) & true_roi).sum().item())
+        tn = int(((~pred_roi) & (~true_roi)).sum().item())
+        fp = int((pred_roi & (~true_roi)).sum().item())
+        positive_n = tp + fn
+        negative_n = tn + fp
+        if positive_n > 0:
+            self.lesion_sens.update(tp / positive_n, n=positive_n)
+        if negative_n > 0:
+            self.lesion_spec.update(tn / negative_n, n=negative_n)
+
+        if compute_froc_metrics:
+            self.update_lesion_froc(
+                probs,
+                target,
+                scoring_mask=gland_float,
+            )
+        if compute_operating_metrics:
+            self.update_voxel_operating_samples(
+                "lesion",
+                true_roi.detach().cpu().numpy(),
+                probs[gland].detach().cpu().numpy(),
+            )
+
     def update_target_cspca_dice_values(self, values):
         values = np.asarray(values, dtype=np.float64).reshape(-1)
         values = values[np.isfinite(values)]
@@ -1366,6 +1736,61 @@ class MetricTracker:
         self.target_cspca_best_threshold_dice_std = best_summary["std"]
         self.target_cspca_best_threshold_dice_n = best_summary["n"]
 
+    def update_lesion_froc(self, probs: torch.Tensor, target: torch.Tensor, scoring_mask: Optional[torch.Tensor] = None):
+        if probs.numel() == 0 or target.numel() == 0:
+            return
+        self.lesion_froc.update_from_maps(probs, target, scoring_mask)
+
+    def update_target_cspca_froc(
+        self,
+        probs: torch.Tensor,
+        target: torch.Tensor,
+        scoring_mask: Optional[torch.Tensor] = None,
+    ):
+        if probs.numel() == 0 or target.numel() == 0:
+            return
+        self.target_cspca_froc.update_from_maps(probs, target, scoring_mask)
+
+    def finalize_froc_metrics(self):
+        self.lesion_froc_metrics = self.lesion_froc.compute_metrics(prefix="lesion_")
+        self.target_cspca_froc_metrics = self.target_cspca_froc.compute_metrics(prefix="target_cspca_")
+
+    def update_voxel_operating_samples(self, prefix: str, y_true, y_score):
+        """Collect voxel-level labels/scores for ROC operating-point metrics."""
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_score = np.asarray(y_score, dtype=np.float32).reshape(-1)
+        valid = np.isfinite(y_score)
+        if valid.size == 0 or not valid.any():
+            return
+
+        true_store = getattr(self, f"{prefix}_voxel_true")
+        score_store = getattr(self, f"{prefix}_voxel_score")
+        true_store.extend(y_true[valid].tolist())
+        score_store.extend(y_score[valid].tolist())
+
+    def finalize_voxel_operating_metrics(self, prefix: str):
+        y_true = np.asarray(getattr(self, f"{prefix}_voxel_true"), dtype=np.int64)
+        y_score = np.asarray(getattr(self, f"{prefix}_voxel_score"), dtype=np.float32)
+        setattr(self, f"{prefix}_voxel_n", int(len(y_true)))
+        if len(y_true) == 0:
+            return
+
+        op = operating_point_metrics(
+            y_true,
+            y_score,
+            fixed_specificity=getattr(self, f"{prefix}_voxel_fixed_spec_target"),
+            fixed_sensitivity=getattr(self, f"{prefix}_voxel_fixed_sens_target"),
+        )
+        setattr(self, f"{prefix}_voxel_fixed_spec_target", op["fixed_spec_target"])
+        setattr(self, f"{prefix}_voxel_sens_at_fixed_spec", op["sens_at_fixed_spec"])
+        setattr(self, f"{prefix}_voxel_actual_spec_at_fixed_spec", op["actual_spec_at_fixed_spec"])
+        setattr(self, f"{prefix}_voxel_actual_fpr_at_fixed_spec", op["actual_fpr_at_fixed_spec"])
+        setattr(self, f"{prefix}_voxel_threshold_at_fixed_spec", op["threshold_at_fixed_spec"])
+        setattr(self, f"{prefix}_voxel_fixed_sens_target", op["fixed_sens_target"])
+        setattr(self, f"{prefix}_voxel_spec_at_fixed_sens", op["spec_at_fixed_sens"])
+        setattr(self, f"{prefix}_voxel_actual_sens_at_fixed_sens", op["actual_sens_at_fixed_sens"])
+        setattr(self, f"{prefix}_voxel_threshold_at_fixed_sens", op["threshold_at_fixed_sens"])
+
     def _update_value_summary(self, values, store, meter, std_attr: str, n_attr: str):
         values = np.asarray(values, dtype=np.float64).reshape(-1)
         values = values[np.isfinite(values)]
@@ -1389,7 +1814,7 @@ class MetricTracker:
         self.tbx_roi_true.extend(y_true[valid].tolist())
         self.tbx_roi_score.extend(y_score[valid].tolist())
 
-    def finalize_tbx_roi_metrics(self, threshold: float):
+    def finalize_tbx_roi_metrics(self, threshold: float, compute_operating_metrics: bool = False):
         y_true = np.asarray(self.tbx_roi_true, dtype=np.int64)
         y_score = np.asarray(self.tbx_roi_score, dtype=np.float32)
         self.tbx_roi_n = int(len(y_true))
@@ -1400,23 +1825,30 @@ class MetricTracker:
         tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
         sens = tp / (tp + fn + 1e-8)
         spec = tn / (tn + fp + 1e-8)
-        op = operating_point_metrics(
-            y_true,
-            y_score,
-            fixed_specificity=self.tbx_roi_fixed_spec_target,
-            fixed_sensitivity=float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90)),
-        )
 
         self.tbx_roi_sens = float(sens)
         self.tbx_roi_spec = float(spec)
         self.tbx_roi_bacc = float((sens + spec) / 2.0)
         self.tbx_roi_auc = safe_auc(y_true, y_score)
         self.tbx_roi_auprc = safe_auprc(y_true, y_score)
+        if not compute_operating_metrics:
+            return
+
+        op = operating_point_metrics(
+            y_true,
+            y_score,
+            fixed_specificity=self.tbx_roi_fixed_spec_target,
+            fixed_sensitivity=float(_cfg("FIXED_SENSITIVITY_TARGET", 0.90)),
+        )
         self.tbx_roi_fixed_spec_target = op["fixed_spec_target"]
         self.tbx_roi_sens_at_fixed_spec = op["sens_at_fixed_spec"]
         self.tbx_roi_actual_spec_at_fixed_spec = op["actual_spec_at_fixed_spec"]
         self.tbx_roi_actual_fpr_at_fixed_spec = op["actual_fpr_at_fixed_spec"]
         self.tbx_roi_threshold_at_fixed_spec = op["threshold_at_fixed_spec"]
+        self.tbx_roi_fixed_sens_target = op["fixed_sens_target"]
+        self.tbx_roi_spec_at_fixed_sens = op["spec_at_fixed_sens"]
+        self.tbx_roi_actual_sens_at_fixed_sens = op["actual_sens_at_fixed_sens"]
+        self.tbx_roi_threshold_at_fixed_sens = op["threshold_at_fixed_sens"]
 
     @staticmethod
     def _ratio(num: int, den: int) -> float:
@@ -1439,20 +1871,32 @@ class MetricTracker:
         )
 
     def print_val_summary(self) -> str:
+        primary_fp = configured_fp_per_patient_targets()[0]
+        primary_fp_key = metric_key_float(primary_fp)
+        lesion_froc_sens = self.lesion_froc_metrics.get(
+            f"lesion_sens_at_fp_per_patient_{primary_fp_key}", 0.0
+        )
+        target_froc_sens = self.target_cspca_froc_metrics.get(
+            f"target_cspca_sens_at_fp_per_patient_{primary_fp_key}", 0.0
+        )
         return (
             f"Loss: {self.loss_total.avg:.4f} | "
-            f"Les-Dice: {self.lesion_dice.avg:.4f}+/-{self.lesion_dice_std:.4f} (n={self.lesion_dice_n}) | "
+            f"Les-Dice full: {self.lesion_dice.avg:.4f}+/-{self.lesion_dice_std:.4f} "
+            f"(n={self.lesion_dice_n}) | "
+            f"Les-Dice gland: {self.lesion_gland_dice.avg:.4f}+/-{self.lesion_gland_dice_std:.4f} "
+            f"(n={self.lesion_gland_dice_n}) | "
+            f"Les voxel Sens/Spec@0.5 gland: {self.lesion_sens.avg:.4f}/{self.lesion_spec.avg:.4f} | "
+            f"Les-Sens@{primary_fp:g}FP/pat gland: {lesion_froc_sens:.4f} | "
             f"Target-csPCa Dice@0.5: {self.target_cspca_dice.avg:.4f}+/-{self.target_cspca_dice_std:.4f} "
             f"(n={self.target_cspca_dice_n}) | "
             f"BestThrDice: {self.target_cspca_best_threshold_dice:.4f}@{self.target_cspca_best_threshold:.2f} | "
             f"TopKDice: {self.target_cspca_topk_dice.avg:.4f} | "
+            f"Target-csPCa Sens@{primary_fp:g}FP/case: {target_froc_sens:.4f} | "
             f"TBx p+: {self.tbx_pos_prob_mean.avg:.4f}, "
             f"p-: {self.tbx_neg_prob_mean.avg:.4f}, "
             f"p(out): {self.outside_gland_prob_mean.avg:.4f}, "
             f"p(patient): {self.patient_risk_prob_mean.avg:.4f}, "
             f"TBx ROI AUC/AUPRC: {self.tbx_roi_auc:.4f}/{self.tbx_roi_auprc:.4f} | "
-            f"TBx ROI Sens@FPR{1.0 - self.tbx_roi_fixed_spec_target:.2f}: "
-            f"{self.tbx_roi_sens_at_fixed_spec:.4f} | "
             f"Pat Sens@Spec{self.patient_fixed_spec_target:.2f}: {self.patient_sens_at_fixed_spec:.4f} | "
             f"Pat Spec@Sens{self.patient_fixed_sens_target:.2f}: {self.patient_spec_at_fixed_sens:.4f} | "
             f"Pat TP/FP/FN/TN: {self.patient_tp}/{self.patient_fp}/{self.patient_fn}/{self.patient_tn} | "
@@ -1520,7 +1964,7 @@ class MetricTracker:
         }
 
     def get_val_dict(self) -> Dict[str, float]:
-        return {
+        val_dict = {
             "val_loss_total": self.loss_total.avg,
             "val_loss_lesion": self.loss_lesion.avg,
             "val_loss_lesion_dense": self.loss_lesion_dense.avg,
@@ -1532,9 +1976,39 @@ class MetricTracker:
             "val_lesion_dice_mean": self.lesion_dice.avg,
             "val_lesion_dice_std": self.lesion_dice_std,
             "val_lesion_dice_n": self.lesion_dice_n,
+            "val_lesion_full_crop_dice": self.lesion_dice.avg,
+            "val_lesion_gland_dice": self.lesion_gland_dice.avg,
+            "val_lesion_gland_dice_mean": self.lesion_gland_dice.avg,
+            "val_lesion_gland_dice_std": self.lesion_gland_dice_std,
+            "val_lesion_gland_dice_n": self.lesion_gland_dice_n,
+            "val_lesion_gland_cases": self.lesion_gland_cases,
+            "val_lesion_gland_missing_cases": self.lesion_gland_missing_cases,
+            "val_lesion_gland_voxels": self.lesion_gland_voxels,
+            "val_lesion_target_outside_gland_voxels": self.lesion_target_outside_gland_voxels,
             "val_lesion_f1": self.lesion_f1.avg,
             "val_lesion_sens": self.lesion_sens.avg,
             "val_lesion_spec": self.lesion_spec.avg,
+            "val_lesion_gland_sens_at_0p5": self.lesion_sens.avg,
+            "val_lesion_gland_spec_at_0p5": self.lesion_spec.avg,
+            "val_lesion_voxel_n": self.lesion_voxel_n,
+            "val_lesion_voxel_fixed_spec_target": self.lesion_voxel_fixed_spec_target,
+            "val_lesion_voxel_sens_at_fixed_spec": self.lesion_voxel_sens_at_fixed_spec,
+            "val_lesion_voxel_actual_spec_at_fixed_spec": self.lesion_voxel_actual_spec_at_fixed_spec,
+            "val_lesion_voxel_actual_fpr_at_fixed_spec": self.lesion_voxel_actual_fpr_at_fixed_spec,
+            "val_lesion_voxel_threshold_at_fixed_spec": self.lesion_voxel_threshold_at_fixed_spec,
+            "val_lesion_voxel_fixed_sens_target": self.lesion_voxel_fixed_sens_target,
+            "val_lesion_voxel_spec_at_fixed_sens": self.lesion_voxel_spec_at_fixed_sens,
+            "val_lesion_voxel_actual_sens_at_fixed_sens": self.lesion_voxel_actual_sens_at_fixed_sens,
+            "val_lesion_voxel_threshold_at_fixed_sens": self.lesion_voxel_threshold_at_fixed_sens,
+            "val_lesion_gland_voxel_n": self.lesion_voxel_n,
+            "val_lesion_gland_fixed_spec_target": self.lesion_voxel_fixed_spec_target,
+            "val_lesion_gland_sens_at_fixed_spec": self.lesion_voxel_sens_at_fixed_spec,
+            "val_lesion_gland_actual_spec_at_fixed_spec": self.lesion_voxel_actual_spec_at_fixed_spec,
+            "val_lesion_gland_threshold_at_fixed_spec": self.lesion_voxel_threshold_at_fixed_spec,
+            "val_lesion_gland_fixed_sens_target": self.lesion_voxel_fixed_sens_target,
+            "val_lesion_gland_spec_at_fixed_sens": self.lesion_voxel_spec_at_fixed_sens,
+            "val_lesion_gland_actual_sens_at_fixed_sens": self.lesion_voxel_actual_sens_at_fixed_sens,
+            "val_lesion_gland_threshold_at_fixed_sens": self.lesion_voxel_threshold_at_fixed_sens,
             "val_target_cspca_dice": self.target_cspca_dice.avg,
             "val_target_cspca_dice_at_prob_threshold": self.target_cspca_dice.avg,
             "val_target_cspca_dice_mean": self.target_cspca_dice.avg,
@@ -1554,6 +2028,16 @@ class MetricTracker:
             "val_target_cspca_top_percent_dice_mean": self.target_cspca_top_percent_dice.avg,
             "val_target_cspca_top_percent_dice_std": self.target_cspca_top_percent_dice_std,
             "val_target_cspca_top_percent_dice_n": self.target_cspca_top_percent_dice_n,
+            "val_target_cspca_voxel_n": self.target_cspca_voxel_n,
+            "val_target_cspca_voxel_fixed_spec_target": self.target_cspca_voxel_fixed_spec_target,
+            "val_target_cspca_voxel_sens_at_fixed_spec": self.target_cspca_voxel_sens_at_fixed_spec,
+            "val_target_cspca_voxel_actual_spec_at_fixed_spec": self.target_cspca_voxel_actual_spec_at_fixed_spec,
+            "val_target_cspca_voxel_actual_fpr_at_fixed_spec": self.target_cspca_voxel_actual_fpr_at_fixed_spec,
+            "val_target_cspca_voxel_threshold_at_fixed_spec": self.target_cspca_voxel_threshold_at_fixed_spec,
+            "val_target_cspca_voxel_fixed_sens_target": self.target_cspca_voxel_fixed_sens_target,
+            "val_target_cspca_voxel_spec_at_fixed_sens": self.target_cspca_voxel_spec_at_fixed_sens,
+            "val_target_cspca_voxel_actual_sens_at_fixed_sens": self.target_cspca_voxel_actual_sens_at_fixed_sens,
+            "val_target_cspca_voxel_threshold_at_fixed_sens": self.target_cspca_voxel_threshold_at_fixed_sens,
             "val_tbx_roi_bacc": self.tbx_roi_bacc,
             "val_tbx_roi_sens": self.tbx_roi_sens,
             "val_tbx_roi_spec": self.tbx_roi_spec,
@@ -1565,6 +2049,10 @@ class MetricTracker:
             "val_tbx_roi_actual_spec_at_fixed_spec": self.tbx_roi_actual_spec_at_fixed_spec,
             "val_tbx_roi_actual_fpr_at_fixed_spec": self.tbx_roi_actual_fpr_at_fixed_spec,
             "val_tbx_roi_threshold_at_fixed_spec": self.tbx_roi_threshold_at_fixed_spec,
+            "val_tbx_roi_fixed_sens_target": self.tbx_roi_fixed_sens_target,
+            "val_tbx_roi_spec_at_fixed_sens": self.tbx_roi_spec_at_fixed_sens,
+            "val_tbx_roi_actual_sens_at_fixed_sens": self.tbx_roi_actual_sens_at_fixed_sens,
+            "val_tbx_roi_threshold_at_fixed_sens": self.tbx_roi_threshold_at_fixed_sens,
             "val_patient_bacc": self.patient_bacc,
             "val_patient_sens": self.patient_sens,
             "val_patient_spec": self.patient_spec,
@@ -1637,6 +2125,16 @@ class MetricTracker:
             "val_loss_sys_cases": self.loss_sys_cases,
             "val_loss_sys_regions": self.loss_sys_regions,
         }
+        val_dict.update({f"val_{key}": value for key, value in self.lesion_froc_metrics.items()})
+        val_dict.update(
+            {
+                f"val_lesion_gland_{key[len('lesion_'):]}": value
+                for key, value in self.lesion_froc_metrics.items()
+                if key.startswith("lesion_")
+            }
+        )
+        val_dict.update({f"val_{key}": value for key, value in self.target_cspca_froc_metrics.items()})
+        return val_dict
 
 
 # -----------------------------------------------------------------------------
@@ -1644,7 +2142,17 @@ class MetricTracker:
 # -----------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, epoch, save_dir):
+def validate(
+    model,
+    loader,
+    criterion,
+    device,
+    epoch,
+    save_dir,
+    compute_operating_metrics: bool = False,
+    compute_froc_metrics: bool = False,
+    sample_exporter=None,
+):
     """Validate the segmentation + MIL model.
 
     This function accepts the new dict-output model and loss. It also tolerates
@@ -1702,12 +2210,31 @@ def validate(model, loader, criterion, device, epoch, save_dir):
             target = batch["lesion_mask"][idx].float()
             tracker.update_lesion_dice_values(compute_dice_per_case(pred_bin, target))
             tracker.lesion_f1.update(compute_f1(pred_bin, target))
-            tracker.lesion_sens.update(compute_sens(pred_bin, target))
-            tracker.lesion_spec.update(compute_spec(pred_bin, target))
+            gland_mask = batch.get("gland_mask", torch.zeros_like(batch["lesion_mask"]))[idx]
+            has_gland = batch.get(
+                "has_gland",
+                torch.zeros_like(batch["has_lesion"]),
+            )[idx]
+            tracker.update_lesion_gland_metrics(
+                lesion_probs[idx],
+                target,
+                gland_mask.float(),
+                has_gland,
+                threshold=prob_threshold,
+                compute_operating_metrics=compute_operating_metrics,
+                compute_froc_metrics=compute_froc_metrics,
+            )
 
         # B-series csPCa localisation metric on biopsy-confirmed target ROIs.
         if "has_target" in batch and "target_mask" in batch and batch["has_target"].sum() > 0:
             target_cspca = (batch["target_mask"] >= positive_threshold).float()
+            target_cases = batch["has_target"] > 0
+            if compute_froc_metrics:
+                tracker.update_target_cspca_froc(
+                    lesion_probs[target_cases],
+                    target_cspca[target_cases],
+                    scoring_mask=(batch["target_mask"][target_cases] > 0).float(),
+                )
             positive_target_cases = (batch["has_target"] > 0) & target_cspca.reshape(target_cspca.size(0), -1).any(dim=1)
             if positive_target_cases.any():
                 positive_probs = lesion_probs[positive_target_cases]
@@ -1720,13 +2247,23 @@ def validate(model, loader, criterion, device, epoch, save_dir):
 
             sampled_tbx_roi = (batch["has_target"] > 0).view(-1, 1, 1, 1, 1) & (batch["target_mask"] > 0)
             if sampled_tbx_roi.any():
+                sampled_true = target_cspca[sampled_tbx_roi].detach().cpu().numpy()
+                sampled_score = lesion_probs[sampled_tbx_roi].detach().cpu().numpy()
                 tracker.update_tbx_roi_samples(
-                    target_cspca[sampled_tbx_roi].detach().cpu().numpy(),
-                    lesion_probs[sampled_tbx_roi].detach().cpu().numpy(),
+                    sampled_true,
+                    sampled_score,
                 )
+                if compute_operating_metrics:
+                    tracker.update_voxel_operating_samples(
+                        "target_cspca",
+                        sampled_true,
+                        sampled_score,
+                    )
 
         # Patient/region metrics derived from segmentation risk maps and mask GT.
         seg_evaluator.update_from_batch(lesion_probs=lesion_probs, batch=batch)
+        if sample_exporter is not None:
+            sample_exporter.update(batch, lesion_probs, seg_evaluator)
 
         if save_val_vis:
             for b in range(imgs.size(0)):
@@ -1771,7 +2308,15 @@ def validate(model, loader, criterion, device, epoch, save_dir):
 
     seg_metrics = seg_evaluator.compute_metrics()
     tracker.finalize_target_cspca_aux_dice()
-    tracker.finalize_tbx_roi_metrics(prob_threshold)
+    if compute_froc_metrics:
+        tracker.finalize_froc_metrics()
+    if compute_operating_metrics:
+        tracker.finalize_voxel_operating_metrics("lesion")
+        tracker.finalize_voxel_operating_metrics("target_cspca")
+    tracker.finalize_tbx_roi_metrics(
+        prob_threshold,
+        compute_operating_metrics=compute_operating_metrics,
+    )
 
     tracker.patient_sens = seg_metrics["patient_sens"]
     tracker.patient_spec = seg_metrics["patient_spec"]
@@ -1812,6 +2357,9 @@ def validate(model, loader, criterion, device, epoch, save_dir):
     tracker.region_spec_at_fixed_sens = seg_metrics["region_spec_at_fixed_sens"]
     tracker.region_actual_sens_at_fixed_sens = seg_metrics["region_actual_sens_at_fixed_sens"]
     tracker.region_threshold_at_fixed_sens = seg_metrics["region_threshold_at_fixed_sens"]
+
+    if sample_exporter is not None:
+        sample_exporter.finalize()
 
     return tracker
 

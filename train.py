@@ -14,9 +14,10 @@ Current training contract:
 
 from __future__ import annotations
 
+import math
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import torch
@@ -316,6 +317,12 @@ def select_validation_metric(v_track) -> float:
         return -float(v_track.loss_total.avg)
     if metric_name in {"lesion_dice", "dice", "val_lesion_dice"}:
         return float(v_track.lesion_dice.avg)
+    if metric_name in {
+        "lesion_gland_dice",
+        "within_prostate_dice",
+        "val_lesion_gland_dice",
+    }:
+        return float(getattr(v_track, "lesion_gland_dice").avg)
     if metric_name in {"target_cspca_dice", "val_target_cspca_dice", "cspca_dice"}:
         return float(getattr(v_track, "target_cspca_dice").avg)
     if metric_name in {"tbx_roi_sens_at_fixed_spec", "val_tbx_roi_sens_at_fixed_spec", "tbx_roi_sens_at_fpr5"}:
@@ -326,6 +333,12 @@ def select_validation_metric(v_track) -> float:
         return float(getattr(v_track, "tbx_roi_auprc", 0.0))
     if metric_name in {"tbx_roi_bacc", "val_tbx_roi_bacc"}:
         return float(getattr(v_track, "tbx_roi_bacc", 0.0))
+    for prefix in ("lesion", "target_cspca"):
+        if metric_name.startswith(f"{prefix}_sens_at_fp_per_patient_"):
+            return float(getattr(v_track, f"{prefix}_froc_metrics", {}).get(metric_name, 0.0))
+        if metric_name.startswith(f"val_{prefix}_sens_at_fp_per_patient_"):
+            key = metric_name[4:]
+            return float(getattr(v_track, f"{prefix}_froc_metrics", {}).get(key, 0.0))
     if metric_name == "lesion_f1":
         return float(v_track.lesion_f1.avg)
     if metric_name == "patient_sens_at_fixed_spec":
@@ -340,10 +353,35 @@ def select_validation_metric(v_track) -> float:
         return float(v_track.region_bacc)
     if metric_name == "region_auc":
         return float(getattr(v_track, "region_auc", 0.0))
+    if metric_name in {"region_auprc", "val_region_auprc"}:
+        return float(getattr(v_track, "region_auprc", 0.0))
     if metric_name == "patient_bacc":
         return float(getattr(v_track, "patient_bacc", 0.0))
     if metric_name == "patient_auc":
         return float(getattr(v_track, "patient_auc", 0.0))
+    if metric_name in {"patient_auprc", "val_patient_auprc"}:
+        return float(getattr(v_track, "patient_auprc", 0.0))
+    if metric_name == "ra_tbx_auprc_composite":
+        return (
+            0.50 * float(v_track.lesion_dice.avg)
+            + 0.50 * float(getattr(v_track, "tbx_roi_auprc", 0.0))
+        )
+    if metric_name == "ra_sbx_auprc_composite":
+        return (
+            0.50 * float(v_track.lesion_dice.avg)
+            + 0.50 * float(getattr(v_track, "region_auprc", 0.0))
+        )
+    if metric_name == "biopsy_auprc_composite":
+        return (
+            0.50 * float(getattr(v_track, "tbx_roi_auprc", 0.0))
+            + 0.50 * float(getattr(v_track, "region_auprc", 0.0))
+        )
+    if metric_name == "mixed_auprc":
+        return (
+            0.40 * float(v_track.lesion_dice.avg)
+            + 0.30 * float(getattr(v_track, "tbx_roi_auprc", 0.0))
+            + 0.30 * float(getattr(v_track, "region_auprc", 0.0))
+        )
     if metric_name == "clinical_bacc":
         return 0.5 * float(getattr(v_track, "patient_bacc", 0.0)) + 0.5 * float(v_track.region_bacc)
     if metric_name == "composite":
@@ -381,6 +419,103 @@ def get_best_model_path(save_path: str) -> str:
     raise FileNotFoundError(f"No best model found in {save_path}")
 
 
+def configured_final_test_epochs() -> Tuple[int, ...]:
+    epochs = _cfg("FINAL_TEST_CHECKPOINT_EPOCHS", ())
+    if epochs is None:
+        return tuple()
+    if isinstance(epochs, str):
+        epochs = [item.strip() for item in epochs.split(",") if item.strip()]
+    out = []
+    for epoch in epochs:
+        try:
+            epoch_int = int(epoch)
+        except (TypeError, ValueError):
+            continue
+        if epoch_int > 0:
+            out.append(epoch_int)
+    return tuple(sorted(set(out)))
+
+
+def epoch_checkpoint_path(save_path: str, epoch: int) -> str:
+    return os.path.join(save_path, f"checkpoint_epoch_{int(epoch):03d}.pth")
+
+
+def should_save_final_test_checkpoint(epoch: int) -> bool:
+    return int(epoch) in set(configured_final_test_epochs())
+
+
+def collect_final_test_checkpoints(save_path: str) -> List[Tuple[str, str]]:
+    """Return labelled checkpoints to evaluate during final test."""
+    candidates: List[Tuple[str, str]] = []
+
+    if bool(_cfg("FINAL_TEST_INCLUDE_BEST", True)):
+        try:
+            candidates.append(("best", get_best_model_path(save_path)))
+        except FileNotFoundError:
+            pass
+
+    for epoch in configured_final_test_epochs():
+        path = epoch_checkpoint_path(save_path, epoch)
+        if os.path.exists(path):
+            candidates.append((f"epoch_{epoch:03d}", path))
+
+    if bool(_cfg("FINAL_TEST_INCLUDE_LAST", True)):
+        path = os.path.join(save_path, "last_checkpoint.pth")
+        if os.path.exists(path):
+            candidates.append(("last", path))
+
+    if not candidates:
+        candidates.append(("best", get_best_model_path(save_path)))
+
+    seen_paths = set()
+    unique = []
+    for label, path in candidates:
+        real = os.path.realpath(path)
+        if real in seen_paths:
+            continue
+        seen_paths.add(real)
+        unique.append((label, path))
+    return unique
+
+
+def configured_final_test_datasets() -> List[Tuple[str, str]]:
+    """Return labelled final-test datasets.
+
+    Config.FINAL_TEST_DATASETS may be a sequence of (label, csv_path) pairs.
+    When absent, use the shared internal and PROMIS external cohorts.
+    """
+    configured = _cfg("FINAL_TEST_DATASETS", None)
+    if configured:
+        datasets: List[Tuple[str, str]] = []
+        for item in configured:
+            if isinstance(item, dict):
+                label = str(item.get("label", f"dataset_{len(datasets) + 1}"))
+                csv_path = item.get("csv") or item.get("path")
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                label = str(item[0])
+                csv_path = item[1]
+            else:
+                continue
+            if csv_path:
+                datasets.append((label, str(csv_path)))
+        if datasets:
+            return datasets
+
+    return [
+        (
+            "internal",
+            get_csv_path("COMMON_INTERNAL_TEST_CSV", "common_internal_test.csv"),
+        ),
+        (
+            "external",
+            get_csv_path(
+                "COMMON_EXTERNAL_TEST_CSV",
+                "N4_mixed_PROMIS_external_val.csv",
+            ),
+        ),
+    ]
+
+
 def load_best_weights(model, criterion, model_path: str, device: torch.device) -> Dict[str, Any]:
     """Load a best checkpoint or plain state_dict into the current model."""
     checkpoint = torch.load(model_path, map_location=device)
@@ -403,52 +538,112 @@ def load_best_weights(model, criterion, model_path: str, device: torch.device) -
 
 
 def run_final_test(model, criterion, device: torch.device, save_path: str, metric_name: str):
-    """Evaluate the saved best model on TEST_CSV after training has finished."""
-    test_csv = get_csv_path("TEST_CSV", "N4_mixed_PROMIS_external_val.csv")
-    best_model_path = get_best_model_path(save_path)
+    """Evaluate saved checkpoints on configured final-test datasets."""
+    from test import TestArtifactExporter
 
-    # Keep test evaluation post-hoc: validation still selects the checkpoint,
-    # then the frozen best model is loaded once for external reporting.
+    test_datasets = configured_final_test_datasets()
+    checkpoint_specs = collect_final_test_checkpoints(save_path)
+
     print("\n" + "=" * 60)
-    print("Final test using best model")
+    print("Final test using selected checkpoints")
     print("=" * 60)
-    print(f"Best model: {best_model_path}")
-    print(f"Test CSV:   {test_csv}")
     print(f"Test dataset task: {get_dataset_task(is_train=False, split='test')}")
+    print("Datasets:")
+    for label, csv_path in test_datasets:
+        print(f"  {label:<12} {csv_path}")
+    print("Checkpoints:")
+    for label, path in checkpoint_specs:
+        print(f"  {label:<12} {path}")
 
-    checkpoint = load_best_weights(model, criterion, best_model_path, device)
-    best_epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
-    if hasattr(criterion, "set_epoch") and best_epoch > 0:
-        criterion.set_epoch(best_epoch)
+    compute_operating_metrics = bool(_cfg("FINAL_TEST_COMPUTE_OPERATING_METRICS", True))
+    compute_froc_metrics = bool(_cfg("FINAL_TEST_COMPUTE_FROC_METRICS", True))
+    rows = []
+    tested_epochs = set()
+    last_track = None
+    for label, checkpoint_path in checkpoint_specs:
+        checkpoint = load_best_weights(model, criterion, checkpoint_path, device)
+        checkpoint_epoch = int(checkpoint.get("epoch", 0)) if isinstance(checkpoint, dict) else 0
+        # Avoid retesting the same epoch when, for example, best also equals an
+        # explicitly saved periodic checkpoint. Keep the best-labelled row.
+        if checkpoint_epoch > 0 and checkpoint_epoch in tested_epochs:
+            print(f"Skipping {label} because epoch {checkpoint_epoch} was already tested.")
+            continue
+        if checkpoint_epoch > 0:
+            tested_epochs.add(checkpoint_epoch)
+        if hasattr(criterion, "set_epoch") and checkpoint_epoch > 0:
+            criterion.set_epoch(checkpoint_epoch)
 
-    test_loader = DataLoader(
-        build_dataset(test_csv, is_train=False, split="test"),
-        batch_size=_cfg("BATCH_SIZE", 1),
-        shuffle=False,
-        num_workers=_cfg("NUM_WORKERS", 0),
-        pin_memory=torch.cuda.is_available(),
-    )
+        for dataset_label, test_csv in test_datasets:
+            artifact_dir = os.path.join(
+                save_path,
+                str(_cfg("TEST_ARTIFACT_SUBDIR", "test_artifacts")),
+                utils.safe_vis_filename(dataset_label),
+                utils.safe_vis_filename(label),
+            )
+            sample_exporter = TestArtifactExporter(
+                artifact_dir,
+                dataset_label=dataset_label,
+                dataset_csv=test_csv,
+                checkpoint_label=label,
+                checkpoint_path=checkpoint_path,
+                checkpoint_epoch=checkpoint_epoch,
+                visualization_policy=str(_cfg("TEST_VIS_POLICY", "representative")),
+                max_visualizations=int(_cfg("TEST_VIS_MAX_PER_RUN", 12)),
+                low_dice_threshold=float(_cfg("TEST_VIS_LOW_DICE_THRESHOLD", 0.5)),
+            )
+            test_loader = DataLoader(
+                build_dataset(test_csv, is_train=False, split="test"),
+                batch_size=_cfg("BATCH_SIZE", 1),
+                shuffle=False,
+                num_workers=_cfg("NUM_WORKERS", 0),
+                pin_memory=torch.cuda.is_available(),
+            )
 
-    test_track = utils.validate(model, test_loader, criterion, device, best_epoch, save_dir="")
-    print(f"Test  | {test_track.print_val_summary()}")
+            print("\n" + "-" * 60)
+            print(
+                f"Testing dataset={dataset_label} | checkpoint={label} | "
+                f"epoch={checkpoint_epoch} | path={checkpoint_path}"
+            )
+            test_track = utils.validate(
+                model,
+                test_loader,
+                criterion,
+                device,
+                checkpoint_epoch,
+                save_dir="",
+                compute_operating_metrics=compute_operating_metrics,
+                compute_froc_metrics=compute_froc_metrics,
+                sample_exporter=sample_exporter,
+            )
+            print(f"Test [{dataset_label}/{label}] | {test_track.print_val_summary()}")
+            last_track = test_track
 
-    test_log = {
-        "best_epoch": best_epoch,
-        "best_model_metric_name": metric_name,
-        "best_model_metric_value": float(checkpoint.get("best_metric", float("nan")))
-        if isinstance(checkpoint, dict)
-        else float("nan"),
-        "best_model_path": best_model_path,
-        "test_csv": test_csv,
-    }
-    for key, value in test_track.get_val_dict().items():
-        test_key = key.replace("val_", "test_", 1) if key.startswith("val_") else f"test_{key}"
-        test_log[test_key] = value
+            test_log = {
+                "test_dataset_label": dataset_label,
+                "checkpoint_label": label,
+                "checkpoint_epoch": checkpoint_epoch,
+                "checkpoint_path": checkpoint_path,
+                "is_best_checkpoint": int(label == "best"),
+                "best_model_metric_name": metric_name,
+                "checkpoint_best_metric_value": float(checkpoint.get("best_metric", math.nan))
+                if isinstance(checkpoint, dict)
+                else math.nan,
+                "test_csv": test_csv,
+                "test_compute_operating_metrics": int(compute_operating_metrics),
+                "test_compute_froc_metrics": int(compute_froc_metrics),
+                "test_artifact_dir": artifact_dir,
+                "test_per_sample_metrics_csv": os.path.join(artifact_dir, "per_sample_metrics.csv"),
+                "test_per_region_metrics_csv": os.path.join(artifact_dir, "per_region_metrics.csv"),
+            }
+            for key, value in test_track.get_val_dict().items():
+                test_key = key.replace("val_", "test_", 1) if key.startswith("val_") else f"test_{key}"
+                test_log[test_key] = value
+            rows.append(test_log)
 
     test_log_csv = os.path.join(save_path, "test_log.csv")
-    pd.DataFrame([test_log]).to_csv(test_log_csv, index=False)
+    pd.DataFrame(rows).to_csv(test_log_csv, index=False)
     print(f"Test log saved to: {test_log_csv}")
-    return test_track
+    return last_track
 
 
 def get_experiment_name() -> str:
@@ -522,8 +717,10 @@ def main():
     history = []
     metric_name = str(_cfg("BEST_MODEL_METRIC", "lesion_dice"))
     saved_train_vis_patients = set()
+    last_epoch = 0
 
     for epoch in range(1, int(_cfg("NUM_EPOCHS", 100)) + 1):
+        last_epoch = epoch
         print(f"\nEpoch {epoch}/{_cfg('NUM_EPOCHS', 100)}")
         if hasattr(criterion, "set_epoch"):
             criterion.set_epoch(epoch)
@@ -550,7 +747,16 @@ def main():
         )
         if hasattr(criterion, "set_epoch"):
             criterion.set_epoch(epoch)
-        val_track = utils.validate(model, val_loader, criterion, device, epoch, save_path)
+        val_track = utils.validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            epoch,
+            save_path,
+            compute_operating_metrics=bool(_cfg("VALIDATION_COMPUTE_OPERATING_METRICS", True)),
+            compute_froc_metrics=bool(_cfg("VALIDATION_COMPUTE_FROC_METRICS", False)),
+        )
 
         print(f"Train | {train_track.print_train_summary()}")
         print(f"Val   | {val_track.print_val_summary()}")
@@ -591,6 +797,7 @@ def main():
         cur_metric = select_validation_metric(val_track)
         print(f"Selection metric ({metric_name}): {cur_metric:.4f}")
 
+        stop_training = False
         if cur_metric > best_metric:
             best_metric = cur_metric
             early_stop_counter = 0
@@ -610,9 +817,40 @@ def main():
             early_stop_counter += 1
             if early_stop_counter >= int(_cfg("EARLY_STOP_PATIENCE", 20)):
                 print(f"Early stop triggered at epoch {epoch}")
-                break
+                stop_training = True
+
+        if should_save_final_test_checkpoint(epoch):
+            checkpoint_path = epoch_checkpoint_path(save_path, epoch)
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                criterion,
+                optimizer,
+                scheduler,
+                epoch,
+                best_metric,
+                exp_name,
+            )
+            print(f"--> Final-test checkpoint saved: {checkpoint_path}")
+
+        if stop_training:
+            break
 
         scheduler.step()
+
+    if last_epoch > 0:
+        last_checkpoint_path = os.path.join(save_path, "last_checkpoint.pth")
+        save_checkpoint(
+            last_checkpoint_path,
+            model,
+            criterion,
+            optimizer,
+            scheduler,
+            last_epoch,
+            best_metric,
+            exp_name,
+        )
+        print(f"Last checkpoint saved: {last_checkpoint_path}")
 
     try:
         run_final_test(model, criterion, device, save_path, metric_name)
